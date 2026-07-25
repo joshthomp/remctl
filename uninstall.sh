@@ -59,6 +59,7 @@ FILES=(
     remctl_serialization.py
     remctl_smart_lists.py
     remctl_images.py
+    remctl_accounts.py
     remctl-bridge
     remctl-private
     remctl-permissions

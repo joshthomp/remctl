@@ -112,6 +112,15 @@ cp "$SCRIPT_DIR/remctl_smart_lists.py" "$BIN_DIR/remctl_smart_lists.py"
 chmod 644 "$BIN_DIR/remctl_smart_lists.py"
 echo -e "  ${GREEN}✓${RESET} remctl_smart_lists.py → $BIN_DIR/remctl_smart_lists.py"
 
+# Optional multi-account extension. RemCTL runs fine without it; when present
+# it adds --account/--all-accounts and the accounts/config commands.
+if [ -f "$SCRIPT_DIR/remctl_accounts.py" ]; then
+    echo -e "${BLUE}→${RESET} Installing multi-account extension..."
+    cp "$SCRIPT_DIR/remctl_accounts.py" "$BIN_DIR/remctl_accounts.py"
+    chmod 644 "$BIN_DIR/remctl_accounts.py"
+    echo -e "  ${GREEN}✓${RESET} remctl_accounts.py → $BIN_DIR/remctl_accounts.py"
+fi
+
 echo -e "${BLUE}→${RESET} Installing shell completion sources..."
 mkdir -p "$BIN_DIR/completions"
 for name in remctl rctl reminders; do

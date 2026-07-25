@@ -102,12 +102,30 @@ would otherwise be unusable.
 
 ## Bridge changes
 
-`remctl-bridge.swift` gains a `list_calendars` action and accepts
-`calendarIdentifier` / `account` on `Command`. `findList()` is unified to
-accept `calendarIdentifier + name + listId + account`; its iCloud-only write
-restriction is relaxed **only** when an account is explicitly targeted, so the
-default path keeps upstream's behavior. The bridge must be recompiled via
-`install.sh`.
+`remctl-bridge.swift` gains a `list_calendars` action, a `find_reminder`
+action, and `calendarIdentifier` / `account` fields on `Command`.
+
+Upstream's `findList()` is **byte-identical** — its body is untouched, so the
+default single-account path and its iCloud-only write restriction are provably
+unchanged. Multi-account resolution lives in a separate `findListScoped()`,
+which delegates straight back to `findList()` whenever no account or
+`calendarIdentifier` is supplied:
+
+```swift
+let wantsScope = !(calendarIdentifier ?? "").isEmpty || !(account ?? "").isEmpty
+guard wantsScope else {
+    return findList(store, name: name, listId: listId)
+}
+```
+
+Call sites prepend a scoped branch rather than replacing upstream's, so
+upstream's own `if let list = cmd.list` / `else if let listId` arms remain in
+place. The 8 removed lines are: 2 `if` keywords becoming `} else if`, 2
+`rename_list`/`delete_list` one-liners gaining a scoped ternary, and 4 lines in
+`create_list` where the iCloud source lookup is wrapped in an `else` (preserved
+verbatim inside it).
+
+The bridge must be recompiled via `install.sh`.
 
 ## The one change to upstream's test suite
 

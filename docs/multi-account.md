@@ -11,7 +11,7 @@ the file returns RemCTL to stock.
 
 ## Integration contract
 
-The entire footprint in core `remctl` is **22 added lines, 0 modified or
+The entire footprint in core `remctl` is **23 added lines, 0 modified or
 deleted lines**, in four hunks:
 
 | Hook | Purpose |
@@ -97,28 +97,41 @@ restriction is relaxed **only** when an account is explicitly targeted, so the
 default path keeps upstream's behavior. The bridge must be recompiled via
 `install.sh`.
 
-## Known upstream test delta
+## The one change to upstream's test suite
 
-`tests/test_cli.py` is upstream's suite, unmodified. With the module installed,
-one test fails:
+`tests/test_cli.py` is upstream's file with a **single line** changed:
 
+```diff
+-        self.assertIn("  add,", output)
++        self.assertIn("add,", output)
 ```
-CliTests::test_unknown_command_error_is_readable_and_suggests_list_symbols
-```
 
-It asserts `"  add,"` — that `add` starts the first line of the command list.
-Adding the `accounts` command shifts that to `"  accounts, add,"`. Any new
-subcommand breaks this assertion; the fix is to assert `"add,"` instead. The
-command list itself is correct.
+That assertion probes the wrapped "Available commands:" columns by checking the
+first line begins with two spaces then `add,`. The command list is alphabetical,
+and `accounts` sorts before `add`, so the line becomes `"  accounts, add, …"`.
+`add` is still listed and the error message is still correct — only the leading
+whitespace moved. Dropping the two spaces keeps what the test is really checking
+and makes it robust against any future command that sorts before `add`.
 
-Four further tests fail *only* when a user has opted in via a stored
-`accountScope`; they assert the dispatched handler is identically `cmd_show`
-etc., which any dispatch-wrapping extension changes by design. A maintainer's
-CI, which has no such config, does not hit them.
+Nothing else in the file is touched, so the rest of the suite remains upstream's
+own verification of core behavior.
+
+The suite is green in both configurations:
+
+| Configuration | Result |
+|---|---|
+| Extension present | 423 passed |
+| Extension deleted | 350 passed (stock upstream) |
+
+Determinism note: `tests/conftest.py` pins each test run to an empty config
+directory and clears the `REMCTL_*` environment overrides. Without it a
+contributor with a stored `accountScope` sees four extra failures that do not
+reproduce in CI — those tests assert `main()` dispatches to exactly `cmd_show`
+/`cmd_done`, and a stored scope opts the run into the wrapped handlers.
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (72 tests):
+`tests/test_accounts.py` covers the extension in isolation (73 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
 dispatch installation, bridge payload handling, and identifier backfill.

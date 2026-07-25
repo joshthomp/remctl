@@ -266,7 +266,23 @@ class LiveMatrix:
             "15m",
         )
         rid = int(rich["numericId"])
-        info = self.retry(lambda: self.info(rid) if self.info(rid).get("subtasks") else None)
+        def rich_metadata_ready():
+            payload = self.info(rid)
+            if (
+                payload.get("url") == "https://example.com"
+                and {"remctl", "media"}.issubset(set(payload.get("tags", [])))
+                and payload.get("flagged") is True
+                and payload.get("urgent") is True
+                and payload.get("section") == "Research"
+                and payload.get("earlyReminder")
+                and payload.get("attachments")
+                and payload.get("subtasks")
+            ):
+                return payload
+            return None
+
+        info = self.retry(rich_metadata_ready, attempts=40)
+        self.assert_true(bool(info), "private rich metadata bundle did not persist")
         self.assert_true(info.get("url") == "https://example.com", "private rich URL did not persist")
         self.assert_true({"remctl", "media"}.issubset(set(info.get("tags", []))), "private tags did not persist")
         self.assert_true(info.get("flagged") is True, "private flag did not persist")
@@ -295,7 +311,22 @@ class LiveMatrix:
             "arriving",
             "--json",
         ])
-        edited_info = self.retry(lambda: self.info(rid))
+        def edited_metadata_ready():
+            payload = self.info(rid)
+            location_alarms = [
+                alarm for alarm in payload.get("alarms", [])
+                if alarm.get("type") == "location" and alarm.get("location", {}).get("title") == "Apple Park"
+            ]
+            if (
+                payload.get("flagged") is False
+                and payload.get("urgent") is False
+                and location_alarms
+            ):
+                return payload
+            return None
+
+        edited_info = self.retry(edited_metadata_ready, attempts=40)
+        self.assert_true(bool(edited_info), "private flag, urgent, and location edits did not persist")
         location_alarms = [
             alarm for alarm in edited_info.get("alarms", [])
             if alarm.get("type") == "location" and alarm.get("location", {}).get("title") == "Apple Park"
@@ -306,7 +337,12 @@ class LiveMatrix:
         self.record("edit private flag urgent and location", "passed", str(rid))
 
         self.json_command(["edit", str(rid), "--private", "--early-reminder", "clear", "--json"])
-        cleared = self.retry(lambda: self.info(rid))
+        def early_reminder_cleared():
+            payload = self.info(rid)
+            return payload if not payload.get("earlyReminder") else None
+
+        cleared = self.retry(early_reminder_cleared, attempts=40)
+        self.assert_true(bool(cleared), "Early Reminder clear did not persist")
         self.assert_true(not cleared.get("earlyReminder"), "Early Reminder clear did not persist")
         self.record("edit private early reminder clear", "passed", str(rid))
 

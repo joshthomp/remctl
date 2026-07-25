@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 1
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -26,10 +27,15 @@
 - (id)updateAccount:(id)account;
 - (id)updateReminder:(id)reminder;
 - (id)updateList:(id)list;
+- (id)updateListSection:(id)section;
 - (id)updateSmartList:(id)smartList;
 - (id)updateTemplate:(id)templateObject;
 - (id)addReminderWithTitle:(NSString *)title toReminderSubtaskContextChangeItem:(id)context;
+- (id)_copyReminder:(id)reminder toListChangeItem:(id)listChangeItem;
+- (id)_copyReminder:(id)reminder toReminderSubtaskContextChangeItem:(id)context;
 - (id)addListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem listObjectID:(id)objectID;
+- (id)addGroupWithName:(NSString *)name toAccountGroupContextChangeItem:(id)context;
+- (id)addGroupWithName:(NSString *)name toAccountGroupContextChangeItem:(id)context groupObjectID:(id)objectID;
 - (id)addListSectionWithDisplayName:(NSString *)name toListSectionContextChangeItem:(id)context;
 - (id)addCustomSmartListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem smartListObjectID:(id)objectID;
 - (id)addTemplateWithName:(NSString *)name configuration:(id)configuration toAccountChangeItem:(id)accountChangeItem;
@@ -45,6 +51,7 @@
 @interface REMAccountChangeItem : NSObject
 - (void)addListChangeItem:(id)listChangeItem;
 - (void)addSmartListChangeItem:(id)smartListChangeItem;
+- (id)groupContext;
 @end
 
 @interface REMAccountCapabilities : NSObject
@@ -89,6 +96,7 @@
 @end
 
 @interface REMReminderChangeItem : NSObject
+- (id)remObjectID;
 - (id)assignmentContext;
 - (id)attachmentContext;
 - (id)dueDateDeltaAlertContext;
@@ -121,6 +129,7 @@
 
 @interface REMReminderHashtagContextChangeItem : NSObject
 - (id)addHashtagWithType:(NSInteger)type name:(NSString *)name;
+- (void)removeAllHashtags;
 @end
 
 @interface REMReminderFlaggedContextChangeItem : NSObject
@@ -138,6 +147,7 @@
 
 @interface REMListChangeItem : NSObject
 - (id)remObjectID;
+- (id)sublistContext;
 - (id)sectionsContextChangeItem;
 - (id)appearanceContext;
 - (id)groceryContextChangeItem;
@@ -145,6 +155,14 @@
 - (void)setIsPinned:(BOOL)pinned;
 - (void)setName:(NSString *)name;
 - (void)setParentOwnerID:(id)objectID;
+- (void)setParentSubContainerID:(id)objectID;
+- (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
+@end
+
+@interface REMList : NSObject
+- (id)account;
+- (id)remObjectID;
+- (id)parentList;
 @end
 
 @interface REMListGroceryContextChangeItem : NSObject
@@ -169,6 +187,8 @@
 
 @interface REMListSectionChangeItem : NSObject
 - (id)remObjectID;
+- (void)setDisplayName:(NSString *)displayName;
+- (void)removeFromList;
 @end
 
 @interface REMListSectionContextChangeItem : NSObject
@@ -213,6 +233,37 @@ static void output(NSDictionary *dict) {
 static void fail(NSString *message) {
     output(@{@"status": @"error", @"message": message ?: @"Unknown error"});
     exit(1);
+}
+
+static void failException(NSString *prefix, NSException *exception) {
+    NSString *reason = exception.reason ?: exception.name ?: @"Unknown Objective-C exception";
+    fail([NSString stringWithFormat:@"%@: %@", prefix ?: @"Objective-C exception", reason]);
+}
+
+static BOOL isWritableCloudKitAccount(id account) {
+    if (!account) {
+        return NO;
+    }
+    NSString *className = NSStringFromClass([account class]);
+    return className.length > 0
+        && [className rangeOfString:@"CloudKit" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static id fetchWritableCloudKitAccount(id store, NSError **error) {
+    id account = nil;
+    if ([store respondsToSelector:@selector(fetchPrimaryActiveCloudKitAccountWithError:)]) {
+        account = [store fetchPrimaryActiveCloudKitAccountWithError:error];
+    }
+    if (account) {
+        return account;
+    }
+    if ([store respondsToSelector:@selector(fetchDefaultAccountWithError:)]) {
+        account = [store fetchDefaultAccountWithError:error];
+        if (account && !isWritableCloudKitAccount(account)) {
+            account = nil;
+        }
+    }
+    return account;
 }
 
 static void setCustomSmartListSupportedVersion(id change) {
@@ -347,6 +398,23 @@ static NSURL *reminderURL(NSString *ckIdentifier) {
 
 static NSURL *sectionURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDListSection/%@", ckIdentifier]];
+}
+
+static NSArray *sectionObjectIDsFromStrings(NSArray *sectionIDs) {
+    NSMutableArray *result = [NSMutableArray array];
+    if (![sectionIDs isKindOfClass:[NSArray class]]) {
+        return result;
+    }
+    for (id raw in sectionIDs) {
+        if (![raw isKindOfClass:[NSString class]] || [raw length] == 0) {
+            continue;
+        }
+        id objectID = [REMObjectID objectIDWithURL:sectionURL(raw)];
+        if (objectID) {
+            [result addObject:objectID];
+        }
+    }
+    return result;
 }
 
 static NSURL *shareeURL(NSString *ckIdentifier) {
@@ -661,12 +729,19 @@ int main(int argc, const char * argv[]) {
             fail(error.localizedDescription ?: @"Invalid JSON");
         }
         NSDictionary *cmd = (NSDictionary *)json;
+        @try {
         NSString *action = cmd[@"action"];
+        if ([action isEqualToString:@"protocol_version"]) {
+            output(@{@"status": @"ok", @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION)});
+            return 0;
+        }
         NSSet<NSString *> *allowedActions = [NSSet setWithArray:@[
             @"add_private_metadata",
             @"add_url_attachments",
             @"add_tags",
+            @"set_tags",
             @"add_subtasks",
+            @"clone_reminder_tree_to_list",
             @"assign_section",
             @"add_section_and_assign",
             @"assign_sharee",
@@ -677,6 +752,12 @@ int main(int argc, const char * argv[]) {
             @"set_early_reminder",
             @"add_location_alarm",
             @"create_list",
+            @"create_group",
+            @"set_list_parent_group",
+            @"delete_group",
+            @"create_section",
+            @"rename_section",
+            @"delete_section",
             @"set_list_appearance",
             @"set_list_pinned",
             @"set_smart_list_pinned",
@@ -698,12 +779,9 @@ int main(int argc, const char * argv[]) {
             }
             NSError *error = nil;
             REMStore *store = [REMStore new];
-            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            REMAccount *account = fetchWritableCloudKitAccount(store, &error);
             if (!account) {
-                account = [store fetchDefaultAccountWithError:&error];
-            }
-            if (!account) {
-                fail(error.localizedDescription ?: @"No active Reminders account found");
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
             }
 
             REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
@@ -740,6 +818,266 @@ int main(int argc, const char * argv[]) {
             output(details);
             return 0;
         }
+        if ([action isEqualToString:@"create_group"]) {
+            NSString *name = cmd[@"name"];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+                fail(@"name is required");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMAccount *account = fetchWritableCloudKitAccount(store, &error);
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id accountChange = [save updateAccount:account];
+            if (!accountChange) {
+                fail(@"Could not create ReminderKit account change item");
+            }
+            if (![accountChange respondsToSelector:@selector(groupContext)]) {
+                fail(@"ReminderKit account change item does not support list groups");
+            }
+            id groupContext = [accountChange groupContext];
+            if (!groupContext) {
+                fail(@"Could not create ReminderKit group context");
+            }
+            REMListChangeItem *change = nil;
+            if ([save respondsToSelector:@selector(addGroupWithName:toAccountGroupContextChangeItem:groupObjectID:)]) {
+                change = [save addGroupWithName:name toAccountGroupContextChangeItem:groupContext groupObjectID:nil];
+            } else if ([save respondsToSelector:@selector(addGroupWithName:toAccountGroupContextChangeItem:)]) {
+                change = [save addGroupWithName:name toAccountGroupContextChangeItem:groupContext];
+            }
+            if (!change) {
+                fail(@"Could not create ReminderKit group change item");
+            }
+            if ([change respondsToSelector:@selector(setParentOwnerID:)]) {
+                [change setParentOwnerID:[account remObjectID]];
+            }
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit group save failed");
+            }
+            id objectID = [change remObjectID];
+            NSString *uuid = objectID && [objectID respondsToSelector:@selector(uuid)] ? [[objectID uuid] UUIDString] : @"";
+            NSString *url = objectID && [objectID respondsToSelector:@selector(urlRepresentation)] ? [[objectID urlRepresentation] absoluteString] : @"";
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"name": name,
+                @"id": uuid ?: @"",
+                @"url": url ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"set_list_parent_group"]) {
+            NSString *listID = cmd[@"listId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            NSString *groupID = cmd[@"groupId"];
+            BOOL hasGroup = [groupID isKindOfClass:[NSString class]] && groupID.length > 0;
+            NSURL *listObjectURL = listURL(listID);
+            id listObjectID = [REMObjectID objectIDWithURL:listObjectURL];
+            if (!listObjectID) {
+                fail(@"Could not build ReminderKit list object ID");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMList *list = [store fetchListWithObjectID:listObjectID error:&error];
+            if (!list) {
+                fail(error.localizedDescription ?: @"List not found");
+            }
+            REMList *group = nil;
+            id groupObjectID = nil;
+            if (hasGroup) {
+                groupObjectID = [REMObjectID objectIDWithURL:listURL(groupID)];
+                if (!groupObjectID) {
+                    fail(@"Could not build ReminderKit group object ID");
+                }
+                group = [store fetchListWithObjectID:groupObjectID error:&error];
+                if (!group) {
+                    fail(error.localizedDescription ?: @"Group not found");
+                }
+            }
+            REMAccount *account = [list respondsToSelector:@selector(account)] ? [list account] : nil;
+            if (!account && group && [group respondsToSelector:@selector(account)]) {
+                account = [group account];
+            }
+            if (!account) {
+                account = fetchWritableCloudKitAccount(store, &error);
+            }
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListChangeItem *change = [save updateList:list];
+            if (!change) {
+                fail(@"Could not create ReminderKit list change item");
+            }
+            if (![change respondsToSelector:@selector(setParentSubContainerID:)]) {
+                fail(@"ReminderKit list change item does not support group membership");
+            }
+            if ([change respondsToSelector:@selector(setParentOwnerID:)]) {
+                [change setParentOwnerID:[account remObjectID]];
+            }
+            [change setParentSubContainerID:hasGroup ? groupObjectID : nil];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit list group membership save failed");
+            }
+            NSMutableDictionary *details = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"status": @"updated",
+                @"action": action,
+                @"listId": listID,
+            }];
+            if (hasGroup) {
+                details[@"groupId"] = groupID;
+            } else {
+                details[@"groupId"] = [NSNull null];
+            }
+            output(details);
+            return 0;
+        }
+        if ([action isEqualToString:@"delete_group"]) {
+            NSString *groupID = cmd[@"groupId"];
+            if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) {
+                fail(@"groupId is required");
+            }
+            NSURL *objectURL = listURL(groupID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit group object ID");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMList *group = [store fetchListWithObjectID:objectID error:&error];
+            if (!group) {
+                fail(error.localizedDescription ?: @"Group not found");
+            }
+            REMAccount *account = [group respondsToSelector:@selector(account)] ? [group account] : nil;
+            if (!account) {
+                account = fetchWritableCloudKitAccount(store, &error);
+            }
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id accountChange = [save updateAccount:account];
+            if (!accountChange) {
+                fail(@"Could not create ReminderKit account change item");
+            }
+            REMListChangeItem *change = [save updateList:group];
+            if (!change) {
+                fail(@"Could not create ReminderKit group change item");
+            }
+            if (![change respondsToSelector:@selector(removeFromParentWithAccountChangeItem:)]) {
+                fail(@"ReminderKit group change item does not support deletion");
+            }
+            [change removeFromParentWithAccountChangeItem:accountChange];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit group delete failed");
+            }
+            output(@{
+                @"status": @"deleted",
+                @"action": action,
+                @"groupId": groupID,
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"create_section"]) {
+            NSString *listID = cmd[@"listId"];
+            NSString *name = cmd[@"name"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) fail(@"listId is required");
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
+            id listObjectID = [REMObjectID objectIDWithURL:listURL(listID)];
+            if (!listObjectID) fail(@"Could not build ReminderKit list object ID");
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            id list = [store fetchListWithObjectID:listObjectID error:&error];
+            if (!list) fail(error.localizedDescription ?: @"List not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id listChange = [save updateList:list];
+            if (!listChange) fail(@"Could not create ReminderKit list change item");
+            if (![listChange respondsToSelector:@selector(sectionsContextChangeItem)]) {
+                fail(@"ReminderKit list change item does not support sections");
+            }
+            id sectionContext = [listChange sectionsContextChangeItem];
+            if (!sectionContext) fail(@"Could not create ReminderKit section context");
+            id sectionChange = [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
+            id sectionObjectID = [sectionChange remObjectID];
+            if (!sectionObjectID) fail(@"Could not create section object ID");
+            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"])];
+            [ordering addObject:sectionObjectID];
+            [sectionContext setUnsavedSectionIDsOrdering:ordering];
+            [sectionContext setShouldUpdateSectionsOrdering:YES];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section create failed");
+            }
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"listId": listID,
+                @"name": name,
+                @"sectionURL": [[sectionObjectID urlRepresentation] absoluteString] ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"rename_section"]) {
+            NSString *sectionID = cmd[@"sectionId"];
+            NSString *name = cmd[@"name"];
+            if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
+            id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
+            if (!sectionObjectID) fail(@"Could not build ReminderKit section object ID");
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            id section = [store fetchListSectionWithObjectID:sectionObjectID error:&error];
+            if (!section) fail(error.localizedDescription ?: @"Section not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListSectionChangeItem *change = [save updateListSection:section];
+            if (!change) fail(@"Could not create ReminderKit section change item");
+            if (![change respondsToSelector:@selector(setDisplayName:)]) {
+                fail(@"ReminderKit section change item does not support rename");
+            }
+            [change setDisplayName:name];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section rename failed");
+            }
+            output(@{
+                @"status": @"renamed",
+                @"action": action,
+                @"sectionId": sectionID,
+                @"name": name,
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"delete_section"]) {
+            NSString *sectionID = cmd[@"sectionId"];
+            if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
+            id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
+            if (!sectionObjectID) fail(@"Could not build ReminderKit section object ID");
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            id section = [store fetchListSectionWithObjectID:sectionObjectID error:&error];
+            if (!section) fail(error.localizedDescription ?: @"Section not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListSectionChangeItem *change = [save updateListSection:section];
+            if (!change) fail(@"Could not create ReminderKit section change item");
+            if (![change respondsToSelector:@selector(removeFromList)]) {
+                fail(@"ReminderKit section change item does not support delete");
+            }
+            [change removeFromList];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section delete failed");
+            }
+            output(@{
+                @"status": @"deleted",
+                @"action": action,
+                @"sectionId": sectionID,
+            });
+            return 0;
+        }
         if ([action isEqualToString:@"create_smart_list"]) {
             NSString *name = cmd[@"name"];
             if (![name isKindOfClass:[NSString class]] || name.length == 0) {
@@ -748,12 +1086,9 @@ int main(int argc, const char * argv[]) {
             NSData *filterData = decodedBase64Data(cmd[@"filterData"], @"filterData");
             NSError *error = nil;
             REMStore *store = [REMStore new];
-            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            REMAccount *account = fetchWritableCloudKitAccount(store, &error);
             if (!account) {
-                account = [store fetchDefaultAccountWithError:&error];
-            }
-            if (!account) {
-                fail(error.localizedDescription ?: @"No active Reminders account found");
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
             }
             REMAccountCapabilities *capabilities = [account capabilities];
             if (!capabilities || ![capabilities supportsCustomSmartLists]) {
@@ -881,13 +1216,10 @@ int main(int argc, const char * argv[]) {
             }
             REMAccount *account = [smartList account];
             if (!account) {
-                account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+                account = fetchWritableCloudKitAccount(store, &error);
             }
             if (!account) {
-                account = [store fetchDefaultAccountWithError:&error];
-            }
-            if (!account) {
-                fail(error.localizedDescription ?: @"No active Reminders account found");
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
             }
 
             REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
@@ -931,12 +1263,9 @@ int main(int argc, const char * argv[]) {
             if (!list) {
                 fail(error.localizedDescription ?: @"Source list not found");
             }
-            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            REMAccount *account = fetchWritableCloudKitAccount(store, &error);
             if (!account) {
-                account = [store fetchDefaultAccountWithError:&error];
-            }
-            if (!account) {
-                fail(error.localizedDescription ?: @"No active Reminders account found");
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
             }
             REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
             id accountChange = [save updateAccount:account];
@@ -986,12 +1315,9 @@ int main(int argc, const char * argv[]) {
             if (!templateObject) {
                 fail(error.localizedDescription ?: @"Template not found");
             }
-            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            REMAccount *account = fetchWritableCloudKitAccount(store, &error);
             if (!account) {
-                account = [store fetchDefaultAccountWithError:&error];
-            }
-            if (!account) {
-                fail(error.localizedDescription ?: @"No active Reminders account found");
+                fail(error.localizedDescription ?: @"No active iCloud Reminders account found");
             }
             REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
             id accountChange = [save updateAccount:account];
@@ -1059,6 +1385,7 @@ int main(int argc, const char * argv[]) {
             if (!objectID) {
                 fail(@"Could not build ReminderKit list object ID");
             }
+            error = nil;
             REMStore *store = [REMStore new];
             id list = [store fetchListWithObjectID:objectID error:&error];
             if (!list) {
@@ -1083,6 +1410,7 @@ int main(int argc, const char * argv[]) {
             applyListAppearance(change, cmd, details, @"List");
             applyListGroceryMetadata(change, cmd, details);
 
+            error = nil;
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit list save failed");
             }
@@ -1103,6 +1431,7 @@ int main(int argc, const char * argv[]) {
             if (!objectID) {
                 fail(@"Could not build ReminderKit list object ID");
             }
+            error = nil;
             REMStore *store = [REMStore new];
             id list = [store fetchListWithObjectID:objectID error:&error];
             if (!list) {
@@ -1117,6 +1446,7 @@ int main(int argc, const char * argv[]) {
                 fail(@"ReminderKit list change item does not support pinning");
             }
             [change setIsPinned:[pinned boolValue]];
+            error = nil;
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit list pin save failed");
             }
@@ -1142,6 +1472,7 @@ int main(int argc, const char * argv[]) {
             if (!objectID) {
                 fail(@"Could not build ReminderKit smart list object ID");
             }
+            error = nil;
             REMStore *store = [REMStore new];
             id smartList = nil;
             if ([store respondsToSelector:@selector(fetchSmartListWithObjectID:error:)]) {
@@ -1162,6 +1493,7 @@ int main(int argc, const char * argv[]) {
                 fail(@"ReminderKit smart list change item does not support pinning");
             }
             [change setIsPinned:[pinned boolValue]];
+            error = nil;
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit smart list pin save failed");
             }
@@ -1187,6 +1519,7 @@ int main(int argc, const char * argv[]) {
             if (!objectID) {
                 fail(@"Could not build ReminderKit list object ID");
             }
+            error = nil;
             REMStore *store = [REMStore new];
             id list = [store fetchListWithObjectID:objectID error:&error];
             if (!list) {
@@ -1218,6 +1551,7 @@ int main(int argc, const char * argv[]) {
             } @catch (NSException *exception) {
                 fail([NSString stringWithFormat:@"ReminderKit grocery categorization failed: %@", exception.reason ?: exception.name]);
             }
+            error = nil;
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit grocery categorization save failed");
             }
@@ -1243,9 +1577,85 @@ int main(int argc, const char * argv[]) {
         }
 
         REMStore *store = [REMStore new];
+        error = nil;
         id reminder = [store fetchReminderWithObjectID:objectID error:&error];
         if (!reminder) {
             fail(error.localizedDescription ?: @"Reminder not found");
+        }
+
+        if ([action isEqualToString:@"clone_reminder_tree_to_list"]) {
+            NSString *listID = cmd[@"listId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            NSArray<NSString *> *childIDs = stringArray(cmd[@"childIds"], @"childIds");
+            NSURL *listObjectURL = listURL(listID);
+            id listObjectID = [REMObjectID objectIDWithURL:listObjectURL];
+            if (!listObjectID) {
+                fail(@"Could not build ReminderKit target list object ID");
+            }
+            id list = [store fetchListWithObjectID:listObjectID error:&error];
+            if (!list) {
+                fail(error.localizedDescription ?: @"Target list not found");
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id listChange = [save updateList:list];
+            if (!listChange) {
+                fail(@"Could not create ReminderKit target list change item");
+            }
+            REMReminderChangeItem *copiedParent = [save _copyReminder:reminder toListChangeItem:listChange];
+            if (!copiedParent) {
+                fail(@"Could not clone parent reminder into target list");
+            }
+
+            NSMutableArray *clonedChildren = [NSMutableArray array];
+            if (childIDs.count > 0) {
+                id subtaskContext = [copiedParent subtaskContext];
+                if (!subtaskContext) {
+                    fail(@"Cloned parent reminder does not support subtasks");
+                }
+
+                for (NSString *childID in childIDs) {
+                    id childObjectID = [REMObjectID objectIDWithURL:reminderURL(childID)];
+                    if (!childObjectID) {
+                        fail([NSString stringWithFormat:@"Could not build ReminderKit child object ID: %@", childID]);
+                    }
+                    id childReminder = [store fetchReminderWithObjectID:childObjectID error:&error];
+                    if (!childReminder) {
+                        fail(error.localizedDescription ?: [NSString stringWithFormat:@"Child reminder not found: %@", childID]);
+                    }
+                    REMReminderChangeItem *copiedChild = [save _copyReminder:childReminder toReminderSubtaskContextChangeItem:subtaskContext];
+                    if (!copiedChild) {
+                        fail([NSString stringWithFormat:@"Could not clone child reminder: %@", childID]);
+                    }
+                    id childObjectIDOut = [copiedChild remObjectID];
+                    NSString *childUUID = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(uuid)] ? [[childObjectIDOut uuid] UUIDString] : @"";
+                    NSString *childURL = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(urlRepresentation)] ? [[childObjectIDOut urlRepresentation] absoluteString] : @"";
+                    [clonedChildren addObject:@{
+                        @"sourceId": childID,
+                        @"id": childUUID ?: @"",
+                        @"url": childURL ?: @"",
+                    }];
+                }
+            }
+
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit clone save failed");
+            }
+            id parentObjectIDOut = [copiedParent remObjectID];
+            NSString *parentUUID = parentObjectIDOut && [parentObjectIDOut respondsToSelector:@selector(uuid)] ? [[parentObjectIDOut uuid] UUIDString] : @"";
+            NSString *parentURL = parentObjectIDOut && [parentObjectIDOut respondsToSelector:@selector(urlRepresentation)] ? [[parentObjectIDOut urlRepresentation] absoluteString] : @"";
+            output(@{
+                @"status": @"cloned",
+                @"action": action,
+                @"id": reminderID,
+                @"listId": listID,
+                @"newId": parentUUID ?: @"",
+                @"newUrl": parentURL ?: @"",
+                @"children": clonedChildren,
+            });
+            return 0;
         }
 
         REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
@@ -1262,6 +1672,7 @@ int main(int argc, const char * argv[]) {
             @"status": @"updated",
             @"id": reminderID,
             @"action": action ?: @"",
+            @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION),
         }];
 
         if ([action isEqualToString:@"add_private_metadata"]) {
@@ -1272,15 +1683,30 @@ int main(int argc, const char * argv[]) {
             if (urls.count == 0) fail(@"At least one URL is required");
         } else if ([action isEqualToString:@"add_tags"]) {
             if (tags.count == 0) fail(@"At least one tag is required");
+        } else if ([action isEqualToString:@"set_tags"]) {
+            id hashtagContext = [change hashtagContext];
+            if (!hashtagContext || ![hashtagContext respondsToSelector:@selector(removeAllHashtags)]) {
+                fail(@"ReminderKit hashtag context does not support tag replacement");
+            }
+            [hashtagContext removeAllHashtags];
+            details[@"tagsReplaced"] = @YES;
         } else if ([action isEqualToString:@"add_subtasks"]) {
             NSArray<NSDictionary *> *subtaskSpecs = subtaskSpecArray(cmd);
             if (subtaskSpecs.count == 0) fail(@"At least one subtask is required");
             id subtaskContext = [change subtaskContext];
+            if (!subtaskContext) {
+                fail(@"ReminderKit reminder change item does not support subtasks on this macOS version");
+            }
             NSMutableArray *subtaskURLs = [NSMutableArray array];
             NSMutableArray *subtaskDetails = [NSMutableArray array];
             for (NSDictionary *subtaskSpec in subtaskSpecs) {
                 NSString *title = subtaskSpec[@"title"];
-                id subtask = [save addReminderWithTitle:title toReminderSubtaskContextChangeItem:subtaskContext];
+                id subtask = nil;
+                @try {
+                    subtask = [save addReminderWithTitle:title toReminderSubtaskContextChangeItem:subtaskContext];
+                } @catch (NSException *exception) {
+                    failException(@"ReminderKit subtask creation failed", exception);
+                }
                 if (!subtask) fail([NSString stringWithFormat:@"Could not create subtask: %@", title]);
                 id subtaskID = [subtask remObjectID];
                 NSString *subtaskURL = subtaskID ? ([[subtaskID urlRepresentation] absoluteString] ?: @"") : @"";
@@ -1299,10 +1725,17 @@ int main(int argc, const char * argv[]) {
             NSString *sectionID = cmd[@"sectionId"];
             if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
             id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
+            error = nil;
             id section = [store fetchListSectionWithObjectID:sectionObjectID error:&error];
             if (!section) fail(error.localizedDescription ?: @"Section not found");
-            id listChange = [save updateList:[reminder list]];
+            id list = [reminder list];
+            if (!list) fail(@"Reminder has no parent list");
+            id listChange = [save updateList:list];
+            if (!listChange) fail(@"Could not create ReminderKit list change item");
             id sectionContext = [listChange sectionsContextChangeItem];
+            if (!sectionContext || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]) {
+                fail(@"ReminderKit section context unavailable");
+            }
             id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
             id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
             [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
@@ -1310,15 +1743,26 @@ int main(int argc, const char * argv[]) {
         } else if ([action isEqualToString:@"add_section_and_assign"]) {
             NSString *name = cmd[@"name"];
             if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
-            id listChange = [save updateList:[reminder list]];
+            id list = [reminder list];
+            if (!list) fail(@"Reminder has no parent list");
+            id listChange = [save updateList:list];
+            if (!listChange) fail(@"Could not create ReminderKit list change item");
             id sectionContext = [listChange sectionsContextChangeItem];
+            if (!sectionContext
+                || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]
+                || ![sectionContext respondsToSelector:@selector(setUnsavedSectionIDsOrdering:)]
+                || ![sectionContext respondsToSelector:@selector(setShouldUpdateSectionsOrdering:)]) {
+                fail(@"ReminderKit section context unavailable");
+            }
             id sectionChange = [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
             id sectionObjectID = [sectionChange remObjectID];
             if (!sectionObjectID) fail(@"Could not create section object ID");
             id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
             id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
             [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
-            [sectionContext setUnsavedSectionIDsOrdering:@[sectionObjectID]];
+            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"])];
+            [ordering addObject:sectionObjectID];
+            [sectionContext setUnsavedSectionIDsOrdering:ordering];
             [sectionContext setShouldUpdateSectionsOrdering:YES];
             details[@"sectionURL"] = [[sectionObjectID urlRepresentation] absoluteString] ?: @"";
         } else if ([action isEqualToString:@"assign_sharee"]) {
@@ -1334,6 +1778,9 @@ int main(int argc, const char * argv[]) {
             id originatorObjectID = [REMObjectID objectIDWithURL:shareeURL(originatorID)];
             if (!assigneeObjectID) fail(@"Could not build ReminderKit assignee object ID");
             if (!originatorObjectID) fail(@"Could not build ReminderKit originator object ID");
+            if (![assignmentContext respondsToSelector:@selector(removeAllAssignments)]) {
+                fail(@"ReminderKit reminder change item does not support assignment");
+            }
             [assignmentContext removeAllAssignments];
             id assignment = [(REMReminderAssignmentContextChangeItem *)assignmentContext addAssignmentWithAssigneeID:assigneeObjectID originatorID:originatorObjectID status:1];
             if (!assignment) fail(@"Could not create ReminderKit assignment");
@@ -1372,10 +1819,18 @@ int main(int argc, const char * argv[]) {
                 addedImages += 1;
             }
         } else if ([action isEqualToString:@"set_flagged"]) {
-            [[change flaggedContext] setFlagged:[cmd[@"flagged"] boolValue] ? 1 : 0];
+            id flaggedContext = [change flaggedContext];
+            if (!flaggedContext || ![flaggedContext respondsToSelector:@selector(setFlagged:)]) {
+                fail(@"ReminderKit flagged context unavailable");
+            }
+            [flaggedContext setFlagged:[cmd[@"flagged"] boolValue] ? 1 : 0];
             details[@"flagged"] = @([cmd[@"flagged"] boolValue]);
         } else if ([action isEqualToString:@"set_urgent"]) {
-            [[change urgentAlarmContext] setIsUrgentStateEnabledForCurrentUser:[cmd[@"urgent"] boolValue]];
+            id urgentContext = [change urgentAlarmContext];
+            if (!urgentContext || ![urgentContext respondsToSelector:@selector(setIsUrgentStateEnabledForCurrentUser:)]) {
+                fail(@"ReminderKit urgent context unavailable");
+            }
+            [urgentContext setIsUrgentStateEnabledForCurrentUser:[cmd[@"urgent"] boolValue]];
             details[@"urgent"] = @([cmd[@"urgent"] boolValue]);
         } else if ([action isEqualToString:@"set_early_reminder"]) {
             id context = [change dueDateDeltaAlertContext];
@@ -1435,6 +1890,9 @@ int main(int argc, const char * argv[]) {
 
         if (([action isEqualToString:@"add_private_metadata"] || [action isEqualToString:@"add_url_attachments"]) && urls.count) {
             id attachmentContext = [change attachmentContext];
+            if (!attachmentContext || ![attachmentContext respondsToSelector:@selector(addURLAttachmentWithURL:)]) {
+                fail(@"ReminderKit attachment context unavailable");
+            }
             for (NSString *urlString in urls) {
                 if (!looksLikeWebURL(urlString)) {
                     fail([NSString stringWithFormat:@"Invalid web URL: %@", urlString]);
@@ -1444,14 +1902,18 @@ int main(int argc, const char * argv[]) {
                 addedURLs += 1;
             }
         }
-        if (([action isEqualToString:@"add_private_metadata"] || [action isEqualToString:@"add_tags"]) && tags.count) {
+        if (([action isEqualToString:@"add_private_metadata"] || [action isEqualToString:@"add_tags"] || [action isEqualToString:@"set_tags"]) && tags.count) {
             id hashtagContext = [change hashtagContext];
+            if (!hashtagContext || ![hashtagContext respondsToSelector:@selector(addHashtagWithType:name:)]) {
+                fail(@"ReminderKit hashtag context unavailable");
+            }
             for (NSString *tag in tags) {
                 [hashtagContext addHashtagWithType:1 name:tag];
                 addedTags += 1;
             }
         }
 
+        error = nil;
         if (![save saveSynchronouslyWithError:&error]) {
             fail(error.localizedDescription ?: @"ReminderKit save failed");
         }
@@ -1461,6 +1923,9 @@ int main(int argc, const char * argv[]) {
         details[@"imagesAdded"] = @(addedImages);
         details[@"subtasksAdded"] = @(addedSubtasks);
         output(details);
+        } @catch (NSException *exception) {
+            failException(@"ReminderKit exception", exception);
+        }
     }
     return 0;
 }

@@ -141,27 +141,143 @@ def due_date_delta_alerts_from_row(row, *, ts=None):
 
 
 def preload_extras(db, pks):
-    """Batch-load subtask counts and hashtags to avoid N+1 queries."""
+    """Batch-load subtask counts and hashtags to avoid N+1 queries.
+
+    Each table is queried under its own try/except so a minimal fixture
+    missing one table still gets the other extra.
+    """
     if not pks:
         return {}, {}
     placeholders = ",".join("?" * len(pks))
-    subtask_rows = db.execute(
-        f"SELECT ZPARENTREMINDER, COUNT(*) FROM ZREMCDREMINDER "
-        f"WHERE ZPARENTREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0 "
-        f"AND ZCOMPLETED = 0 GROUP BY ZPARENTREMINDER",
-        pks,
-    ).fetchall()
-    subtask_counts = {row[0]: row[1] for row in subtask_rows}
-    hashtag_rows = db.execute(
-        f"SELECT o.ZREMINDER3, h.ZNAME FROM ZREMCDOBJECT o "
-        f"JOIN ZREMCDHASHTAGLABEL h ON o.ZHASHTAGLABEL = h.Z_PK "
-        f"WHERE o.ZREMINDER3 IN ({placeholders})",
-        pks,
-    ).fetchall()
+    subtask_counts = {}
     hashtags = {}
-    for row in hashtag_rows:
-        hashtags.setdefault(row[0], []).append(row[1])
+    try:
+        subtask_rows = db.execute(
+            f"SELECT ZPARENTREMINDER, COUNT(*) FROM ZREMCDREMINDER "
+            f"WHERE ZPARENTREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0 "
+            f"AND ZCOMPLETED = 0 GROUP BY ZPARENTREMINDER",
+            pks,
+        ).fetchall()
+        subtask_counts = {row[0]: row[1] for row in subtask_rows}
+    except Exception:
+        # Minimal test fixtures omit this table; extras are best-effort.
+        pass
+    try:
+        hashtag_rows = db.execute(
+            f"SELECT o.ZREMINDER3, h.ZNAME FROM ZREMCDOBJECT o "
+            f"JOIN ZREMCDHASHTAGLABEL h ON o.ZHASHTAGLABEL = h.Z_PK "
+            f"WHERE o.ZREMINDER3 IN ({placeholders}) AND o.ZMARKEDFORDELETION = 0",
+            pks,
+        ).fetchall()
+        for row in hashtag_rows:
+            hashtags.setdefault(row[0], []).append(row[1])
+    except Exception:
+        pass
     return subtask_counts, hashtags
+
+
+def _table_columns(db, table):
+    try:
+        return {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    except Exception:
+        return set()
+
+
+def preload_attachments(db, pks):
+    """Batch-load attachment rows grouped by parent reminder pk.
+
+    One query per backing table over the page of reminders; mirrors
+    preload_extras. Returns {reminder_pk: [row, ...]} with sha/width/height
+    included when the schema has those columns ("" placeholders otherwise).
+    """
+    if not pks or db is None:
+        return {}
+    placeholders = ",".join("?" * len(pks))
+    saved_cols = _table_columns(db, "ZREMCDSAVEDATTACHMENT")
+    object_cols = _table_columns(db, "ZREMCDOBJECT")
+    saved_sha = "ZSHA512SUM" if "ZSHA512SUM" in saved_cols else "NULL AS ZSHA512SUM"
+    object_sha = "ZSHA512SUM" if "ZSHA512SUM" in object_cols else "NULL AS ZSHA512SUM"
+    grouped = {}
+    try:
+        saved_rows = db.execute(
+            f"SELECT ZREMINDER, ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE, {saved_sha}, "
+            "NULL AS ZWIDTH, NULL AS ZHEIGHT "
+            f"FROM ZREMCDSAVEDATTACHMENT "
+            f"WHERE ZREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0",
+            pks,
+        ).fetchall()
+        object_rows = db.execute(
+            f"SELECT ZREMINDER2, ZFILENAME, ZUTI, "
+            "CASE WHEN ZWIDTH IS NOT NULL OR ZHEIGHT IS NOT NULL THEN 'image' ELSE 'file' END AS ZATTACHMENTTYPERAWVALUE, "
+            f"{object_sha}, ZWIDTH, ZHEIGHT "
+            f"FROM ZREMCDOBJECT "
+            f"WHERE ZREMINDER2 IN ({placeholders}) AND ZFILENAME IS NOT NULL AND ZFILENAME != '' "
+            "AND ZMARKEDFORDELETION = 0",
+            pks,
+        ).fetchall()
+    except Exception:
+        return {}
+    for row in saved_rows + object_rows:
+        grouped.setdefault(row[0], []).append(row)
+    for pk in grouped:
+        grouped[pk].sort(key=lambda row: row[1] or "")
+    return grouped
+
+
+def preload_indicators(db, pks):
+    """Batch-load one-liner badge flags: {pk: {"image": bool, "link": bool}}.
+
+    image: the reminder has at least one image attachment (ZREMCDSAVEDATTACHMENT
+    row typed 'image', or a ZREMCDOBJECT file row with dimensions).
+    link: the reminder has at least one rich link (ZREMCDOBJECT row with ZURL)
+    or a legacy saved attachment typed 'url'.
+
+    Independent of preload_attachments: a reminder can carry a link without any
+    attachment rows. Each table pair is queried under its own try/except so a
+    minimal fixture missing a table degrades to False flags, never an error.
+    """
+    if not pks or db is None:
+        return {}
+    placeholders = ",".join("?" * len(pks))
+    image_pks = set()
+    link_pks = set()
+    try:
+        saved_rows = db.execute(
+            f"SELECT ZREMINDER, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
+            f"WHERE ZREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0",
+            pks,
+        ).fetchall()
+        for row in saved_rows:
+            raw = (_row_get(row, "ZATTACHMENTTYPERAWVALUE") or "").strip().lower()
+            if raw == "url":
+                link_pks.add(row[0])
+            elif raw == "image":
+                image_pks.add(row[0])
+    except Exception:
+        pass
+    try:
+        object_rows = db.execute(
+            f"SELECT ZREMINDER2, ZWIDTH, ZHEIGHT, ZURL, ZFILENAME FROM ZREMCDOBJECT "
+            f"WHERE ZREMINDER2 IN ({placeholders}) AND ZMARKEDFORDELETION = 0 "
+            f"AND ((ZURL IS NOT NULL AND ZURL != '') OR (ZFILENAME IS NOT NULL AND ZFILENAME != ''))",
+            pks,
+        ).fetchall()
+        for row in object_rows:
+            url = _row_get(row, "ZURL")
+            if url:
+                link_pks.add(row[0])
+            filename = _row_get(row, "ZFILENAME")
+            if filename and (
+                _row_get(row, "ZWIDTH") is not None
+                or _row_get(row, "ZHEIGHT") is not None
+            ):
+                image_pks.add(row[0])
+    except Exception:
+        pass
+    return {
+        pk: {"image": pk in image_pks, "link": pk in link_pks}
+        for pk in image_pks | link_pks
+    }
 
 
 def serialize_reminder(
@@ -173,13 +289,16 @@ def serialize_reminder(
     section=None,
     subtask_counts=None,
     hashtags=None,
+    attachments=None,
     rich_link_resolver=None,
     fallback_subtask_count=None,
     fallback_hashtags=None,
+    attachment_rows_to_json=None,
 ):
     """Convert a reminder row to a JSON-serializable dict."""
     subtask_counts = subtask_counts or {}
     hashtags = hashtags or {}
+    attachments = attachments or {}
 
     subtask_count = subtask_counts.get(row["Z_PK"])
     if subtask_count is None:
@@ -232,6 +351,10 @@ def serialize_reminder(
         reminder["parentID"] = row["ZPARENTREMINDER"]
     if tags:
         reminder["tags"] = tags
+    if attachments and attachment_rows_to_json is not None:
+        attachment_payload = attachment_rows_to_json(attachments.get(row["Z_PK"], []))
+        if attachment_payload:
+            reminder["attachments"] = attachment_payload
     recurrence = recurrence_from_row(row, ts=ts)
     if recurrence:
         reminder["recurrence"] = recurrence
@@ -254,9 +377,12 @@ def serialize_reminders(
     rich_link_resolver=None,
     fallback_subtask_count=None,
     fallback_hashtags=None,
+    attachment_rows_to_json=None,
 ):
     """Convert reminder rows with shared preloaded metadata."""
-    subtask_counts, hashtags = preload_extras(db, [row["Z_PK"] for row in rows]) if db else ({}, {})
+    pks = [row["Z_PK"] for row in rows]
+    subtask_counts, hashtags = preload_extras(db, pks) if db else ({}, {})
+    attachments = preload_attachments(db, pks) if db and attachment_rows_to_json is not None else {}
     memberships = memberships or {}
     return [
         serialize_reminder(
@@ -267,9 +393,11 @@ def serialize_reminders(
             section=memberships.get(row["ZCKIDENTIFIER"]),
             subtask_counts=subtask_counts,
             hashtags=hashtags,
+            attachments=attachments,
             rich_link_resolver=rich_link_resolver,
             fallback_subtask_count=fallback_subtask_count,
             fallback_hashtags=fallback_hashtags,
+            attachment_rows_to_json=attachment_rows_to_json,
         )
         for row in rows
     ]

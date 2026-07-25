@@ -19,10 +19,10 @@ Options:
   -h, --help                  Show this help text
 
 Notes:
-  The installer copies binaries into ~/bin by default.
+  The installer copies binaries into ~/bin by default and creates rctl and reminders aliases.
   Use PREFIX="$HOME/.local" if you want ~/.local/bin instead.
   remctl-private is optional and only used by explicit --private writes.
-  Run `remctl onboard`, then `remctl permissions full-disk-access` for the visual Full Disk Access flow.
+  Run `remctl onboard`, then `remctl permissions full-disk-access` for EventKit and database access.
   Run `remctl doctor` after permissions, or pass --doctor when upgrading an already-authorized install.
 EOF
 }
@@ -87,10 +87,20 @@ cp "$SCRIPT_DIR/remctl" "$BIN_DIR/remctl"
 chmod +x "$BIN_DIR/remctl"
 echo -e "  ${GREEN}✓${RESET} remctl → $BIN_DIR/remctl"
 
+echo -e "${BLUE}→${RESET} Installing aliases..."
+ln -sf "remctl" "$BIN_DIR/rctl"
+ln -sf "remctl" "$BIN_DIR/reminders"
+echo -e "  ${GREEN}✓${RESET} rctl → $BIN_DIR/rctl"
+echo -e "  ${GREEN}✓${RESET} reminders → $BIN_DIR/reminders"
+
 echo -e "${BLUE}→${RESET} Installing shared runtime helpers..."
 cp "$SCRIPT_DIR/remctl_runtime.py" "$BIN_DIR/remctl_runtime.py"
 chmod 644 "$BIN_DIR/remctl_runtime.py"
 echo -e "  ${GREEN}✓${RESET} remctl_runtime.py → $BIN_DIR/remctl_runtime.py"
+
+cp "$SCRIPT_DIR/remctl_images.py" "$BIN_DIR/remctl_images.py"
+chmod 644 "$BIN_DIR/remctl_images.py"
+echo -e "  ${GREEN}✓${RESET} remctl_images.py → $BIN_DIR/remctl_images.py"
 
 echo -e "${BLUE}→${RESET} Installing shared serialization helpers..."
 cp "$SCRIPT_DIR/remctl_serialization.py" "$BIN_DIR/remctl_serialization.py"
@@ -102,26 +112,31 @@ cp "$SCRIPT_DIR/remctl_smart_lists.py" "$BIN_DIR/remctl_smart_lists.py"
 chmod 644 "$BIN_DIR/remctl_smart_lists.py"
 echo -e "  ${GREEN}✓${RESET} remctl_smart_lists.py → $BIN_DIR/remctl_smart_lists.py"
 
-echo -e "${BLUE}→${RESET} Installing zsh completion source..."
+echo -e "${BLUE}→${RESET} Installing shell completion sources..."
 mkdir -p "$BIN_DIR/completions"
-completion_tmp="$BIN_DIR/completions/_remctl.tmp"
-"$BIN_DIR/remctl" completion zsh > "$completion_tmp"
-mv "$completion_tmp" "$BIN_DIR/completions/_remctl"
-chmod 644 "$BIN_DIR/completions/_remctl"
-echo -e "  ${GREEN}✓${RESET} _remctl → $BIN_DIR/completions/_remctl"
+for name in remctl rctl reminders; do
+    completion_tmp="$BIN_DIR/completions/_${name}.tmp"
+    "$BIN_DIR/$name" completion zsh > "$completion_tmp"
+    mv "$completion_tmp" "$BIN_DIR/completions/_${name}"
+    chmod 644 "$BIN_DIR/completions/_${name}"
+    echo -e "  ${GREEN}✓${RESET} _${name} → $BIN_DIR/completions/_${name}"
+done
 
 # 2. Compile and install helpers
+COMPILE_LOG="$(mktemp -t remctl-compile)"
+trap 'rm -f "$COMPILE_LOG"' EXIT
 if command -v swiftc &>/dev/null; then
     echo -e "${BLUE}→${RESET} Compiling remctl-bridge (Swift/EventKit)..."
     if swiftc -O \
         -framework EventKit \
         -framework Foundation \
         -o "$BIN_DIR/remctl-bridge" \
-        "$SCRIPT_DIR/remctl-bridge.swift" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-bridge.swift" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-bridge"
         echo -e "  ${GREEN}✓${RESET} remctl-bridge → $BIN_DIR/remctl-bridge"
     else
         echo -e "  ${RED}✗${RESET} remctl-bridge failed to compile"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
         exit 1
     fi
 
@@ -130,7 +145,7 @@ if command -v swiftc &>/dev/null; then
         -framework AppKit \
         -framework Foundation \
         -o "$BIN_DIR/remctl-permissions" \
-        "$SCRIPT_DIR/remctl-permissions.swift" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-permissions.swift" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-permissions"
         echo -e "  ${GREEN}✓${RESET} remctl-permissions → $BIN_DIR/remctl-permissions"
         if [[ -f "$SCRIPT_DIR/assets/remctl-permissions-icon.png" ]]; then
@@ -140,6 +155,7 @@ if command -v swiftc &>/dev/null; then
         fi
     else
         echo -e "  ${YELLOW}⚠${RESET} remctl-permissions did not compile — guided permission UI unavailable"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
         echo -e "    ${DIM}remctl will still print manual Full Disk Access steps${RESET}"
     fi
 else
@@ -156,11 +172,12 @@ if command -v clang &>/dev/null; then
         -framework AppKit \
         -framework ReminderKit \
         -o "$BIN_DIR/remctl-private" \
-        "$SCRIPT_DIR/remctl-private.m" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-private.m" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-private"
         echo -e "  ${GREEN}✓${RESET} remctl-private → $BIN_DIR/remctl-private"
     else
         echo -e "  ${YELLOW}⚠${RESET} remctl-private did not compile — private metadata writes unavailable"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
     fi
 else
     echo -e "  ${YELLOW}⚠${RESET} clang not found — private metadata writes unavailable"
@@ -190,6 +207,15 @@ if [[ "$SETUP_SHELL" != "skip" ]]; then
     echo -e "${BLUE}→${RESET} Running remctl setup..."
     SETUP_ARGS=("$BIN_DIR/remctl" "setup" "--shell" "$SETUP_SHELL")
     "${SETUP_ARGS[@]}"
+
+    echo -e "${BLUE}→${RESET} Installing completions for aliases..."
+    for alias_name in rctl reminders; do
+        if "$BIN_DIR/$alias_name" setup --shell "$SETUP_SHELL" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${RESET} _${alias_name} installed"
+        else
+            echo -e "  ${YELLOW}⚠${RESET} _${alias_name} setup skipped"
+        fi
+    done
 fi
 
 if [[ "$RUN_DOCTOR" -eq 1 ]]; then
@@ -197,6 +223,7 @@ if [[ "$RUN_DOCTOR" -eq 1 ]]; then
     if ! "$BIN_DIR/remctl" doctor; then
         echo -e "${YELLOW}⚠${RESET}  Doctor found setup issues. This is common before macOS permissions are granted."
         echo -e "${DIM}Run '$BIN_DIR/remctl onboard'. If Full Disk Access is missing, use '$BIN_DIR/remctl permissions full-disk-access'. Then run '$BIN_DIR/remctl doctor'.${RESET}"
+        echo -e "${DIM}For agent runners, use '$BIN_DIR/remctl doctor --for-agent' in the same context that will write reminders.${RESET}"
     fi
 fi
 
@@ -205,10 +232,11 @@ echo -e "${GREEN}${BOLD}Done!${RESET} RemCTL v$("$BIN_DIR/remctl" --version) ins
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
     echo -e "${DIM}Bootstrap is ready. Next: run 'remctl onboard', then 'remctl permissions full-disk-access', then 'remctl doctor'.${RESET}"
 else
-    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual Full Disk Access setup.${RESET}"
+    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual database-access setup.${RESET}"
 fi
 if [[ "$PATH_NEEDS_UPDATE" -eq 1 ]]; then
     echo -e "${YELLOW}${BOLD}Reminder:${RESET}${YELLOW} open a new Terminal window after adding $BIN_DIR to PATH, or run commands with the full path:${RESET}"
     echo -e "  ${BOLD}$BIN_DIR/remctl onboard${RESET}"
+    echo -e "  Aliases also work: ${BOLD}$BIN_DIR/rctl${RESET} and ${BOLD}$BIN_DIR/reminders${RESET}"
 fi
 echo ""

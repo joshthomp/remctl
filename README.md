@@ -128,7 +128,7 @@ remctl list-rename --list-id 123 --new-name "Project X Archive"
 remctl info 23880 --json
 remctl accounts
 remctl today --all-accounts
-remctl add "Send invoice" -l Tasks --account Exchange
+remctl add "Send invoice" -l Projects --account Exchange
 ```
 
 RemCTL works across every Reminders account on the Mac — iCloud, Exchange, Google, other CalDAV, and on-device local. See [Multiple Accounts](#multiple-accounts) below.
@@ -150,7 +150,7 @@ remctl accounts                          # what's connected, and which is defaul
 remctl lists --all-accounts              # every account, grouped by account
 remctl today --account Exchange          # scope one command to one account
 remctl --account Exchange lists          # the flag works before the command too
-remctl add "Send invoice" -l Tasks --account "work@example.com"
+remctl add "Send invoice" -l Projects --account "work@example.com"
 remctl done 42 --account Exchange
 ```
 
@@ -171,11 +171,11 @@ export REMCTL_ACCOUNT_SCOPE=all           # or just for this shell
 
 Read commands — `lists`, `groups`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `tags`, `smart-lists`, `templates`, `stats` — run against each account in scope and merge the results. Human output groups items under bold per-account headers; JSON adds `account` and `accountType` to every item so agents can tell sources apart; `stats` reports per-account figures plus a combined total.
 
-Single-target commands — `show`, `info`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `subtasks`, `open`, `link`, `add` — find the account holding the target on their own, so `remctl show MDTP` works whether that list lives in iCloud or Exchange. Reminder IDs are per-account, so when the same ID or list name exists in more than one account in scope, RemCTL refuses and tells you to disambiguate with `--account` rather than guessing:
+Single-target commands — `show`, `info`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `subtasks`, `open`, `link`, `add` — find the account holding the target on their own, so `remctl show Projects` works whether that list lives in iCloud or Exchange. Reminder IDs are per-account, so when the same ID or list name exists in more than one account in scope, RemCTL refuses and tells you to disambiguate with `--account` rather than guessing:
 
 ```text
-$ remctl show Tasks --all-accounts
-Error: list 'Tasks' exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
+$ remctl show Projects --all-accounts
+Error: list 'Projects' exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
 ```
 
 On single-target commands, `--all-accounts` means "search every account to resolve this target", so `remctl done 42 --all-accounts` finds reminder 42 wherever it lives.

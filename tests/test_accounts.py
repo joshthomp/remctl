@@ -358,7 +358,7 @@ class TargetResolutionTests(AccountsTestBase):
         with mock.patch.object(self.mod, "_accounts_holding_list",
                                return_value=[scope[0]]) as lookup:
             picked = self.mod._pick_target_account(
-                self._args(list="Tasks", list_id=None), scope, "show")
+                self._args(list="Projects", list_id=None), scope, "show")
         self.assertIs(picked, scope[0])
         lookup.assert_called_once()
 
@@ -555,7 +555,7 @@ class BridgePayloadTests(AccountsTestBase):
 
     def test_list_payload_recovered_from_stdout(self):
         """list_calendars returns a JSON list, which core coerces to an error dict."""
-        raw = '[{"title": "Tasks", "calendarIdentifier": "CAL-1"}]'
+        raw = '[{"title": "Projects", "calendarIdentifier": "CAL-1"}]'
         coerced = {"status": "error", "message": "..."}
         with (
             mock.patch.object(self.core, "bridge_available", return_value=True),
@@ -599,11 +599,11 @@ class IdentifierBackfillTests(AccountsTestBase):
         self.account = self._account("Work", "Exchange")
 
     def test_existing_identifier_is_left_alone(self):
-        row = {"ZCKIDENTIFIER": "CK-1", "ZTITLE": "T", "list_name": "Tasks"}
+        row = {"ZCKIDENTIFIER": "CK-1", "ZTITLE": "T", "list_name": "Projects"}
         self.assertIs(self.mod._with_identifier(row, self.account), row)
 
     def test_missing_identifier_is_resolved_via_eventkit(self):
-        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Tasks"}
+        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
         with (
             mock.patch.object(self.mod, "_calendar_id_for", return_value="CAL-1"),
             mock.patch.object(self.mod, "_bridge_payload",
@@ -614,7 +614,7 @@ class IdentifierBackfillTests(AccountsTestBase):
         self.assertEqual(out["ZTITLE"], "T")
 
     def test_unresolvable_reminder_is_returned_unchanged(self):
-        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Tasks"}
+        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
         with (
             mock.patch.object(self.mod, "_calendar_id_for", return_value="CAL-1"),
             mock.patch.object(self.mod, "_bridge_payload", return_value=None),
@@ -622,7 +622,7 @@ class IdentifierBackfillTests(AccountsTestBase):
             self.assertIs(self.mod._with_identifier(row, self.account), row)
 
     def test_unknown_calendar_returns_row_unchanged(self):
-        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Tasks"}
+        row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
         with mock.patch.object(self.mod, "_calendar_id_for", return_value=None):
             self.assertIs(self.mod._with_identifier(row, self.account), row)
 
@@ -631,11 +631,11 @@ class IdentifierBackfillTests(AccountsTestBase):
 
     def test_calendar_lookup_matches_on_list_and_account(self):
         calendars = [
-            {"title": "Tasks", "calendarIdentifier": "CAL-OTHER", "sourceTitle": "iCloud"},
-            {"title": "Tasks", "calendarIdentifier": "CAL-WORK", "sourceTitle": "Work"},
+            {"title": "Projects", "calendarIdentifier": "CAL-OTHER", "sourceTitle": "iCloud"},
+            {"title": "Projects", "calendarIdentifier": "CAL-WORK", "sourceTitle": "Work"},
         ]
         with mock.patch.object(self.mod, "_bridge_payload", return_value=calendars):
-            self.assertEqual(self.mod._calendar_id_for("Tasks", self.account), "CAL-WORK")
+            self.assertEqual(self.mod._calendar_id_for("Projects", self.account), "CAL-WORK")
 
     def test_q_reminder_is_wrapped_inside_account_context(self):
         original = self.core.q_reminder

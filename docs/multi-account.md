@@ -32,9 +32,21 @@ No core command is modified. Instead:
   the *unmodified* core handler runs against it.
 - **Writes** — an `account` field is injected into outgoing bridge payloads;
   `remctl-bridge` resolves a `(list, account)` pair to a stable calendar.
-- **Aggregation** — for `lists`, `search`, `today`, etc. the core handler is
-  run once per account and its output merged (JSON payloads are parsed and
-  tagged with `account`/`accountType`; human output gets per-account headers).
+- **Aggregation** — for `lists`, `search`, `today`, `show`, etc. the core
+  handler is run once per account and its output merged (JSON payloads are
+  parsed and tagged with `account`/`accountType`; human output gets
+  per-account headers). Both streams are captured per account, so an account
+  that simply lacks the requested list contributes nothing instead of leaking
+  a "not found" error; if every account fails, the error is surfaced and the
+  exit code preserved.
+
+The split is **read vs. act**, not reminder vs. list. Reads aggregate, because
+showing every match is more useful than refusing. Commands that mutate a single
+item (`add`, `done`, `edit`, `delete`, `list-delete`, `section-create`, ...)
+refuse an ambiguous target, because acting on the wrong account's copy is not
+recoverable. `AGGREGATE_COMMANDS`, `REMINDER_TARGET_COMMANDS` and
+`LIST_TARGET_COMMANDS` encode that split, and a test asserts every name in them
+is a real subcommand — a typo there silently disables the flags for a command.
 
 The practical consequence: **upstream changes to those commands are inherited
 automatically** rather than needing to be re-merged. When upstream added list
@@ -120,7 +132,7 @@ The suite is green in both configurations:
 
 | Configuration | Result |
 |---|---|
-| Extension present | 423 passed |
+| Extension present | 431 passed |
 | Extension deleted | 350 passed (stock upstream) |
 
 Determinism note: `tests/conftest.py` pins each test run to an empty config
@@ -131,7 +143,7 @@ reproduce in CI — those tests assert `main()` dispatches to exactly `cmd_show`
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (73 tests):
+`tests/test_accounts.py` covers the extension in isolation (81 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
 dispatch installation, bridge payload handling, and identifier backfill.

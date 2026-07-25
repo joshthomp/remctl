@@ -358,7 +358,7 @@ class TargetResolutionTests(AccountsTestBase):
         with mock.patch.object(self.mod, "_accounts_holding_list",
                                return_value=[scope[0]]) as lookup:
             picked = self.mod._pick_target_account(
-                self._args(list="Projects", list_id=None), scope, "show")
+                self._args(list="Projects", list_id=None), scope, "add")
         self.assertIs(picked, scope[0])
         lookup.assert_called_once()
 
@@ -425,15 +425,18 @@ class InstallTests(AccountsTestBase):
 
 
 class AggregateOutputTests(AccountsTestBase):
+    def _ok(self, text):
+        return self.mod.CaptureResult(text, "", True)
+
     def test_human_output_gets_per_account_headers(self):
         scope = [self._account("iCloud"), self._account("Work", "Exchange")]
         outputs = {"iCloud": "one\n", "Work": "two\n"}
 
         def handler(a):
-            print(outputs[self._current])
+            pass
 
         def fake_capture(_h, _a, account):
-            return outputs[account.name]
+            return self._ok(outputs[account.name])
 
         with mock.patch.object(self.mod, "_run_capture", side_effect=fake_capture):
             with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -446,7 +449,7 @@ class AggregateOutputTests(AccountsTestBase):
 
     def test_single_account_scope_has_no_header(self):
         scope = [self._account("iCloud")]
-        with mock.patch.object(self.mod, "_run_capture", return_value="body\n"):
+        with mock.patch.object(self.mod, "_run_capture", return_value=self._ok("body\n")):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.mod._aggregate(lambda a: None, self._args(), scope)
         self.assertEqual(out.getvalue().strip(), "body")
@@ -455,7 +458,7 @@ class AggregateOutputTests(AccountsTestBase):
         scope = [self._account("iCloud"), self._account("Work", "Exchange")]
         payloads = {"iCloud": json.dumps([{"id": 1}]), "Work": json.dumps([{"id": 2}])}
         with mock.patch.object(self.mod, "_run_capture",
-                               side_effect=lambda _h, _a, acct: payloads[acct.name]):
+                               side_effect=lambda _h, _a, acct: self._ok(payloads[acct.name])):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.mod._aggregate(lambda a: None, self._args(json=True), scope)
         merged = json.loads(out.getvalue())
@@ -466,7 +469,9 @@ class AggregateOutputTests(AccountsTestBase):
         scope = [self._account("iCloud"), self._account("Broken", "Exchange")]
 
         def capture(_h, _a, account):
-            return None if account.name == "Broken" else "ok\n"
+            if account.name == "Broken":
+                return self.mod.CaptureResult("", "boom\n", False)
+            return self._ok("ok\n")
 
         with mock.patch.object(self.mod, "_run_capture", side_effect=capture):
             with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -475,31 +480,106 @@ class AggregateOutputTests(AccountsTestBase):
         self.assertNotIn("Broken", out.getvalue())
 
 
+class CommandClassificationTests(AccountsTestBase):
+    """Reads aggregate; commands that act on one thing refuse an ambiguous name."""
+
+    def test_reads_aggregate_across_accounts(self):
+        for name in ("show", "sections", "sharees", "lists", "search", "today"):
+            self.assertIn(name, self.mod.AGGREGATE_COMMANDS, name)
+
+    def test_mutations_stay_single_target(self):
+        for name in ("add", "list-edit", "list-delete", "section-create"):
+            self.assertIn(name, self.mod.LIST_TARGET_COMMANDS, name)
+            self.assertNotIn(name, self.mod.AGGREGATE_COMMANDS, name)
+
+    def test_reminder_mutations_stay_single_target(self):
+        for name in ("done", "undone", "edit", "delete", "flag", "unflag"):
+            self.assertIn(name, self.mod.REMINDER_TARGET_COMMANDS, name)
+            self.assertNotIn(name, self.mod.AGGREGATE_COMMANDS, name)
+
+    def test_no_command_is_both_aggregate_and_targeted(self):
+        targeted = self.mod.REMINDER_TARGET_COMMANDS | self.mod.LIST_TARGET_COMMANDS
+        self.assertEqual(self.mod.AGGREGATE_COMMANDS & targeted, set())
+
+    def test_every_classified_name_is_a_real_command(self):
+        """Guards against typos like "section" for the real "sections"."""
+        parser, sub = self.core.build_parser()
+        known = set(sub.choices)
+        classified = (self.mod.AGGREGATE_COMMANDS
+                      | self.mod.REMINDER_TARGET_COMMANDS
+                      | self.mod.LIST_TARGET_COMMANDS)
+        self.assertEqual(classified - known, set())
+
+
+class AggregateErrorHandlingTests(AccountsTestBase):
+    def _result(self, out="", err="", ok=True):
+        return self.mod.CaptureResult(out, err, ok)
+
+    def test_missing_in_some_accounts_does_not_leak_errors(self):
+        """`show X --all-accounts` must not print "not found" for accounts
+        that simply do not have list X."""
+        scope = [self._account("Has"), self._account("Missing", "Exchange")]
+
+        def capture(_h, _a, account):
+            if account.name == "Missing":
+                return self._result(err="Error: list not found: X\n", ok=False)
+            return self._result(out="X:\n[ ] #1 item\n")
+
+        with mock.patch.object(self.mod, "_run_capture", side_effect=capture):
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.mod._aggregate(lambda a: None, self._args(), scope)
+        self.assertIn("#1 item", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_missing_in_every_account_surfaces_the_error(self):
+        scope = [self._account("A"), self._account("B", "Exchange")]
+        with mock.patch.object(
+            self.mod, "_run_capture",
+            return_value=self._result(err="Error: list not found: X\n", ok=False),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()) as err, \
+                 self.assertRaises(SystemExit) as raised:
+                self.mod._aggregate(lambda a: None, self._args(), scope)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("list not found", err.getvalue())
+
+
 class RunCaptureTests(AccountsTestBase):
-    def test_nonzero_exit_reports_no_output(self):
+    def _capture(self, handler):
+        with mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()):
+            return self.mod._run_capture(handler, self._args(), self._account("A"))
+
+    def test_nonzero_exit_is_marked_not_ok(self):
         def handler(a):
             print("partial")
             sys.exit(1)
 
-        with mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()):
-            self.assertIsNone(
-                self.mod._run_capture(handler, self._args(), self._account("A")))
+        self.assertFalse(self._capture(handler).ok)
 
     def test_clean_exit_zero_keeps_output(self):
         def handler(a):
             print("done")
 
-        with mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()):
-            self.assertEqual(
-                self.mod._run_capture(handler, self._args(), self._account("A")), "done\n")
+        result = self._capture(handler)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.out, "done\n")
+
+    def test_stderr_is_captured_not_leaked(self):
+        """An account missing the target must not print to the real stderr."""
+        def handler(a):
+            print("nope", file=sys.stderr)
+            sys.exit(1)
+
+        result = self._capture(handler)
+        self.assertFalse(result.ok)
+        self.assertIn("nope", result.err)
 
     def test_unavailable_database_is_not_fatal(self):
         def handler(a):
             raise self.core.RemindersDBUnavailable("nope")
 
-        with mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()):
-            self.assertIsNone(
-                self.mod._run_capture(handler, self._args(), self._account("A")))
+        self.assertFalse(self._capture(handler).ok)
 
 
 class CommandTokenScannerTests(AccountsTestBase):

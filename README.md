@@ -169,16 +169,31 @@ export REMCTL_ACCOUNT_SCOPE=all           # or just for this shell
 
 ### What you get across accounts
 
-Read commands — `lists`, `groups`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `tags`, `smart-lists`, `templates`, `stats` — run against each account in scope and merge the results. Human output groups items under bold per-account headers; JSON adds `account` and `accountType` to every item so agents can tell sources apart; `stats` reports per-account figures plus a combined total.
+Read commands — `lists`, `groups`, `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `sections`, `sharees`, `tags`, `smart-lists`, `templates`, `stats` — run against each account in scope and merge the results. Human output groups items under bold per-account headers; JSON adds `account` and `accountType` to every item so agents can tell sources apart; `stats` reports per-account figures plus a combined total.
 
-Single-target commands — `show`, `info`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `subtasks`, `open`, `link`, `add` — find the account holding the target on their own, so `remctl show Projects` works whether that list lives in iCloud or Exchange. Reminder IDs are per-account, so when the same ID or list name exists in more than one account in scope, RemCTL refuses and tells you to disambiguate with `--account` rather than guessing:
+Because these are reads, a list name that exists in more than one account is not an error — you get each match in turn:
 
 ```text
 $ remctl show Projects --all-accounts
-Error: list 'Projects' exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
+  work@example.com
+Projects:
+[ ] #44 Draft the Q3 summary
+
+  personal@example.com
+Projects:
+[ ] #12 Renew passport
 ```
 
-On single-target commands, `--all-accounts` means "search every account to resolve this target", so `remctl done 42 --all-accounts` finds reminder 42 wherever it lives.
+Accounts that don't have the list are skipped silently rather than reporting "not found"; if *no* account has it, the command errors and exits non-zero as usual.
+
+Commands that **act** on a single thing — `add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `info`, `subtasks`, `open`, `link`, `list-edit`, `list-delete`, `section-create` — resolve the account themselves, so `remctl done 42` works wherever reminder 42 lives. Here an ambiguous target *is* refused, because acting on the wrong account's copy is not recoverable:
+
+```text
+$ remctl done 42 --all-accounts
+Error: reminder id 42 exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
+```
+
+On these commands `--all-accounts` means "search every account to resolve this target".
 
 `export` and `import` stay single-account by design, since IDs collide across accounts.
 

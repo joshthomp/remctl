@@ -84,9 +84,13 @@ def config_file():
     return core.CONFIG_DIR / "config.json"
 
 # Commands that aggregate across accounts: run once per account, merge output.
+# These are pure reads, so showing every match is more useful than refusing --
+# `show`/`sharees` name a list, and a name that exists in two accounts simply
+# yields two blocks rather than an ambiguity error.
 AGGREGATE_COMMANDS = {
     "lists", "groups", "search", "today", "flagged", "urgent",
     "upcoming", "overdue", "tags", "smart-lists", "templates", "stats",
+    "show", "sections", "sharees",
 }
 
 # Commands that act on a single reminder identified by numeric id.
@@ -96,10 +100,11 @@ REMINDER_TARGET_COMMANDS = {
 }
 
 # Commands that act on a single list.
+# Commands that act on a single list. These keep refusing an ambiguous name:
+# creating or deleting in the wrong account is not recoverable.
 LIST_TARGET_COMMANDS = {
-    "show", "add", "export", "import", "list-edit", "list-delete",
-    "section", "section-create", "section-rename", "section-delete",
-    "sharees",
+    "add", "export", "import", "list-edit", "list-delete",
+    "section-create", "section-rename", "section-delete",
 }
 
 # Commands whose output is inherently one account's: offering --all-accounts
@@ -452,22 +457,29 @@ def account_context(account):
         core.q_reminder = prev_q_reminder
 
 
-def _run_capture(handler, a, account):
-    """Run a core handler against *account*, returning its stdout.
+CaptureResult = namedtuple("CaptureResult", ["out", "err", "ok"])
 
-    Returns None when the command exited non-zero for this account, which in
-    aggregate mode simply means "nothing here" rather than a fatal error.
+
+def _run_capture(handler, a, account):
+    """Run a core handler against *account* and capture its output.
+
+    Both streams are captured. A non-zero exit for one account is not fatal
+    during aggregation -- a list simply may not exist in every account -- so
+    the failure is reported through `ok` and its stderr is held back rather
+    than interleaved with the accounts that did produce output.
     """
-    buffer = io.StringIO()
+    out, err = io.StringIO(), io.StringIO()
+    ok = True
     try:
-        with account_context(account), contextlib.redirect_stdout(buffer):
+        with (account_context(account),
+              contextlib.redirect_stdout(out),
+              contextlib.redirect_stderr(err)):
             handler(a)
     except SystemExit as exc:
-        if exc.code not in (0, None):
-            return None
+        ok = exc.code in (0, None)
     except core.RemindersDBUnavailable:
-        return None
-    return buffer.getvalue()
+        ok = False
+    return CaptureResult(out.getvalue(), err.getvalue(), ok)
 
 
 # ── Aggregating across accounts ──────────────────────────────────────────────
@@ -516,12 +528,8 @@ def _merge_json(results):
 def _aggregate(handler, a, scope):
     """Run *handler* once per account and emit a combined result."""
     multi = len(scope) > 1
-    results = []
-    for account in scope:
-        text = _run_capture(handler, a, account)
-        if text is None:
-            continue
-        results.append((account, text))
+    captured = [(account, _run_capture(handler, a, account)) for account in scope]
+    results = [(account, r.out) for account, r in captured if r.ok]
 
     if getattr(a, "json", False) or getattr(a, "format", None) == "json":
         print(json.dumps(_merge_json(results), indent=2, ensure_ascii=False))
@@ -537,11 +545,18 @@ def _aggregate(handler, a, scope):
             print(core.C.bold(f"  {account.name}"))
         printed = True
         print(text.rstrip("\n"))
-    if not printed:
-        # Fall back to the core command's own empty-state message.
-        for account in scope[:1]:
-            with account_context(account):
-                handler(a)
+    if printed:
+        return
+
+    # Nothing anywhere. Surface a real error if every account reported one,
+    # otherwise let the core command print its own empty-state message.
+    errors = [r.err for _, r in captured if not r.ok and r.err.strip()]
+    if errors and len(errors) == len(captured):
+        sys.stderr.write(errors[0])
+        sys.exit(1)
+    for account in scope[:1]:
+        with account_context(account):
+            handler(a)
 
 
 # ── Targeting a single account ───────────────────────────────────────────────

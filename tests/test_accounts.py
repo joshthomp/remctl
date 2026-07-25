@@ -409,6 +409,13 @@ class InstallTests(AccountsTestBase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("does not support --account", err.getvalue())
 
+    def test_single_account_commands_do_not_offer_all_accounts(self):
+        """export/import cannot merge across accounts, so the flag is withheld."""
+        self.assertIn("export", self.mod.SINGLE_ACCOUNT_COMMANDS)
+        self.assertIn("import", self.mod.SINGLE_ACCOUNT_COMMANDS)
+        self.assertNotIn("show", self.mod.SINGLE_ACCOUNT_COMMANDS)
+        self.assertNotIn("done", self.mod.SINGLE_ACCOUNT_COMMANDS)
+
     def test_all_accounts_flag_rejected_for_unsupported_command(self):
         sub = self._sub_with("export", options=("--account",))
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):

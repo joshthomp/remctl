@@ -102,6 +102,10 @@ LIST_TARGET_COMMANDS = {
     "sharees",
 }
 
+# Commands whose output is inherently one account's: offering --all-accounts
+# would imply a merge they cannot perform (IDs collide across accounts).
+SINGLE_ACCOUNT_COMMANDS = {"export", "import"}
+
 # Bridge actions that write; these get an `account` hint when scoped.
 BRIDGE_WRITE_ACTIONS = {
     "create", "update", "delete", "complete", "uncomplete", "flag", "unflag",
@@ -711,8 +715,13 @@ def register_cli(p, sub):
 
     for name in sorted(AGGREGATE_COMMANDS | REMINDER_TARGET_COMMANDS | LIST_TARGET_COMMANDS):
         parser = sub.choices.get(name)
-        if parser is not None:
-            _add_scope_flags(parser, all_accounts=name in AGGREGATE_COMMANDS)
+        if parser is None:
+            continue
+        # On aggregate commands --all-accounts means "read from every account".
+        # On single-target commands it means "search every account to resolve
+        # the target". SINGLE_ACCOUNT_COMMANDS opt out entirely: their output
+        # is per-account by nature, so the flag could only mislead.
+        _add_scope_flags(parser, all_accounts=name not in SINGLE_ACCOUNT_COMMANDS)
 
     c = sub.add_parser("accounts", help="List connected Reminders accounts")
     c.add_argument("--json", action="store_true", help="Output JSON")

@@ -193,6 +193,200 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(self.remctl.parse_recurrence("weekly funday"))
         self.assertIsNone(self.remctl.parse_recurrence("monthly 0,32"))
 
+    def test_parse_recurrence_accepts_interval_tokens(self):
+        self.assertEqual(
+            self.remctl.parse_recurrence("yearly x2"),
+            {"frequency": "yearly", "interval": 2},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("weekly x2 thu"),
+            {"frequency": "weekly", "interval": 2, "daysOfWeek": [5]},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly x6"),
+            {"frequency": "monthly", "interval": 6},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly x2 4th-fri"),
+            {
+                "frequency": "monthly",
+                "interval": 2,
+                "daysOfWeek": [6],
+                "weekNumbers": [4],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("daily x999"),
+            {"frequency": "daily", "interval": 999},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly x3 15"),
+            {"frequency": "monthly", "interval": 3, "daysOfMonth": [15]},
+        )
+
+    def test_parse_recurrence_rejects_bad_interval_tokens(self):
+        for spec in (
+            "yearly x0",
+            "yearly x",
+            "yearly x1000",
+            "yearly x²",
+            "daily x2 extra",
+            "daily x2 mon",
+            "weekly x2 thu extra",
+        ):
+            with self.subTest(spec=spec):
+                self.assertIsNone(self.remctl.parse_recurrence(spec))
+        # A huge digit run must return None, not trip CPython's int() length cap.
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x" + "9" * 5000))
+
+    def test_parse_recurrence_accepts_nth_weekday_tokens(self):
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly 4th-fri"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [4],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly 1st-mon,3rd-mon"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [2, 2],
+                "weekNumbers": [1, 3],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly -1-fri"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [-1],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly last-fri"),
+            self.remctl.parse_recurrence("monthly -1-fri"),
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly last-sun"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [1],
+                "weekNumbers": [-1],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly 2nd-tue,-2-thu"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [3, 5],
+                "weekNumbers": [2, -2],
+            },
+        )
+
+    def test_parse_recurrence_rejects_bad_nth_weekday_tokens(self):
+        for spec in (
+            "monthly 6th-fri",
+            "monthly 0th-fri",
+            "monthly -6-fri",
+            "monthly 4st-fri",
+            "monthly 1th-fri",
+            "monthly 2rd-fri",
+            "monthly 4th-funday",
+            "monthly 4th-fri,15",
+            "monthly 15,4th-fri",
+            "monthly last-funday",
+            "weekly 4th-fri",
+            "yearly 4th-fri",
+        ):
+            with self.subTest(spec=spec):
+                self.assertIsNone(self.remctl.parse_recurrence(spec))
+
+    def test_parse_recurrence_rejects_non_decimal_day_of_month(self):
+        self.assertIsNone(self.remctl.parse_recurrence("monthly ²"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly " + "9" * 5000))
+
+    def test_recurrence_summary_renders_week_pinned_days_and_counts(self):
+        summary = self.remctl.recurrence_summary
+        self.assertEqual(
+            summary({
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [4],
+            }),
+            "monthly 4th Fri",
+        )
+        self.assertEqual(
+            summary({
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [-1],
+            }),
+            "monthly last Fri",
+        )
+        self.assertEqual(
+            summary({
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [-2],
+            }),
+            "monthly 2nd-last Fri",
+        )
+        self.assertEqual(
+            summary({
+                "frequency": "monthly",
+                "interval": 2,
+                "daysOfWeek": [3],
+                "weekNumbers": [4],
+            }),
+            "every 2 months 4th Tue",
+        )
+        # The stored-blob shape from recurrence_from_row renders identically.
+        self.assertEqual(
+            summary({
+                "frequency": "monthly",
+                "interval": 2,
+                "daysOfWeekDetailed": [{"weekNumber": 4, "dayOfTheWeek": 3}],
+                "daysOfWeek": [3],
+            }),
+            "every 2 months 4th Tue",
+        )
+        # weekNumber 0 in the blob means "any week".
+        self.assertEqual(
+            summary({
+                "frequency": "weekly",
+                "interval": 1,
+                "daysOfWeekDetailed": [
+                    {"weekNumber": 0, "dayOfTheWeek": 2},
+                    {"weekNumber": 0, "dayOfTheWeek": 4},
+                ],
+                "daysOfWeek": [2, 4],
+            }),
+            "weekly Mon, Wed",
+        )
+        # Missing weekNumbers entries stay unpinned.
+        self.assertEqual(
+            summary({"frequency": "weekly", "interval": 1, "daysOfWeek": [2, 4]}),
+            "weekly Mon, Wed",
+        )
+        self.assertEqual(
+            summary({"frequency": "daily", "interval": 1, "count": 5}),
+            "daily, 5 times",
+        )
+        self.assertEqual(
+            summary({"frequency": "daily", "interval": 1, "count": 1}),
+            "daily, 1 time",
+        )
+
     def test_private_call_returns_structured_error_payload(self):
         with mock.patch.object(
             self.remctl,
@@ -3480,7 +3674,7 @@ class CliTests(unittest.TestCase):
                     "resolve_list_or_die",
                     return_value={"id": 1, "title": "Work", "requested": "Work", "method": "exact"},
                 ),
-                mock.patch.object(self.remctl, "osa_flag_reminder_try", return_value=True) as flag_try,
+                mock.patch.object(self.remctl, "osa_set_flagged_result", return_value=(True, "")) as flag_try,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.remctl.cmd_add(args)
@@ -3489,7 +3683,7 @@ class CliTests(unittest.TestCase):
 
         bridge_payload = bridge_call_result.call_args.args[0]
         self.assertNotIn("flagged", bridge_payload)
-        flag_try.assert_called_once_with("Work", "FLAG-ID")
+        flag_try.assert_called_once_with("FLAG-ID", flagged=True)
 
     def test_cmd_add_flag_applescript_failure_warns_without_failing(self):
         args = SimpleNamespace(
@@ -3537,7 +3731,11 @@ class CliTests(unittest.TestCase):
                 return_value={"id": 1, "title": "Work", "requested": "Work", "method": "exact"},
             ),
             mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
-            mock.patch.object(self.remctl, "osa_flag_reminder_try", return_value=False),
+            mock.patch.object(
+                self.remctl,
+                "osa_set_flagged_result",
+                return_value=(False, "Not authorized to send Apple events to Reminders. (-1743)"),
+            ),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
@@ -3545,6 +3743,69 @@ class CliTests(unittest.TestCase):
 
         self.assertIn("Created:", stdout.getvalue())
         self.assertIn("failed to set the flag via AppleScript", stderr.getvalue())
+        self.assertIn("-1743", stderr.getvalue())
+
+    def test_cmd_add_flag_applescript_failure_surfaces_warning_in_json(self):
+        args = SimpleNamespace(
+            title="Flagged task",
+            list="Work",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=True,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            json=True,
+            flagged=None,
+            urgent=None,
+            early_reminder=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "FLAG-ID"}),
+            ),
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 1, "title": "Work", "requested": "Work", "method": "exact"},
+            ),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            mock.patch.object(
+                self.remctl,
+                "osa_set_flagged_result",
+                return_value=(False, "Not authorized to send Apple events to Reminders. (-1743)"),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.remctl.cmd_add(args)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "created")
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertIn("flag_not_set", payload["warnings"][0])
+        self.assertIn("-1743", payload["warnings"][0])
 
     def test_q_recent_reminder_by_title_returns_sqlite_row_without_get(self):
         db = self._due_window_db()
@@ -4810,16 +5071,99 @@ class CliTests(unittest.TestCase):
             "cmd_delete", SimpleNamespace(id=1, json=True, force=True), "delete"
         )
 
-    def test_cmd_flag_is_applescript_first(self):
-        # Bridge has no flagged property — priority=1 as proxy is lossy.
-        self._assert_applescript_first(
-            "cmd_flag", SimpleNamespace(id=1, json=True), "set flagged of r to true"
+    def _flag_cmd(self, cmd_name, *, set_result):
+        reminder = self._FAKE_REMINDER
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(
+                self.remctl, "osa_set_flagged_result", return_value=set_result
+            ) as set_flag,
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                getattr(self.remctl, cmd_name)(SimpleNamespace(id=1, json=True))
+                exit_code = None
+            except SystemExit as exc:
+                exit_code = exc.code
+        return SimpleNamespace(
+            stdout=out.getvalue(),
+            stderr=err.getvalue(),
+            exit_code=exit_code,
+            set_flag=set_flag,
+            bridge_call=bridge_call,
         )
 
-    def test_cmd_unflag_is_applescript_first(self):
-        self._assert_applescript_first(
-            "cmd_unflag", SimpleNamespace(id=1, json=True), "set flagged of r to false"
+    def test_cmd_flag_writes_real_flag_via_applescript_only(self):
+        result = self._flag_cmd("cmd_flag", set_result=(True, ""))
+        self.assertIsNone(result.exit_code)
+        result.set_flag.assert_called_once_with(
+            self._FAKE_REMINDER["ZCKIDENTIFIER"], flagged=True
         )
+        result.bridge_call.assert_not_called()
+        self.assertEqual(json.loads(result.stdout)["status"], "flagged")
+
+    def test_cmd_unflag_writes_real_flag_via_applescript_only(self):
+        result = self._flag_cmd("cmd_unflag", set_result=(True, ""))
+        self.assertIsNone(result.exit_code)
+        result.set_flag.assert_called_once_with(
+            self._FAKE_REMINDER["ZCKIDENTIFIER"], flagged=False
+        )
+        result.bridge_call.assert_not_called()
+        self.assertEqual(json.loads(result.stdout)["status"], "unflagged")
+
+    def test_cmd_flag_applescript_failure_is_an_error_not_bridge_fallback(self):
+        # The old bridge fallback set priority=1 as a "flag proxy" and reported
+        # success without ever touching ZFLAGGED; reminders in group-nested
+        # lists hit it deterministically because their lists are invisible to
+        # `tell list "<name>"`.
+        result = self._flag_cmd(
+            "cmd_flag",
+            set_result=(False, 'Can\u2019t get list "Editorial". (-1728)'),
+        )
+        self.assertEqual(result.exit_code, 1)
+        result.bridge_call.assert_not_called()
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["code"], "applescript_flag_failed")
+        self.assertIn("-1728", payload["message"])
+
+    def test_cmd_unflag_applescript_failure_is_an_error_not_bridge_fallback(self):
+        result = self._flag_cmd("cmd_unflag", set_result=(False, "AppleScript timed out after 120s"))
+        self.assertEqual(result.exit_code, 1)
+        result.bridge_call.assert_not_called()
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["code"], "applescript_flag_failed")
+        self.assertIn("timed out", payload["message"])
+
+    def test_osa_set_flagged_result_addresses_reminder_at_app_level(self):
+        # `tell list "<name>"` cannot see lists nested inside groups (-1728);
+        # the app-level `reminder id` specifier reaches reminders in any list.
+        with mock.patch.object(self.remctl.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            ok, err = self.remctl.osa_set_flagged_result("ABC-123", flagged=True)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        script = run.call_args.args[0][2]
+        self.assertIn('reminder id "x-apple-reminder://ABC-123"', script)
+        self.assertIn("to true", script)
+        self.assertNotIn("tell list", script)
+
+    def test_osa_set_flagged_result_surfaces_osascript_stderr(self):
+        with mock.patch.object(self.remctl.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr='36:40: execution error: Reminders got an error: Can\u2019t get list "Editorial". (-1728)\n',
+            )
+            ok, err = self.remctl.osa_set_flagged_result("ABC-123", flagged=False)
+        self.assertFalse(ok)
+        self.assertIn("-1728", err)
+        script = run.call_args.args[0][2]
+        self.assertIn("to false", script)
 
     def test_cmd_edit_due_date_is_bridge_first(self):
         reminder = self._FAKE_REMINDER
@@ -5183,6 +5527,132 @@ class CliTests(unittest.TestCase):
         payload = bridge_call_result.call_args.args[0]
         self.assertTrue(payload["clearAlarms"])
         self.assertNotIn("alarm", payload)
+
+    @staticmethod
+    def _edit_args(**overrides):
+        base = dict(
+            id=1, json=True, title=None, list=None, list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_cmd_edit_json_echoes_the_new_title_after_a_rename(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args(title="Renamed")
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "updated")
+        self.assertEqual(payload["id"], 1)
+        self.assertEqual(payload["title"], "Renamed")
+
+    def test_cmd_edit_json_echoes_the_existing_title_when_the_edit_is_not_a_rename(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args(priority="high")
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        self.assertEqual(json.loads(stdout.getvalue())["title"], reminder["ZTITLE"])
+
+    def test_cmd_edit_applescript_fallback_json_echoes_title(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args(title="Renamed")
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "updated")
+        self.assertEqual(payload["title"], "Renamed")
+
+    def test_cmd_edit_private_only_json_echoes_title(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args(private=True, flagged=True)
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+            mock.patch.object(
+                self.remctl,
+                "apply_private_changes",
+                return_value=[{"status": "updated", "action": "set_flagged"}],
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        bridge_call_result.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "updated")
+        self.assertEqual(payload["title"], reminder["ZTITLE"])
+        self.assertEqual(len(payload["private"]), 1)
+
+    def test_cmd_edit_nothing_to_update_emits_structured_json_and_exits_zero(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        osa_try.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "unchanged")
+        self.assertEqual(payload["code"], "nothing_to_update")
+        self.assertEqual(payload["id"], 1)
+        self.assertEqual(payload["title"], reminder["ZTITLE"])
+        self.assertEqual(payload["message"], "Nothing to update.")
+
+    def test_cmd_edit_nothing_to_update_stays_plain_text_without_json(self):
+        reminder = self._FAKE_REMINDER
+        args = self._edit_args(json=False)
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        self.assertEqual(stdout.getvalue().strip(), "Nothing to update.")
 
     def test_cmd_edit_moves_reminder_to_list_through_eventkit_bridge(self):
         reminder = self._FAKE_REMINDER
@@ -5548,6 +6018,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["id"], 42)
         self.assertEqual(result["oldId"], 1)
         self.assertEqual(result["subtasksMoved"], 0)
+        # The cloned row is read back before Reminders has filled in its title,
+        # so the move result falls back to the source reminder's title.
+        self.assertEqual(result["title"], "Move me")
+
+    def test_emit_clone_delete_move_result_json_echoes_title(self):
+        args = SimpleNamespace(json=True)
+        move_result = {
+            "status": "updated",
+            "id": 42,
+            "oldId": 1,
+            "title": "Move me",
+            "list": "Projects",
+            "objectUUID": "NEW-REMINDER",
+            "subtasksMoved": 0,
+            "method": "clone-delete",
+            "delete": {"status": "deleted"},
+        }
+        target = {"id": 9, "title": "Projects", "requested": "Projects", "method": "exact"}
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.remctl.emit_clone_delete_move_result(args, move_result, target)
+
+        self.assertEqual(json.loads(stdout.getvalue())["title"], "Move me")
 
     def test_cmd_edit_resolves_private_section_against_destination_list(self):
         reminder = self._FAKE_REMINDER

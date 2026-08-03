@@ -5,7 +5,7 @@ description: Use when an agent needs to read, create, edit, complete, inspect, o
 
 # RemCTL
 
-RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreData database for fast, detailed output and writes normally through `remctl-bridge` using EventKit. Unsupported private metadata writes are available only when explicitly requested with `--private`; those go through `remctl-private` and Apple's private ReminderKit APIs. It is CLI-only: there is no local API server, token, launch agent, or service command.
+RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreData database for fast, detailed output and writes normally through `remctl-bridge` using EventKit; the real flagged state is the one exception and is written through AppleScript. Unsupported private metadata writes are available only when explicitly requested with `--private`; those go through `remctl-private` and Apple's private ReminderKit APIs. It is CLI-only: there is no local API server, token, launch agent, or service command.
 
 The installed command can be invoked as `remctl`, `rctl`, or `reminders`; all three names behave identically and produce the same output.
 
@@ -27,6 +27,7 @@ Start by deciding the write path. Public EventKit writes are stable and do not n
 | Create/edit ordinary reminder fields | `add`, `edit`, `done`, `undone`, `delete` | No | `info <id> --json` or `show <list> --json` |
 | Due date, priority, notes, recurrence, EventKit alarm | `add` or `edit` with `-d`, `-p`, `-n`, `--recurrence`, `--alarm` | No | `info <id> --json`; recurrence appears as `recurrence` |
 | Move an existing reminder to another list | `edit <id> -l LIST` or `edit <id> --list-id ID` | No | Use the returned `id`; clone-delete fallback may return a new ID plus `oldId` |
+| Set or clear the real flagged state | `flag <id>`, `unflag <id>`, `add -f/--flag` (AppleScript; needs Automation access) | No | `info <id> --json` under `flagged` |
 | Synced rich URL, real tags, section assignment, shared-list assignment, subtask, image, real flag, urgent, Early Reminder, location alarm | `add --private` or `edit --private` | Yes | `info <id> --json`; UI/device check when sync matters |
 | Replace/remove synced reminder tags | `edit --private --set-tags`, `edit --private --clear-tags`, `edit --private --remove-tag` | Yes | `info <id> --json` |
 | Section create/rename/delete | `section-create`, `section-rename`, `section-delete` | Yes | `sections --json` or `show <list> --json` |
@@ -94,6 +95,8 @@ remctl edit 23880 --list-id 156 --json
 remctl edit 23880 --recurrence monthly --json
 remctl done 23880 --json
 remctl done 23880 --date 2026-05-27 --json
+remctl flag 23880 --json
+remctl unflag 23880 --json
 remctl link --list-id 153 --json
 remctl export --list-id 153 --format json
 remctl list-symbols --preview
@@ -144,10 +147,28 @@ remctl add "Weekly report" --recurrence weekly --json
 remctl add "Standup" --recurrence "weekly mon,wed,fri" --alarm 15m --json
 remctl add "Pay rent" --recurrence monthly --json
 remctl add "Annual review" --recurrence yearly --json
+remctl add "Team sync" --recurrence "monthly 4th-fri" --json
+remctl add "Deep clean" --recurrence "daily x2" --json
 remctl edit 23880 --recurrence "weekly mon,wed" --json
+remctl edit 23880 --recurrence "monthly x2 last-fri" --json
 ```
 
-Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; invalid recurrence, alarm, and priority values fail before writing. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; use `edit ID --alarm clear --json` to remove normal alarms. Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
+Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`, each with an optional interval token immediately after the frequency (`daily x2`, `weekly x2 thu`, `monthly x3 15`, `monthly x2 4th-fri`, `yearly x2`; N is 1–999), plus monthly Nth-weekday rules: `monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri`, and negative `monthly -1-fri` through `-5-fri` (`last-fri` is an alias of `-1-fri`). Nth-weekday rules are monthly-only, validate their ordinal suffix (`4st-fri` is rejected), and cannot be mixed with plain day-of-month numbers in one rule. Prefer `last-fri` over `5th-fri`: EventKit silently skips months with no fifth Friday. Invalid recurrence, alarm, and priority values fail before writing. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Week-pinned rules read back from the database as `daysOfWeekDetailed` entries carrying `weekNumber` alongside a flat `daysOfWeek`; the parallel `weekNumbers` array is the bridge shape and appears in `--via-eventkit` payloads. Human output renders them as `monthly 4th Fri`, `monthly last Fri`, or `every 2 months 4th Tue`, and occurrence-limited series end with `, 5 times` (the old `x5` suffix now means an input interval). Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; use `edit ID --alarm clear --json` to remove normal alarms. Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
+
+## Flagging
+
+`flag` and `unflag` write the real flagged state through AppleScript (`set flagged of reminder id …`). EventKit has no public flagged API, so there is no bridge fallback and priority is never touched. The reminder is addressed at application level, so lists nested inside groups work.
+
+```bash
+remctl flag 23880 --json
+remctl unflag 23880 --json
+remctl add "Ship release" -l Work --flag --json
+```
+
+- Success under `--json` is `{"status": "flagged", "id": 23880, "title": "…"}` (or `"unflagged"`) on stdout, exit 0. Verify with `info <id> --json` under `flagged`.
+- Failure is terminal: exit 1 with the underlying osascript error. Under `--json` the payload is `{"status": "error", "code": "applescript_flag_failed", "id": 23880, "message": "…"}` on **stderr**, stdout is empty, and the flag is unchanged. Never report a flag as set without a `flagged`/`unflagged` payload.
+- Typical causes are missing Automation access for Reminders (`-1743`) and an unresponsive Reminders.app (120s timeout). Grant Automation access, or fall back to `edit <id> --private --flagged` / `edit <id> --private --no-flagged`, which writes the same state through ReminderKit.
+- `add -f/--flag` never fails the create. On flag failure the reminder still exists and `--json` returns `status: "created"` plus `"warnings": ["flag_not_set: <error>"]`; check `warnings` before telling the user the new reminder is flagged. With `--private`, `add --flag` goes through ReminderKit instead and its failures surface on the `partial` path, not in `warnings`.
 
 ## Private Metadata
 
@@ -224,7 +245,7 @@ Private metadata rules:
 - `--section`, `--new-section`, `--set-tags`, `--clear-tags`, `--remove-tag`, `--assign`, `--unassign`, `--subtask`, `--image`, `--flagged`, `--urgent`, `--early-reminder`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `section-create`, `section-rename`, and `section-delete` require `--private`, refuse duplicate section names on create/rename, and should be verified with `sections --json` or `show <list> --json`.
 - Rich-link and image attachment edits are additive. RemCTL can add synced rich links and images; it does not remove or replace existing rich links/images.
-- `add -f/--flag` sets the real flagged state via AppleScript after the create (no `--private` needed); if the flag-set fails the add still succeeds with a warning. `add --private` also sets the real flag through the private path.
+- `add -f/--flag` sets the real flagged state via AppleScript after the create (no `--private` needed); if the flag-set fails the add still succeeds, with the osascript error in the stderr warning and a `warnings: ["flag_not_set: …"]` array in the JSON payload. `add --private` sets the real flag through the private path instead. See Flagging for `flag`/`unflag`.
 - `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges; verify those via `color`, `badge`, and `badgeEmblem` in `lists --json` or `smart-lists --json`. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` write Reminders' private Groceries list metadata and locale. `list-pin` and `list-unpin` require `--private` and save regular list or smart-list pin state through ReminderKit. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
 - List groups are visible through `groups`, `group-info`, `lists --json`, and `show <group>`. `groups` and `group-info` include active/completed/total counts for child lists. `show <group> --format table` prints child-list and section tables; `show <group> --completed --format table` uses completion timestamps rather than due status. `group-create`, `list-create --private --group`, `group-edit`, and `group-delete` require `--private`; they move list containers only, not reminders. `group-edit --move-list LIST --before-list SIBLING`, `--after-list`, `--first`, or `--last` reorders child lists. `group-delete` detaches child lists to the top level before deleting the empty group.
 - Groceries lists are visible in `lists --json` as `listType: "groceries"`, `isGroceries: true`, and `grocery.locale`; human list headings show `🥕`, and known Groceries section headings get matching category emoji. `show --json` includes `sectionEmoji` for known Groceries categories. Use `add --private --grocery` or `edit --private --grocery` only against detected Groceries lists. RemCTL first verifies Reminders' automatic grocery sorting and reports `source: "reminders_auto"` when the item is already sectioned; it falls back to the private categorizer only for unsectioned items.
@@ -315,7 +336,7 @@ remctl permissions full-disk-access
 remctl doctor
 ```
 
-RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript fallback operations, and Full Disk Access for direct database reads. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
+RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript operations, and Full Disk Access for direct database reads. `flag`, `unflag`, and `add --flag` are AppleScript-only, not a fallback: without Automation access they fail instead of degrading. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
 
 macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`; if the `eventkit` check fails, run `remctl onboard` from the same context to trigger Reminders access. For a one-off unblock, run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
 

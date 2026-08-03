@@ -74,7 +74,7 @@ The fallback intentionally does not support `--list-id`, table output, sections,
 Writes go through Apple-supported APIs:
 
 1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, moving reminders between lists, complete, delete, recurrence, alarms, URLs appended to notes, and list management. The Python CLI validates user input first, and the bridge also rejects malformed due dates, recurrence rules, alarms, priorities, and location payloads if called directly. Bridge failures are kept structured so the CLI can distinguish permission denials from move-specific container rejections.
-2. AppleScript is a fallback for operations that still need Reminders.app automation behavior. It also sets the real flagged state after a non-private `add -f/--flag`, because EventKit has no public flag property. Before using the AppleScript fallback, RemCTL first checks whether the write already landed (recovery check) so retries do not create duplicates; `list-create` hard-fails on timeout or execution errors rather than falling back.
+2. AppleScript is a fallback for operations that still need Reminders.app automation behavior. It is also the only write path for the real flagged state — `flag`, `unflag`, and non-private `add -f/--flag` — because EventKit has no public flag property. Before using the AppleScript fallback, RemCTL first checks whether the write already landed (recovery check) so retries do not create duplicates; `list-create` and the flag writes hard-fail on timeout or execution errors rather than falling back.
 
 There is also an explicitly unsupported opt-in helper:
 
@@ -146,13 +146,16 @@ EventKit writes recurrence rules. Direct reads resolve those rules from `ZREMCDO
 
 ```json
 {
-  "frequency": "weekly",
-  "interval": 1,
-  "daysOfWeek": [2, 4]
+  "frequency": "monthly",
+  "interval": 2,
+  "daysOfWeek": [6],
+  "daysOfWeekDetailed": [{"dayOfTheWeek": 6, "weekNumber": 4}]
 }
 ```
 
-Human output summarizes the same data with badges such as `↻ weekly Mon, Wed`.
+`daysOfWeek` is the flat weekday list; `daysOfWeekDetailed` preserves Reminders' stored week pinning, where `weekNumber` 0 means "any week", 4 means the 4th weekday of the month, and -1 means the last one. Writes take the pinning as a parallel `weekNumbers` array alongside `daysOfWeek`; `remctl-bridge` validates it (monthly -5 to 5, yearly -53 to 53, unpinned only for daily/weekly, because `EKRecurrenceDayOfWeek` raises an uncatchable exception on an out-of-range week number) and maps it to EventKit Nth-weekday rules. The limited `--via-eventkit` read returns the same pinning as `weekNumbers`, omitted when every day is unpinned. EventKit skips periods that lack the requested weekday, so a 5th-Friday rule does not fire in months without one; `-1` is the durable "last Friday" form.
+
+Human output summarizes the same data with badges such as `↻ weekly Mon, Wed`, `↻ monthly 4th Fri`, and `↻ every 2 months 4th Tue`. An occurrence-count end renders as `, 5 times`, not `x5`, which now reads as the `xN` interval input token.
 
 ## Due Dates and Alarms
 
@@ -162,7 +165,7 @@ Normal alarms are `ZREMCDOBJECT` rows linked from the reminder through alarm row
 
 ## Flags, Urgent, and Early Reminders
 
-Flags are read from `ZFLAGGED` and shown as `⚑`.
+Flags are read from `ZFLAGGED` and shown as `⚑`. Non-private flag writes (`flag`, `unflag`, `add --flag`) are AppleScript-only and address the reminder at application level (`reminder id …`), because EventKit has no public flagged API and Reminders' scripting dictionary cannot see lists nested inside groups (`tell list "<name>"` throws -1728 for them). A failed AppleScript flag write is an error, never a bridge fallback; `remctl-bridge` refuses `flag`/`unflag` and `flagged` payloads outright. `edit --private --flagged` writes the same state through ReminderKit.
 
 macOS 26 urgent reminders are read from `ZISURGENTSTATEENABLEDFORCURRENTUSER` and shown as `⏰`. Apple describes urgent reminders as reminders that schedule an alarm when due. Normal writes do not touch the private urgent fields; `add --private --urgent` and `edit --private --urgent` can write them through the unsupported private helper.
 

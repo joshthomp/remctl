@@ -88,6 +88,7 @@ remctl today --via-eventkit --json
 remctl show Work --via-eventkit
 remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
 remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
+remctl add "Team sync" -l Work -d "2026-08-28 10:00" --recurrence "monthly x2 4th-fri"
 remctl done 23880 --date "2026-05-27 09:30"
 remctl edit 23880 -d clear
 remctl edit 23880 -l Work
@@ -139,7 +140,7 @@ The full command guide is in [docs/commands.md](docs/commands.md). For smart lis
 
 Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`. In create mode, date-only forms such as `today`, `tomorrow`, `YYYY-MM-DD`, `+3d`, and `next friday` create all-day reminders; forms with explicit times create timed reminders.
 
-Recurrence, normal alarm, and priority inputs are also validated before writes. Supported recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; `upcoming DAYS` requires a positive range from 1 to 3650 days.
+Recurrence, normal alarm, and priority inputs are also validated before writes. Supported recurrence forms are `daily`, `weekly`, `monthly`, `yearly`, `weekly mon,wed,fri`, and `monthly 1,15`. An optional `xN` interval token (1–999) follows the frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. Monthly rules can also pin a weekday to a week of the month: `monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri` (alias of `-1-fri`), down to `-5-fri`. Ordinal suffixes are checked, so `4st-fri` is rejected; week-pinned days cannot be mixed with plain day-of-month numbers, and they are monthly-only. Use `last-fri` rather than `5th-fri` for "the last Friday": EventKit skips months that have no fifth Friday. `upcoming DAYS` requires a positive range from 1 to 3650 days.
 
 ## Multiple Accounts
 
@@ -375,7 +376,7 @@ RemCTL output is designed for both humans and agents:
 - image attachments appear in `info --json` and list-command JSON as `attachments` entries with `filename`, `type`, `path`, `resolved`, `uti`, `width`, and `height`; `path` is the sha512-verified local file, or `null` with `resolved: false` when the attachment is not downloaded on this Mac
 - shared-list assignments appear in human output as `@Name` and in `info --json` as `assignment`
 - Early Reminders appear in `info` output (text and JSON) as labels such as `15 minutes before`
-- recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`
+- recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`, `↻ monthly 4th Fri`, or `↻ every 2 months 4th Tue`
 - Groceries lists show `🥕` in list headings and list summaries
 - table output keeps a dedicated `Repeat` column when any row is recurring
 - human output strips terminal control characters from Reminders text before printing
@@ -420,7 +421,7 @@ Plain human list output ends each reminder line with one or two trailing emoji b
 RemCTL may need three macOS permission grants:
 
 - Reminders access for EventKit writes
-- Automation access for AppleScript fallback operations
+- Automation access for AppleScript operations, including `flag`, `unflag`, and `add --flag`, which have no EventKit path
 - Full Disk Access for direct database reads
 
 Run:
@@ -468,6 +469,8 @@ For Groceries automation, use `lists --json` to detect `listType: "groceries"` a
 For shared-list assignments, call `remctl sharees LIST --json` first. `--assign` accepts a unique name, email/phone address, numeric sharee ID, object UUID, or `me`; prefer `address`, `id`, or `objectUUID` in automation because names can collide. Assignment writes require `--private` and a known target shared list, then verify with `remctl info ID --json` and inspect `assignment.assignee`.
 
 Agents should pass deterministic due dates, using `YYYY-MM-DD` for all-day reminders and `YYYY-MM-DD HH:MM` for timed reminders after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
+
+`flag`, `unflag`, and `add --flag` write the real flagged state through Reminders' AppleScript interface, because EventKit has no flagged API; there is no bridge fallback. If the AppleScript write fails, `flag`/`unflag` exit 1 and emit `{"status": "error", "code": "applescript_flag_failed", "id", "message"}` on stderr instead of reporting a fake success. `add --flag` still creates the reminder and reports the failure as a `warnings` array (`["flag_not_set: …"]`) in the JSON payload; finish with `remctl edit <id> --private --flagged` rather than re-running `add`.
 
 List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `section-create`, `section-rename`, `section-delete`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, group membership/order edits, and smart-list list filters. Group commands target groups by name or `--group-id`; write commands that need a real list reject groups and name the child lists you can target. `list-create --private --group-id` is available when group names collide. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
 

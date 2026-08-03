@@ -41,6 +41,7 @@ struct RecurrenceSpec: Decodable {
     let frequency: String
     let interval: Int?
     let daysOfWeek: [Int]?
+    let weekNumbers: [Int]?
     let daysOfMonth: [Int]?
     let end: String?
 }
@@ -157,7 +158,33 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
     if let days = spec.daysOfWeek {
         // Input: 1=Sun, 2=Mon ... 7=Sat → EKWeekday raw values match
         guard !days.isEmpty, days.allSatisfy({ 1...7 ~= $0 }) else { return nil }
-        let mapped = days.compactMap { EKWeekday(rawValue: $0).map { EKRecurrenceDayOfWeek($0) } }
+
+        // Week numbers pin a weekday to the Nth week of the period (4 = 4th Friday,
+        // -1 = last Friday); 0 means unpinned. Validate here: EKRecurrenceDayOfWeek
+        // raises an uncatchable NSException on an out-of-range or wrong-frequency
+        // week number, so a bad value must never reach it.
+        var weekNumbers: [Int]?
+        if let numbers = spec.weekNumbers, !numbers.isEmpty {
+            guard numbers.count == days.count else { return nil }
+            let bounds: ClosedRange<Int>
+            switch freq {
+            case .monthly: bounds = -5...5
+            case .yearly:  bounds = -53...53
+            default:
+                // daily/weekly accept no pinning at all
+                guard numbers.allSatisfy({ $0 == 0 }) else { return nil }
+                bounds = 0...0
+            }
+            guard numbers.allSatisfy({ $0 == 0 || bounds ~= $0 }) else { return nil }
+            weekNumbers = numbers
+        }
+
+        let mapped = days.enumerated().compactMap { index, day -> EKRecurrenceDayOfWeek? in
+            guard let weekday = EKWeekday(rawValue: day) else { return nil }
+            let number = weekNumbers?[index] ?? 0
+            guard number != 0 else { return EKRecurrenceDayOfWeek(weekday) }
+            return EKRecurrenceDayOfWeek(dayOfTheWeek: weekday, weekNumber: number)
+        }
         guard mapped.count == days.count else { return nil }
         daysOfWeek = mapped
     }
@@ -400,10 +427,11 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
             reminder.notes = u
         }
     }
-    // EventKit has no public flagged API; use priority 1 as a proxy (shows flag in Reminders.app)
-    if let f = cmd.flagged {
-        if f && reminder.priority == 0 { reminder.priority = 1 }
-        else if !f && reminder.priority == 1 { reminder.priority = 0 }
+    // EventKit has no public flagged API. The old behavior wrote priority=1 as
+    // a proxy, which clobbered priority and never set the real ZFLAGGED;
+    // refuse instead so callers use AppleScript or remctl-private set_flagged.
+    if cmd.flagged != nil {
+        fail("flagged is not supported: EventKit cannot set the real flagged state; use the AppleScript path or remctl-private set_flagged")
     }
 
     if let spec = cmd.recurrence {
@@ -528,6 +556,11 @@ func recurrencePayload(_ rule: EKRecurrenceRule) -> [String: Any] {
     ]
     if let days = rule.daysOfTheWeek, !days.isEmpty {
         payload["daysOfWeek"] = days.map { $0.dayOfTheWeek.rawValue }
+        let weekNumbers = days.map { $0.weekNumber }
+        // Only surfaced when at least one day is pinned to a specific week.
+        if weekNumbers.contains(where: { $0 != 0 }) {
+            payload["weekNumbers"] = weekNumbers
+        }
     }
     if let days = rule.daysOfTheMonth, !days.isEmpty {
         payload["daysOfMonth"] = days.map { $0.intValue }
@@ -809,28 +842,12 @@ case "uncomplete":
         fail("Uncomplete failed: \(error.localizedDescription)")
     }
 
-case "flag":
-    // EventKit has no public flagged API; set priority=1 as a proxy (shows flag in Reminders.app)
-    guard let id = cmd.id else { fail("id is required for flag") }
-    let reminder = findReminder(store, id: id)
-    if reminder.priority == 0 { reminder.priority = 1 }
-    do {
-        try store.save(reminder, commit: true)
-        output(["status": "flagged", "id": id])
-    } catch {
-        fail("Flag failed: \(error.localizedDescription)")
-    }
-
-case "unflag":
-    guard let id = cmd.id else { fail("id is required for unflag") }
-    let reminder = findReminder(store, id: id)
-    if reminder.priority == 1 { reminder.priority = 0 }
-    do {
-        try store.save(reminder, commit: true)
-        output(["status": "unflagged", "id": id])
-    } catch {
-        fail("Unflag failed: \(error.localizedDescription)")
-    }
+case "flag", "unflag":
+    // EventKit has no public flagged API. The old priority=1 proxy reported
+    // success without ever touching ZFLAGGED and clobbered priority on the
+    // way (unflag reset a genuine High priority to none); refuse instead so
+    // callers use AppleScript or remctl-private set_flagged.
+    fail("EventKit cannot set the real flagged state; use the AppleScript path or remctl-private set_flagged")
 
 case "find_reminder":
     // Find a reminder by title within a specific calendar and return its calendarItemIdentifier.

@@ -52,7 +52,7 @@ remctl today
 
 1. Opens Reminders.app.
 2. Triggers the native Reminders permission prompt.
-3. Triggers the Automation prompt used by AppleScript fallback operations.
+3. Triggers the Automation prompt used by AppleScript fallback operations and by `flag` / `unflag`, which have no non-AppleScript path.
 4. Checks direct database access.
 5. Opens the guided Full Disk Access helper when needed.
 

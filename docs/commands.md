@@ -155,9 +155,12 @@ RemCTL keeps these states distinct:
 - priority is written with `-p high`, `-p medium`, or `-p low` and shown as `!!!`, `!!`, or `!`
 - iCloud stores priority as 1 (high), 5 (medium), or 9 (low). Exchange and other CalDAV accounts use the full iCalendar range, where 1–4 is high, 5 is medium, and 6–9 is low; RemCTL buckets these the same way Reminders.app does. A Microsoft To Do task marked **Important (starred)** syncs through Exchange as high importance and appears in Reminders as a high priority (`!!!`), not as a flag
 - flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`. Flags exist only for iCloud and on-device reminders; Exchange/CalDAV accounts have no flag attribute, so `flag`/`unflag` are unavailable there and report a clear error suggesting priority instead
+- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`, which write the real flag through Reminders automation and need the Automation permission
 - macOS 26 urgent reminders are shown with `⏰` and listed with `urgent`
 - urgent is stored in private ReminderKit metadata; power users can opt into unsupported writes with `add --private --urgent` or `edit --private --urgent`
 - recurring reminders are shown with a `↻` badge and, in table output, a `Repeat` column
+
+`flag` and `unflag` write the real flagged state through AppleScript, the only API that can set it, including for lists nested inside groups. There is no EventKit fallback: if the AppleScript write fails, the command exits 1 with the underlying osascript error instead of reporting success, and `--json` prints `{"status": "error", "code": "applescript_flag_failed", "id": ..., "message": ...}` on stderr. `add --flag` still creates the reminder when only the flag write fails; it warns on stderr and adds `warnings: ["flag_not_set: ..."]` to the `--json` payload. When Reminders automation is unavailable, `edit ID --private --flagged` and `edit ID --private --no-flagged` write the same state through ReminderKit.
 
 ## Creating
 
@@ -295,9 +298,14 @@ remctl add "Weekly report" --recurrence weekly
 remctl add "Standup" --recurrence "weekly mon,wed,fri" --alarm 15m
 remctl add "Pay rent" --recurrence monthly
 remctl add "Annual review" --recurrence yearly
+remctl add "Payday check" --recurrence "monthly last-fri"
+remctl add "Sprint review" --recurrence "monthly x2 4th-fri"
+remctl edit 23880 --recurrence "daily x2"
 ```
 
-Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; invalid recurrence, alarm, and priority values fail before writing. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
+Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, `monthly 4th-fri`, and `yearly`, each optionally taking an interval token `xN` (1 to 999) directly after the frequency, as in `daily x2`, `weekly x2 thu`, or `monthly x2 4th-fri`; invalid recurrence, alarm, and priority values fail before writing. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object; week-pinned weekdays come back as `daysOfWeekDetailed` entries carrying `weekNumber`, and only the limited `--via-eventkit` read returns the flat `weekNumbers` array. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
+
+`monthly` also accepts Nth-weekday rules in place of day-of-month numbers: `monthly 4th-fri` is the 4th Friday, `monthly 1st-mon,3rd-mon` is the 1st and 3rd Monday, and `monthly last-fri` is an alias of `monthly -1-fri`, with negative forms down to `-5-fri`. The ordinal suffix must match the number, so `4st-fri` is rejected; Nth-weekday tokens cannot be mixed with plain day-of-month numbers in one rule, and they are monthly-only. EventKit silently skips months that lack the requested weekday, so `monthly 5th-fri` fires only in months with a fifth Friday — use `monthly last-fri` for "the last Friday of every month".
 
 Early Reminders:
 
@@ -487,7 +495,7 @@ Human-readable output shows:
 - priority markers: `!!!` for high, `!!` for medium, `!` for low
 - `⚑` for flagged reminders
 - `⏰` for macOS 26 urgent reminders
-- repeat badges such as `↻ monthly` for recurring reminders
+- repeat badges such as `↻ monthly`, `↻ monthly 4th Fri`, or `↻ every 2 months 4th Tue` for recurring reminders
 - section and subtask context where the command supports it
 
 JSON output preserves machine-readable fields:
@@ -664,6 +672,8 @@ remctl info <numericId> --json
 `add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks. Attachment entries include a sha512-verified `path` to the local file (or `path: null` with `resolved: false` for legacy attachments not downloaded on this Mac); list-command JSON carries the same `attachments` array for parent reminders. See [Inline Images](#inline-images) and [Attachments in JSON](#attachments-in-json).
 
 If a `--private` write partially fails after the reminder already exists, `add --json` returns `{"status":"partial", ...}` (text mode prints an explicit "Do NOT re-run add" line) carrying the created `numericId`. Re-run `edit` on that ID to finish the remaining metadata; do not re-run `add`, which would duplicate the reminder.
+
+If `flag` or `unflag` fails, RemCTL exits 1 with `code: "applescript_flag_failed"` on stderr and the flag is unchanged; nothing else was written. Grant the Automation permission for the running context, or set the flag with `edit <id> --private --flagged` / `--no-flagged`. `add --flag --json` returning `status: "created"` with a `warnings` entry `flag_not_set: ...` means the reminder exists but is not flagged — do not re-run `add`; set the flag on the returned `numericId`.
 
 Agents must not use `--via-eventkit` by default. It is a limited read-only fallback only for `show`, `search`, `today`, and `upcoming` when Full Disk Access blocks a basic read and the task does not need chainable IDs or private metadata. Its `eventKitId` values are not RemCTL numeric IDs and must not be used with `info`, `edit`, `done`, `delete`, `link`, `open`, or `subtasks`.
 

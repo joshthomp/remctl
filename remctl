@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.5.1
+"""remctl — Power-user Reminders CLI v1.6.1
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -64,7 +64,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.5.1"
+VERSION = "1.6.1"
 PRIVATE_PROTOCOL_VERSION = 1
 _private_protocol_probe = None
 
@@ -2740,11 +2740,59 @@ RECURRENCE_DAY_NAMES = {
     7: "Sat",
 }
 
+RECURRENCE_DAY_TOKENS = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
+
+RECURRENCE_ORDINAL_SUFFIXES = {1: "st", 2: "nd", 3: "rd", 4: "th", 5: "th"}
+
 
 def _recurrence_from_item(item):
     if _item_has(item, "recurrence"):
         return _item_get(item, "recurrence")
     return recurrence_from_row(item, ts=ts)
+
+
+def _recurrence_week_label(week, day_name):
+    """Render a weekday label pinned to a week-of-month ('4th Fri', 'last Fri')."""
+    if not week:
+        return day_name
+    if week > 0:
+        return f"{week}{RECURRENCE_ORDINAL_SUFFIXES.get(week, 'th')} {day_name}"
+    if week == -1:
+        return f"last {day_name}"
+    back = -week
+    return f"{back}{RECURRENCE_ORDINAL_SUFFIXES.get(back, 'th')}-last {day_name}"
+
+
+def _recurrence_day_labels(recurrence):
+    """Weekday labels for a rule, honoring week pinning.
+
+    Reminders' stored blob (daysOfWeekDetailed) wins when present and uses
+    weekNumber 0 for "any week"; bridge-bound rules carry a parallel
+    weekNumbers list instead, which may be missing or short.
+    """
+    detailed = recurrence.get("daysOfWeekDetailed")
+    pairs = []
+    if isinstance(detailed, list) and detailed:
+        for entry in detailed:
+            if isinstance(entry, dict) and entry.get("dayOfTheWeek") is not None:
+                pairs.append((entry.get("dayOfTheWeek"), entry.get("weekNumber")))
+    else:
+        weeks = recurrence.get("weekNumbers") or []
+        for index, day in enumerate(recurrence.get("daysOfWeek") or []):
+            pairs.append((day, weeks[index] if index < len(weeks) else 0))
+
+    labels = []
+    for day, week in pairs:
+        try:
+            week = int(week or 0)
+        except (TypeError, ValueError):
+            week = 0
+        try:
+            name = RECURRENCE_DAY_NAMES.get(int(day), str(day))
+        except (TypeError, ValueError):
+            name = str(day)
+        labels.append(_recurrence_week_label(week, name))
+    return labels
 
 
 def recurrence_summary(recurrence):
@@ -2766,10 +2814,10 @@ def recurrence_summary(recurrence):
     else:
         label = f"every {interval} {plural}"
 
-    days = recurrence.get("daysOfWeek") or []
-    if frequency == "weekly" and days:
-        names = [RECURRENCE_DAY_NAMES.get(int(day), str(day)) for day in days]
-        label += " " + ", ".join(names)
+    if frequency in {"weekly", "monthly", "yearly"}:
+        names = _recurrence_day_labels(recurrence)
+        if names:
+            label += " " + ", ".join(names)
 
     days_of_month = recurrence.get("daysOfMonth") or []
     if frequency == "monthly" and days_of_month:
@@ -2777,7 +2825,8 @@ def recurrence_summary(recurrence):
 
     count = recurrence.get("count")
     if count:
-        label += f" x{count}"
+        # Not " xN" — that now reads as the xN interval token in --recurrence input.
+        label += f", {count} time{'' if count == 1 else 's'}"
     elif recurrence.get("endDate"):
         label += f" until {str(recurrence['endDate'])[:10]}"
 
@@ -4032,8 +4081,12 @@ def parse_subtask_specs(values):
             recurrence = parse_recurrence(str(spec["recurrence"]))
             if recurrence is None:
                 print(
-                    "Error: subtask recurrence must be daily, weekly, monthly, yearly, "
-                    "'weekly mon,wed,fri', or 'monthly 1,15'.",
+                    f"Error: could not parse subtask recurrence {spec['recurrence']!r}. Use daily, "
+                    "weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', "
+                    "'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', or an interval "
+                    "like 'daily x2' / 'monthly x2 4th-fri'. The xN interval (1-999) must come "
+                    "directly after the frequency, and nth-weekday tokens cannot be mixed with "
+                    "day-of-month numbers.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -4491,6 +4544,7 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
         "status": "updated",
         "id": new_row["Z_PK"],
         "oldId": reminder["Z_PK"],
+        "title": _row_get(new_row, "ZTITLE", _row_get(reminder, "ZTITLE")),
         "list": target_list_ref["title"],
         "objectUUID": new_ckid,
         "subtasksMoved": len(new_children),
@@ -4506,6 +4560,7 @@ def emit_clone_delete_move_result(args, move_result, target_list_ref):
             "status": "updated",
             "id": move_result["id"],
             "oldId": move_result["oldId"],
+            "title": move_result.get("title"),
             "list": move_result["list"],
             "objectUUID": move_result["objectUUID"],
             "subtasksMoved": move_result["subtasksMoved"],
@@ -5841,7 +5896,7 @@ def applescript_access_check_for_onboarding():
         "automation",
         "warn",
         message,
-        "Re-run `remctl onboard` from the same terminal and approve the Automation prompt if macOS asks. Flagged operations and AppleScript fallback writes rely on this access.",
+        "Re-run `remctl onboard` from the same terminal and approve the Automation prompt if macOS asks. `flag`/`unflag` require this access and have no bridge fallback; AppleScript fallback writes rely on it too.",
     )
 
 
@@ -5989,27 +6044,32 @@ def osa_by_id_try(list_name, rem_id, action, timeout=120):
         return False
 
 
-def osa_flag_reminder_try(list_name, reminder_ckid, *, flagged=True, timeout=120):
-    """Set the real ZFLAGGED column via AppleScript without touching priority."""
+def osa_set_flagged_result(reminder_ckid, *, flagged=True, timeout=120):
+    """Set the real ZFLAGGED column via AppleScript without touching priority.
+
+    The reminder is addressed at application level (`reminder id ...`) on
+    purpose: Reminders' scripting dictionary does not expose lists nested
+    inside groups, so a `tell list "<name>"` scope throws -1728 for those,
+    while the app-level specifier resolves reminders in any list.
+    Returns (ok, error_text); error_text carries the osascript stderr when
+    ok is False so callers can surface the real failure."""
     if not reminder_ckid:
-        return False
+        return False, "missing reminder identifier"
     rem_id = reminder_ckid if reminder_ckid.startswith("x-apple-reminder://") else f"x-apple-reminder://{reminder_ckid}"
-    action = "set flagged of r to true" if flagged else "set flagged of r to false"
-    if list_name:
-        return osa_by_id_try(list_name, rem_id, action, timeout=timeout)
+    state = "true" if flagged else "false"
     script = (
         f'tell application "Reminders"\n'
-        f'tell default list\n'
-        f'set r to (first reminder whose id is "{esc(rem_id)}")\n'
-        f'{action}\n'
-        f'end tell\n'
+        f'set flagged of reminder id "{esc(rem_id)}" to {state}\n'
         f'end tell'
     )
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0
     except subprocess.TimeoutExpired:
-        return False
+        return False, f"AppleScript timed out after {timeout}s (Reminders.app may be unresponsive)"
+    if r.returncode == 0:
+        return True, ""
+    detail = (r.stderr or "").strip()
+    return False, detail or f"osascript exited {r.returncode} with no error output"
 
 def esc(s):
     """Escape a string for AppleScript double-quoted literals.
@@ -6112,6 +6172,11 @@ def fail_invalid_due_date(value, *, json_mode=False, field="due"):
 
 
 COMPLETION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$")
+# 'monthly 4th-fri', 'monthly last-sun', 'monthly -1-fri' (last Friday of the month)
+RECURRENCE_NTH_WEEKDAY_RE = re.compile(
+    r"^(?:(?P<ordinal>[1-5])(?P<suffix>st|nd|rd|th)|(?P<last>last)|-(?P<negative>[1-5]))"
+    r"-(?P<day>sun|mon|tue|wed|thu|fri|sat)$"
+)
 
 
 def parse_completion_date(value):
@@ -6294,8 +6359,45 @@ def due_spec_is_all_day(s):
 
 # ── Recurrence / Alarm Parsing ───────────────────────────────────────────────
 
+def parse_recurrence_interval(token):
+    """Parse an 'xN' interval token into 1..999, or None if it isn't one."""
+    if not token.startswith("x"):
+        return None
+    digits = token[1:]
+    # Bound the length before int(): CPython caps int() string conversion, so an
+    # unbounded call would raise on a long digit run instead of returning None.
+    if not 1 <= len(digits) <= 3 or not digits.isdecimal():
+        return None
+    value = int(digits)
+    return value if 1 <= value <= 999 else None
+
+
+def parse_nth_weekday_tokens(tokens):
+    """Parse ['4th-fri', 'last-sun'] into parallel (daysOfWeek, weekNumbers)."""
+    days = []
+    weeks = []
+    for token in tokens:
+        match = RECURRENCE_NTH_WEEKDAY_RE.match(token)
+        if not match:
+            return None
+        ordinal = match.group("ordinal")
+        negative = match.group("negative")
+        if ordinal:
+            week = int(ordinal)
+            if match.group("suffix") != RECURRENCE_ORDINAL_SUFFIXES[week]:
+                return None
+        elif negative:
+            week = -int(negative)
+        else:
+            week = -1  # 'last-fri'
+        days.append(RECURRENCE_DAY_TOKENS[match.group("day")])
+        weeks.append(week)
+    return days, weeks
+
+
 def parse_recurrence(spec):
-    """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15'."""
+    """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15',
+    'daily x2', 'monthly x2 4th-fri', or 'monthly last-fri'."""
     if not spec:
         return None
     parts = spec.lower().split()
@@ -6304,35 +6406,52 @@ def parse_recurrence(spec):
     freq = parts[0]
     if freq not in {"daily", "weekly", "monthly", "yearly"}:
         return None
-    result = {"frequency": freq, "interval": 1}
-    if freq == "weekly" and len(parts) > 1:
-        if len(parts) != 2:
+
+    rest = parts[1:]
+    interval = 1
+    if rest:
+        parsed_interval = parse_recurrence_interval(rest[0])
+        if parsed_interval is not None:
+            interval = parsed_interval
+            rest = rest[1:]
+
+    result = {"frequency": freq, "interval": interval}
+    if not rest:
+        return result
+    if len(rest) != 1:
+        return None
+    tokens = [d.strip() for d in rest[0].split(",") if d.strip()]
+    if not tokens:
+        return None
+
+    if freq == "weekly":
+        if any(token not in RECURRENCE_DAY_TOKENS for token in tokens):
             return None
-        day_map = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
-        tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
-        if not tokens or any(token not in day_map for token in tokens):
-            return None
-        days = [day_map[token] for token in tokens]
-        if days: result["daysOfWeek"] = days
-    elif freq == "monthly" and len(parts) > 1:
-        if len(parts) != 2:
-            return None
-        tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
-        if not tokens or not all(token.isdigit() for token in tokens):
+        result["daysOfWeek"] = [RECURRENCE_DAY_TOKENS[token] for token in tokens]
+        return result
+    if freq == "monthly":
+        nth = parse_nth_weekday_tokens(tokens)
+        if nth is not None:
+            result["daysOfWeek"], result["weekNumbers"] = nth
+            return result
+        if not all(len(token) <= 2 and token.isdecimal() for token in tokens):
             return None
         days = [int(token) for token in tokens]
         if any(day < 1 or day > 31 for day in days):
             return None
-        if days: result["daysOfMonth"] = days
-    elif len(parts) > 1:
-        return None
-    return result
+        result["daysOfMonth"] = days
+        return result
+    return None
 
 
 def fail_invalid_recurrence(value):
     print(
         f"Error: could not parse recurrence {value!r}. Use daily, weekly, "
-        "'weekly mon,wed,fri', 'monthly 1,15', monthly, or yearly.",
+        "monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', "
+        "'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', or an "
+        "interval like 'daily x2' / 'monthly x2 4th-fri'. The xN interval (1-999) "
+        "must come directly after the frequency, and nth-weekday tokens cannot be "
+        "mixed with day-of-month numbers.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -8208,17 +8327,14 @@ def cmd_add(a):
                     created_row = q_reminder_by_identifier(db, result.get("id", ""))
                 except RemindersDBUnavailable:
                     created_row = None
+            flag_error = None
             if a.flag and not wants_private:
-                flag_list_name = None
-                if created_row:
-                    flag_list_name = created_row["list_name"]
-                elif list_resolution:
-                    flag_list_name = list_resolution["title"]
-                else:
-                    flag_list_name = target_list_name
-                if not osa_flag_reminder_try(flag_list_name, result.get("id", "")):
+                flag_ok, flag_err = osa_set_flagged_result(result.get("id", ""), flagged=True)
+                if not flag_ok:
+                    flag_error = flag_err
                     print(
-                        "Warning: created the reminder but failed to set the flag via AppleScript.",
+                        "Warning: created the reminder but failed to set the flag via AppleScript: "
+                        f"{flag_err}",
                         file=sys.stderr,
                     )
             if a.json:
@@ -8234,6 +8350,8 @@ def cmd_add(a):
                     payload["numericId"] = created_row["Z_PK"]
                 if private_results:
                     payload["private"] = private_results
+                if flag_error is not None:
+                    payload["warnings"] = [f"flag_not_set: {flag_error}"]
                 print(json.dumps(payload))
             else:
                 print(f"Created: {safe_display(title)}")
@@ -8507,6 +8625,10 @@ def cmd_edit(a):
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
+    # The title every --json result echoes: the new one when the edit renames the
+    # reminder, otherwise the title it keeps. Matches add/done/undone/delete, which
+    # all echo `title` so a caller never has to re-read the reminder to label it.
+    resulting_title = a.title if getattr(a, "title", None) else _row_get(r, "ZTITLE")
     target_list_ref = None
     target_list_name = getattr(a, "list", None)
     target_list_id = getattr(a, "list_id", None)
@@ -8682,7 +8804,7 @@ def cmd_edit(a):
                     list_pk=target_list_pk,
                 ) if wants_private else []
                 if a.json:
-                    payload = {"status": "updated", "id": a.id}
+                    payload = {"status": "updated", "id": a.id, "title": resulting_title}
                     if target_list_ref:
                         payload["list"] = target_list_name
                         if target_list_ref.get("method") != "exact":
@@ -8722,7 +8844,12 @@ def cmd_edit(a):
                 list_pk=target_list_pk,
             )
             if a.json:
-                print(json.dumps({"status": "updated", "id": a.id, "private": private_results}, indent=2))
+                print(json.dumps({
+                    "status": "updated",
+                    "id": a.id,
+                    "title": resulting_title,
+                    "private": private_results,
+                }, indent=2))
             else:
                 print(f"Updated #{a.id}")
                 print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
@@ -8783,13 +8910,25 @@ def cmd_edit(a):
             parts.append(as_date_assign(dt))
         if parts and osa_by_id_try(r["list_name"], _rem_id(r), chr(10).join(parts)):
             if a.json:
-                print(json.dumps({"status": "updated", "id": a.id}))
+                print(json.dumps({"status": "updated", "id": a.id, "title": resulting_title}))
             else:
                 print(f"Updated #{a.id}")
             return
 
     if not has_applescript_fields and not has_bridge_only:
-        print("Nothing to update.")
+        # No-op edit: a real, non-error outcome. Under --json it has to be a
+        # structured payload like every other result, not a bare English line
+        # that breaks the caller's JSON parse. Exit code stays 0.
+        if getattr(a, "json", False):
+            print(json.dumps({
+                "status": "unchanged",
+                "code": "nothing_to_update",
+                "id": a.id,
+                "title": resulting_title,
+                "message": "Nothing to update.",
+            }))
+        else:
+            print("Nothing to update.")
         return
     if not r["ZCKIDENTIFIER"]:
         _refuse_unsafe_title_fallback(r, "edit it", "The reminder has no stable identifier")
@@ -9216,6 +9355,34 @@ def cmd_open(a):
 
 # ── New Commands ─────────────────────────────────────────────────────────────
 
+def _fail_flag_applescript(a, r, operation, error_text):
+    """Honest failure for flag/unflag: exit 1 with the real AppleScript error.
+
+    There is deliberately no bridge fallback here — EventKit has no public
+    flagged API, and the old fallback set priority=1 as a proxy while
+    reporting success without ever touching ZFLAGGED."""
+    hint = (
+        f"remctl edit {a.id} --private --flagged"
+        if operation == "flag"
+        else f"remctl edit {a.id} --private --no-flagged"
+    )
+    title = safe_display(r["ZTITLE"] or "(untitled)")
+    message = (
+        f"AppleScript could not {operation} #{a.id} ('{title}'): {error_text}. "
+        f"EventKit cannot set the real flagged state, so there is no bridge fallback. "
+        f"Approve the Automation prompt with `remctl onboard` from this same context; "
+        f"if Reminders automation stays unavailable, use: {hint}"
+    )
+    if getattr(a, "json", False):
+        print(
+            json.dumps({"status": "error", "code": "applescript_flag_failed", "id": a.id, "message": message}),
+            file=sys.stderr,
+        )
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_flag(a):
     db = open_db()
     r = q_reminder(db, a.id)
@@ -9223,34 +9390,20 @@ def cmd_flag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # AppleScript-first for flag/unflag: EventKit has no public "flagged"
-    # property, so the bridge approximates it with priority=1, which loses
-    # the real priority value. AppleScript `set flagged of r` touches the
-    # actual ZFLAGGED column — the only correct path.
-    rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to true"):
+    # AppleScript-only: EventKit has no public "flagged" API, so the bridge
+    # can never set the real ZFLAGGED column. The reminder is addressed at
+    # application level because group-nested lists are invisible to
+    # `tell list "<name>"` (see osa_set_flagged_result).
+    if not r["ZCKIDENTIFIER"]:
+        _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
+    ok, err = osa_set_flagged_result(r["ZCKIDENTIFIER"], flagged=True)
+    if ok:
         if a.json:
             print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
             print(f"Flagged: {safe_display(r['ZTITLE'])}")
         return
-
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "flag", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "flagged":
-            if a.json:
-                print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Flagged: {safe_display(r['ZTITLE'])}")
-            return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "flag it",
-        "Identifier-based writes failed",
-    )
+    _fail_flag_applescript(a, r, "flag", err)
 
 def cmd_unflag(a):
     db = open_db()
@@ -9259,32 +9412,17 @@ def cmd_unflag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # AppleScript-first (see cmd_flag): only AppleScript can touch the real
-    # flagged column; bridge only toggles priority as a lossy proxy.
-    rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to false"):
+    # AppleScript-only (see cmd_flag).
+    if not r["ZCKIDENTIFIER"]:
+        _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
+    ok, err = osa_set_flagged_result(r["ZCKIDENTIFIER"], flagged=False)
+    if ok:
         if a.json:
             print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
             print(f"Unflagged: {safe_display(r['ZTITLE'])}")
         return
-
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "unflag", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "unflagged":
-            if a.json:
-                print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Unflagged: {safe_display(r['ZTITLE'])}")
-            return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "unflag it",
-        "Identifier-based writes failed",
-    )
+    _fail_flag_applescript(a, r, "unflag", err)
 
 def cmd_upcoming(a):
     days = getattr(a, "days", None)
@@ -11708,9 +11846,11 @@ def build_parser():
             "Use remctl sharees LIST --json before assignment when scripting or when names may collide.\n"
             "Date-only due inputs such as today, tomorrow, YYYY-MM-DD, +3d, +1m (~30 days), and next friday create all-day reminders.\n"
             "Due inputs with explicit times create timed reminders.\n"
+            "Recurrence nth-weekday rules pin a weekday to a week ('monthly 4th-fri'); use 'monthly last-fri' for the final Friday, since 'monthly 5th-fri' skips months with no fifth Friday.\n"
             "If -d/--due is present and cannot be parsed, add fails before creating the reminder.\n"
             "Titles beginning with - require a separator: remctl add -- \"-title\".\n"
             "If a private-metadata step fails after creation, the reminder is kept; re-run edit to finish (do not re-run add).\n"
+            "Without --private, -f/--flag is a separate AppleScript step: if it fails the reminder is still created, stderr warns, and --json adds a warnings array.\n"
             "Private metadata is unsupported by Apple and never writes SQLite directly."
         ),
         formatter_class=HelpFormatter,
@@ -11719,10 +11859,10 @@ def build_parser():
     c.add_argument("--list-id", type=int, help="Create in a list by stable numeric ID")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders")
     c.add_argument("-p", "--priority", help="high, medium, low")
-    c.add_argument("-f", "--flag", action="store_true", help="Set the reminder's real flagged state")
+    c.add_argument("-f", "--flag", action="store_true", help="Set the reminder's real flagged state; applied by a separate AppleScript step after creation (ReminderKit with --private)")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
-    c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', yearly (bridge only)")
+    c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
     c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/assignments/subtasks/images")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
@@ -11798,7 +11938,7 @@ def build_parser():
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders, or clear")
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
-    c.add_argument("--recurrence", help="Recurrence (bridge only)")
+    c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, ISO datetime, or clear (bridge only)")
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
@@ -11881,8 +12021,8 @@ def build_parser():
     c.add_argument("id", type=int, nargs="?", default=None, help="Reminder ID (opens specific reminder via deep link)")
 
     # --- New commands ---
-    c = sub.add_parser("flag", help="Flag a reminder"); c.add_argument("id", type=int); js(c)
-    c = sub.add_parser("unflag", help="Unflag a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("flag", help="Flag a reminder (AppleScript only; needs Reminders Automation access, no bridge fallback)"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("unflag", help="Unflag a reminder (AppleScript only; needs Reminders Automation access, no bridge fallback)"); c.add_argument("id", type=int); js(c)
 
     c = sub.add_parser("upcoming", help="Show reminders due from today through N more days (default 7)")
     c.add_argument("days", type=int, nargs="?", default=7, help="Days to look ahead beyond today; the window always starts today (1 = today and tomorrow, 7 = today plus the next week)")

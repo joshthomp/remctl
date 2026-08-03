@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.6.1 — 2026-07-30
+
+Two things: flagging is now honest end-to-end (it writes the real flag or fails — no more reporting success while writing nothing), and the recurrence grammar learned intervals and Nth-weekday rules.
+
+### Recurrence: intervals and Nth-weekday rules
+
+- **`xN` interval token** right after the frequency, for every frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. N is 1–999. The bridge always supported intervals; the CLI grammar finally exposes them.
+- **Monthly Nth-weekday rules**: `monthly 4th-fri` is the 4th Friday of each month, `monthly 1st-mon,3rd-mon` the 1st and 3rd Monday, `monthly last-fri` (alias of `-1-fri`) the last Friday, with negative forms down to `-5-fri`. Ordinal suffixes are validated (`4st-fri` is rejected), Nth-weekday tokens cannot be mixed with plain day-of-month numbers, and the forms are monthly-only. Prefer `last-fri` over `5th-fri`: EventKit silently skips months without a fifth Friday.
+- **Round-trip.** Parsed rules carry a `weekNumbers` array parallel to `daysOfWeek`; `remctl-bridge` validates it before constructing `EKRecurrenceDayOfWeek` (out-of-range or wrong-frequency week numbers raise an uncatchable NSException inside EventKit, so they are rejected at the boundary) and emits it back on EventKit reads. Database reads surface the pinning as `daysOfWeekDetailed` entries with `weekNumber`, as before. Human output renders `monthly 4th Fri`, `monthly last Fri`, `every 2 months 4th Tue`.
+- **Occurrence-count rendering changed**: a rule ending after N occurrences now renders as `daily, 5 times` instead of `daily x5`, because `x5` now reads as the interval input token.
+- **Hardened numeric parsing.** Recurrence digit tokens now use `isdecimal()` with bounded lengths; the old `isdigit()` path let `monthly ²` and multi-thousand-digit tokens raise tracebacks instead of a parse error.
+- Design informed by PR #23 from @edequalsawesome; implemented fresh with validated ordinal suffixes and the `last-fri` alias.
+
+### Flagging: honest end-to-end
+
+- **Fixed: flagging reminders in group-nested lists silently did nothing.** Reminders' AppleScript dictionary does not expose lists inside groups, so the old list-scoped script (`tell list "<name>"`) always failed for them with `-1728`; the command then fell back to remctl-bridge, which set priority as a "flag proxy" and reported success without ever touching the real flag. `flag`/`unflag` and `add --flag` now address the reminder at application level (`reminder id …`), which resolves reminders in every list, nested or not. (Reported by Brett Rosenberg.)
+- **AppleScript errors are surfaced.** When the flag write fails, `flag`/`unflag` exit 1 with the underlying osascript error — under `--json`: `{"status": "error", "code": "applescript_flag_failed", …}` on stderr — instead of a fake success. `add --flag` failures now include the error text in the stderr warning and a `warnings` array in the JSON payload.
+- **Priority is never touched by flagging.** The bridge's priority=1 proxy is gone: `flag`/`unflag` no longer fall back to the bridge, and remctl-bridge now refuses `flag`/`unflag` actions and `flagged` payload fields outright instead of mutating priority (the old `unflag` proxy could wipe a genuine High priority to none). Requires rebuilding the bridge via `./install.sh`.
+- Regression coverage: app-level addressing, stderr surfacing, error-not-fallback on AppleScript failure for both commands, and the `add --flag` JSON warning.
+
+## 1.6.0 — 2026-07-30
+
+Write confirmations are now fully machine-readable: every `edit` outcome under `--json` identifies the reminder it touched, and the no-op path no longer breaks parsers.
+
+- **`edit … --json` echoes `title`** on all four write paths (bridge, private-only, AppleScript fallback, and clone-delete moves between lists), matching the existing `add`/`done`/`undone`/`delete` convention. Agents and UI consumers can confirm a write without a follow-up `info` call.
+- **Structured no-op result.** `edit` with nothing to change used to print the bare line `Nothing to update.` even under `--json`, breaking any strict parser. It now emits `{"status": "unchanged", "code": "nothing_to_update", "id": …, "title": …, "message": "Nothing to update."}` on stdout with exit 0. `status` is deliberately not `error`, so consumers that branch on error states keep working. Human (non-`--json`) output is byte-identical to before.
+- Regression coverage for the title echo on every write path and for the structured no-op (including that it never falls through to AppleScript).
+
 ## 1.5.1 — 2026-07-18
 
 - Fixed a startup crash on Python 3.14 caused by the literal percentage in the `--image-width` help text being interpreted as an argparse formatting token. Root help, diagnostics, and normal commands now construct the parser correctly across supported Python versions.

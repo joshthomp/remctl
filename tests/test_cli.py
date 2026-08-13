@@ -1262,6 +1262,76 @@ class CliTests(unittest.TestCase):
             "ZDUEDATEDELTAALERTSDATA": None,
         }
 
+    def test_show_requests_persisted_manual_order_for_list_reads(self):
+        db = object()
+        args = SimpleNamespace(
+            list="Projects",
+            list_id=None,
+            completed=False,
+            json=True,
+            format=None,
+            verbose=False,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=db),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 7, "title": "Projects"},
+            ),
+            mock.patch.object(self.remctl, "q_reminders", return_value=[]) as q_reminders,
+            mock.patch.object(self.remctl, "preload_extras", return_value=({}, {})),
+            mock.patch.object(self.remctl, "preload_attachments", return_value={}),
+            mock.patch.object(self.remctl, "preload_indicators", return_value={}),
+            mock.patch.object(self.remctl, "q_sections", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_show(args)
+
+        q_reminders.assert_called_once_with(
+            db,
+            list_pk=7,
+            completed=False,
+            top_level=True,
+            manual_order=True,
+        )
+        self.assertEqual(json.loads(stdout.getvalue()), [])
+
+    def test_show_group_requests_persisted_manual_order_for_each_child(self):
+        db = object()
+        children = [
+            {"Z_PK": 7, "ZNAME": "Editorial"},
+            {"Z_PK": 8, "ZNAME": "Projects"},
+        ]
+        args = SimpleNamespace(completed=False, json=True, format=None, verbose=False)
+        with (
+            mock.patch.object(self.remctl, "q_child_lists", return_value=children),
+            mock.patch.object(
+                self.remctl,
+                "q_reminders_for_lists",
+                return_value=[],
+            ) as q_reminders_for_lists,
+            mock.patch.object(self.remctl, "preload_extras", return_value=({}, {})),
+            mock.patch.object(self.remctl, "preload_attachments", return_value={}),
+            mock.patch.object(self.remctl, "preload_indicators", return_value={}),
+            mock.patch.object(self.remctl, "q_sections", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_show_group(
+                args,
+                db,
+                {"id": 1, "title": "Writing", "isGroup": True},
+            )
+
+        q_reminders_for_lists.assert_called_once_with(
+            db,
+            [7, 8],
+            completed=False,
+            top_level=True,
+            manual_order=True,
+        )
+        self.assertEqual(json.loads(stdout.getvalue()), [])
+
     def test_show_human_output_marks_grocery_sections_with_matching_emoji(self):
         rows = [
             self._show_row(1, "Milk", "REM-1"),
@@ -1733,6 +1803,21 @@ class CliTests(unittest.TestCase):
         self.assertIn("--via-eventkit", output)
         self.assertIn("never the default", output)
         self.assertIn("no RemCTL numeric ids", output)
+        self.assertIn("stored manual display order", output)
+
+    def test_list_pin_help_names_custom_readback_and_builtin_capability_gate(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "list-pin", "--help"]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 0)
+        output = " ".join(stdout.getvalue().split())
+        self.assertIn("custom smart-list state", output)
+        self.assertIn("pinnedDate", output)
+        self.assertIn("generic fetch capability", output)
 
     def test_list_symbols_html_contact_sheet_embeds_badge_assets(self):
         rows = [
@@ -2516,6 +2601,100 @@ class CliTests(unittest.TestCase):
             )
         finally:
             db.close()
+
+    def test_custom_smart_list_pin_and_unpin_use_custom_fetch_contract(self):
+        db = self._smart_list_db()
+        pin_args = SimpleNamespace(
+            name="High Priority",
+            list_id=None,
+            smart_list_id=None,
+            private=True,
+            json=True,
+        )
+        unpin_args = SimpleNamespace(
+            name=None,
+            list_id=None,
+            smart_list_id=2,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    side_effect=[
+                        {"status": "updated", "pinned": True},
+                        {"status": "updated", "pinned": False},
+                    ],
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_list_pin(pin_args)
+                pin_payload = json.loads(stdout.getvalue())
+                stdout.seek(0)
+                stdout.truncate(0)
+                self.remctl.cmd_list_unpin(unpin_args)
+                unpin_payload = json.loads(stdout.getvalue())
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {
+                    "action": "set_smart_list_pinned",
+                    "smartListId": "CUSTOM-1",
+                    "isCustom": True,
+                    "pinned": True,
+                },
+                {
+                    "action": "set_smart_list_pinned",
+                    "smartListId": "CUSTOM-1",
+                    "isCustom": True,
+                    "pinned": False,
+                },
+            ],
+        )
+        self.assertEqual(pin_payload["status"], "pinned")
+        self.assertEqual(pin_payload["kind"], "smart-list")
+        self.assertEqual(pin_payload["private"]["pinned"], True)
+        self.assertEqual(unpin_payload["status"], "unpinned")
+        self.assertEqual(unpin_payload["private"]["pinned"], False)
+
+    def test_custom_smart_list_pin_surfaces_helper_failure_without_success_output(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="High Priority",
+            list_id=None,
+            smart_list_id=None,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    return_value={
+                        "status": "error",
+                        "message": "Custom smart-list pinning is unsupported on this macOS version",
+                    },
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_list_pin(args)
+        finally:
+            db.close()
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Custom smart-list pinning is unsupported", stderr.getvalue())
 
     def test_smart_list_create_rejects_without_private_before_helper(self):
         args = SimpleNamespace(name="Nope", private=False, flagged=True, priority=None, json=True)
@@ -7603,6 +7782,183 @@ class CliTests(unittest.TestCase):
         encoded = b"\x01" + json.dumps(payload).encode("utf-8")
 
         self.assertEqual(self.remctl.decode_manual_sort_hint_blob(encoded), payload)
+
+    def test_sort_reminder_rows_follows_identifier_order_and_appends_unknown_rows(self):
+        rows = [
+            {"Z_PK": 1, "ZTITLE": "First", "ZCKIDENTIFIER": "REM-A"},
+            {"Z_PK": 2, "ZTITLE": "Merging", "ZCKIDENTIFIER": "REM-NEW"},
+            {"Z_PK": 3, "ZTITLE": "Second", "ZCKIDENTIFIER": "REM-B"},
+            {"Z_PK": 4, "ZTITLE": "No identifier", "ZCKIDENTIFIER": None},
+        ]
+
+        ordered = self.remctl.sort_reminder_rows_by_identifier_order(
+            rows,
+            ["rem-b", "rem-a"],
+        )
+
+        self.assertEqual(
+            [row["ZTITLE"] for row in ordered],
+            ["Second", "First", "Merging", "No identifier"],
+        )
+
+    def test_q_reminders_manual_order_expands_query_and_applies_stored_order(self):
+        class Result:
+            def __init__(self, *, one=None, rows=None):
+                self.one = one
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.one
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeDB:
+            def __init__(self):
+                self.reminder_query_params = None
+                self.reminder_query = None
+
+            def execute(self, query, params=()):
+                if "ZREMINDERIDSMERGEABLEORDERING_V2_JSON" in query:
+                    return Result(one=(json.dumps(["REM-B", "REM-A", "REM-C"]),))
+                self.reminder_query = query
+                self.reminder_query_params = params
+                return Result(rows=[
+                    {"Z_PK": 1, "ZTITLE": "First", "ZCKIDENTIFIER": "REM-A"},
+                    {"Z_PK": 2, "ZTITLE": "Second", "ZCKIDENTIFIER": "REM-B"},
+                    {"Z_PK": 3, "ZTITLE": "Third", "ZCKIDENTIFIER": "REM-C"},
+                ])
+
+        db = FakeDB()
+        with mock.patch.object(self.remctl, "rem_cols", return_value="r.Z_PK"):
+            rows = self.remctl.q_reminders(
+                db,
+                list_pk=7,
+                top_level=True,
+                limit=2,
+                manual_order=True,
+            )
+
+        self.assertEqual([row["ZTITLE"] for row in rows], ["Second", "First"])
+        self.assertNotIn("LIMIT ?", db.reminder_query)
+        self.assertEqual(db.reminder_query_params, [7])
+
+    def test_q_reminders_sorts_before_limit_when_unknown_rows_precede_positioned_row(self):
+        class Result:
+            def __init__(self, *, one=None, rows=None):
+                self.one = one
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.one
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeDB:
+            def execute(self, query, params=()):
+                if "ZREMINDERIDSMERGEABLEORDERING_V2_JSON" in query:
+                    return Result(one=(json.dumps(["REM-Z"]),))
+                self.asserted_query = query
+                return Result(rows=[
+                    {"Z_PK": 1, "ZTITLE": "Unknown A", "ZCKIDENTIFIER": "UNKNOWN-A"},
+                    {"Z_PK": 2, "ZTITLE": "Unknown B", "ZCKIDENTIFIER": "UNKNOWN-B"},
+                    {"Z_PK": 3, "ZTITLE": "Positioned", "ZCKIDENTIFIER": "REM-Z"},
+                ])
+
+        db = FakeDB()
+        with mock.patch.object(self.remctl, "rem_cols", return_value="r.Z_PK"):
+            rows = self.remctl.q_reminders(
+                db,
+                list_pk=7,
+                top_level=True,
+                limit=2,
+                manual_order=True,
+            )
+
+        self.assertNotIn("LIMIT ?", db.asserted_query)
+        self.assertEqual([row["ZTITLE"] for row in rows], ["Positioned", "Unknown A"])
+
+    def test_q_reminders_for_lists_applies_each_child_list_order(self):
+        class Result:
+            def __init__(self, *, one=None, rows=None):
+                self.one = one
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.one
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeDB:
+            def execute(self, query, params=()):
+                if "ZREMINDERIDSMERGEABLEORDERING_V2_JSON" in query:
+                    order = {
+                        7: ["EDITORIAL-B", "EDITORIAL-A"],
+                        8: ["PROJECTS-A", "PROJECTS-B"],
+                    }[params[0]]
+                    return Result(one=(json.dumps(order),))
+                return Result(rows=[
+                    {"Z_PK": 1, "ZTITLE": "Editorial A", "ZCKIDENTIFIER": "EDITORIAL-A", "ZLIST": 7},
+                    {"Z_PK": 2, "ZTITLE": "Editorial B", "ZCKIDENTIFIER": "EDITORIAL-B", "ZLIST": 7},
+                    {"Z_PK": 3, "ZTITLE": "Projects A", "ZCKIDENTIFIER": "PROJECTS-A", "ZLIST": 8},
+                    {"Z_PK": 4, "ZTITLE": "Projects B", "ZCKIDENTIFIER": "PROJECTS-B", "ZLIST": 8},
+                ])
+
+        with mock.patch.object(self.remctl, "rem_cols", return_value="r.Z_PK"):
+            rows = self.remctl.q_reminders_for_lists(
+                FakeDB(),
+                [7, 8],
+                top_level=True,
+                manual_order=True,
+            )
+
+        self.assertEqual(
+            [row["ZTITLE"] for row in rows],
+            ["Editorial B", "Editorial A", "Projects A", "Projects B"],
+        )
+
+    def test_q_reminders_for_lists_sorts_all_children_before_global_limit(self):
+        class Result:
+            def __init__(self, *, one=None, rows=None):
+                self.one = one
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.one
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeDB:
+            def execute(self, query, params=()):
+                if "ZREMINDERIDSMERGEABLEORDERING_V2_JSON" in query:
+                    order = {7: ["EDITORIAL-Z"], 8: ["PROJECTS-Z"]}[params[0]]
+                    return Result(one=(json.dumps(order),))
+                self.reminder_query = query
+                return Result(rows=[
+                    {"Z_PK": 1, "ZTITLE": "Editorial unknown", "ZCKIDENTIFIER": "EDITORIAL-A", "ZLIST": 7},
+                    {"Z_PK": 2, "ZTITLE": "Editorial positioned", "ZCKIDENTIFIER": "EDITORIAL-Z", "ZLIST": 7},
+                    {"Z_PK": 3, "ZTITLE": "Projects unknown", "ZCKIDENTIFIER": "PROJECTS-A", "ZLIST": 8},
+                    {"Z_PK": 4, "ZTITLE": "Projects positioned", "ZCKIDENTIFIER": "PROJECTS-Z", "ZLIST": 8},
+                ])
+
+        db = FakeDB()
+        with mock.patch.object(self.remctl, "rem_cols", return_value="r.Z_PK"):
+            rows = self.remctl.q_reminders_for_lists(
+                db,
+                [7, 8],
+                top_level=True,
+                limit=3,
+                manual_order=True,
+            )
+
+        self.assertNotIn("LIMIT ?", db.reminder_query)
+        self.assertEqual(
+            [row["ZTITLE"] for row in rows],
+            ["Editorial positioned", "Editorial unknown", "Projects positioned"],
+        )
 
     def test_reorder_identifier_list_supports_relative_and_edge_positions(self):
         ordering = ["A", "MOVE", "B", "C"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.7.0
+"""remctl — Power-user Reminders CLI v1.7.1
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -55,7 +55,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 PRIVATE_PROTOCOL_VERSION = 2
 _private_protocol_probe = None
 
@@ -1968,23 +1968,80 @@ def rem_cols(db):
     r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name,
     {_RECURRENCE_COLS}"""
 
-def q_reminders(db, list_pk=None, completed=False, parent_pk=None, top_level=False, limit=500):
+def sort_reminder_rows_by_identifier_order(rows, identifier_order):
+    """Return reminder rows in ReminderKit's persisted display order.
+
+    Rows that are absent from the ordering payload keep their query order and
+    follow the positioned rows. This preserves a useful fallback while a newly
+    created reminder is still merging into the list ordering record.
+    """
+    positions = {}
+    for index, identifier in enumerate(identifier_order or []):
+        if isinstance(identifier, str) and identifier:
+            positions.setdefault(identifier.casefold(), index)
+    if not positions:
+        return list(rows)
+
+    def key(indexed_row):
+        original_index, row = indexed_row
+        identifier = _row_get(row, "ZCKIDENTIFIER")
+        position = positions.get(identifier.casefold()) if isinstance(identifier, str) else None
+        if position is None:
+            return (1, original_index)
+        return (0, position, original_index)
+
+    return [row for _, row in sorted(enumerate(rows), key=key)]
+
+
+def q_reminders(
+    db,
+    list_pk=None,
+    completed=False,
+    parent_pk=None,
+    top_level=False,
+    limit=500,
+    manual_order=False,
+):
+    identifier_order = (
+        q_list_reminder_order(db, list_pk)
+        if manual_order and list_pk is not None
+        else []
+    )
     c, params = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL"], []
     if not completed: c.append("r.ZCOMPLETED = 0")
     if list_pk is not None: c.append("r.ZLIST = ?"); params.append(list_pk)
     if parent_pk is not None: c.append("r.ZPARENTREMINDER = ?"); params.append(parent_pk)
     elif top_level: c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
-    return db.execute(
+    query = (
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} AND l.Z_PK IS NOT NULL "
-        f"ORDER BY r.Z_PK LIMIT ?",
-        params + [limit]
-    ).fetchall()
+        f"ORDER BY r.Z_PK"
+    )
+    if not identifier_order:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    if identifier_order:
+        rows = sort_reminder_rows_by_identifier_order(rows, identifier_order)
+    return rows[:limit]
 
 
-def q_reminders_for_lists(db, list_pks, completed=False, top_level=False, limit=500):
+def q_reminders_for_lists(
+    db,
+    list_pks,
+    completed=False,
+    top_level=False,
+    limit=500,
+    manual_order=False,
+):
     if not list_pks:
         return []
+    identifier_orders = (
+        {list_pk: q_list_reminder_order(db, list_pk) for list_pk in list_pks}
+        if manual_order
+        else {}
+    )
+    has_identifier_order = any(identifier_orders.values())
     placeholders = ", ".join("?" for _ in list_pks)
     order_cases = " ".join(f"WHEN {int(pk)} THEN {idx}" for idx, pk in enumerate(list_pks))
     c = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL", f"r.ZLIST IN ({placeholders})"]
@@ -1992,12 +2049,29 @@ def q_reminders_for_lists(db, list_pks, completed=False, top_level=False, limit=
         c.append("r.ZCOMPLETED = 0")
     if top_level:
         c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
-    return db.execute(
+    query = (
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} "
-        f"ORDER BY CASE r.ZLIST {order_cases} ELSE {len(list_pks)} END, r.Z_PK LIMIT ?",
-        list(list_pks) + [limit],
-    ).fetchall()
+        f"ORDER BY CASE r.ZLIST {order_cases} ELSE {len(list_pks)} END, r.Z_PK"
+    )
+    params = list(list_pks)
+    if not has_identifier_order:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    if identifier_orders:
+        rows_by_list = {list_pk: [] for list_pk in list_pks}
+        for row in rows:
+            rows_by_list.setdefault(_row_get(row, "ZLIST"), []).append(row)
+        rows = [
+            row
+            for list_pk in list_pks
+            for row in sort_reminder_rows_by_identifier_order(
+                rows_by_list.get(list_pk, []),
+                identifier_orders.get(list_pk),
+            )
+        ]
+    return rows[:limit]
 
 
 def q_reminder(db, pk):
@@ -8214,7 +8288,13 @@ def cmd_show_group(a, db, group_ref):
         return
     child_ids = [child["Z_PK"] for child in children]
     child_by_id = {child["Z_PK"]: child for child in children}
-    items = q_reminders_for_lists(db, child_ids, completed=a.completed, top_level=True)
+    items = q_reminders_for_lists(
+        db,
+        child_ids,
+        completed=a.completed,
+        top_level=True,
+        manual_order=True,
+    )
     pks = [item["Z_PK"] for item in items]
     sc, ht = preload_extras(db, pks)
     att = preload_attachments(db, pks)
@@ -8299,7 +8379,13 @@ def cmd_show(a):
         return
     pk = list_ref["id"]
     list_name = list_ref["title"]
-    items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
+    items = q_reminders(
+        db,
+        list_pk=pk,
+        completed=a.completed,
+        top_level=True,
+        manual_order=True,
+    )
     pks = [i["Z_PK"] for i in items]
     sc, ht = preload_extras(db, pks)
     att = preload_attachments(db, pks)
@@ -12192,7 +12278,14 @@ def build_parser():
     c.add_argument("--template-id", type=int, help="Read by numeric template ID from templates")
     js(c)
 
-    c = sub.add_parser("show", help="Show reminders in a list (grouped by section)")
+    c = sub.add_parser(
+        "show",
+        help="Show reminders in a list in Reminders display order",
+        description=(
+            "Show reminders in a list, grouped by section. Direct database reads follow "
+            "Reminders' stored manual display order when it is available."
+        ),
+    )
     c.add_argument("list", nargs="?", help="List name")
     c.add_argument("--list-id", type=int, help="Show a list by stable numeric ID")
     c.add_argument("--completed", action="store_true", help="Include completed")
@@ -12599,14 +12692,30 @@ def build_parser():
     c.add_argument("--private", action="store_true", help="Required for list appearance and grocery metadata writes")
     js(c)
 
-    c = sub.add_parser("list-pin", help="Pin a list or smart list in Reminders.app")
+    c = sub.add_parser(
+        "list-pin",
+        help="Pin a list or supported smart list in Reminders.app",
+        description=(
+            "Pin a regular list or custom smart list through private ReminderKit. "
+            "Verify custom smart-list state with smart-lists --json and pinnedDate. "
+            "Built-in smart lists are rejected on hosts without the generic fetch capability."
+        ),
+    )
     c.add_argument("name", nargs="?", help="List or smart-list name to pin")
     c.add_argument("--list-id", type=int, help="Pin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Pin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
     js(c)
 
-    c = sub.add_parser("list-unpin", help="Unpin a list or smart list in Reminders.app")
+    c = sub.add_parser(
+        "list-unpin",
+        help="Unpin a list or supported smart list in Reminders.app",
+        description=(
+            "Unpin a regular list or custom smart list through private ReminderKit. "
+            "Verify custom smart-list state with smart-lists --json and pinnedDate. "
+            "Built-in smart lists are rejected on hosts without the generic fetch capability."
+        ),
+    )
     c.add_argument("name", nargs="?", help="List or smart-list name to unpin")
     c.add_argument("--list-id", type=int, help="Unpin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Unpin a smart list by stable numeric ID")

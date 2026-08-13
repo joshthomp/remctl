@@ -37,6 +37,8 @@ remctl tags
 remctl stats
 ```
 
+Direct `show` reads follow Reminders' persisted manual display order in JSON, plain, and table output. For `show <group>`, each child list uses its own stored order. Reminders that are not present in the ordering record yet remain visible afterward in their previous stable order. The limited `--via-eventkit` fallback does not expose this private ordering record.
+
 ## Flags, Priorities, Urgent, and Recurrence
 
 ```bash
@@ -258,6 +260,8 @@ remctl reminder-move 23880 --last --smart-list-id 170 --private --json
 Without a smart-list target, the reminder and a `--before`/`--after` anchor must belong to the same ordinary list. With `--smart-list` or `--smart-list-id`, RemCTL reorders an unsectioned custom smart list and can position reminders whose base lists differ. Sectioned custom smart lists are refused before saving because their secondary-level `REMManualOrdering` shape has not been verified.
 
 Smart-list ordering requires an existing manual-order record, and relative anchors must already have persisted positions. RemCTL fails before writing when it cannot establish those boundaries. Successful commands re-read the local store and report `verified: true`; the helper writes through ReminderKit and never edits SQLite directly.
+
+For an ordinary list, `remctl show <list> --json` reads that same persisted identifier order, so the CLI output immediately reflects a verified `reminder-move`. Plain and table formats use the same ordered rows.
 
 ## Lists
 
@@ -590,4 +594,4 @@ If an agent supplies an invalid due date, RemCTL creates nothing and exits with 
 
 For Groceries automation, detect eligible lists with `remctl lists --json` and `listType == "groceries"`. After `add --private --grocery`, verify with `remctl show <list> --json` and check that the reminder has a non-empty `section` once categorization completes.
 
-For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed.
+For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed. Custom smart-list pin coverage includes name and numeric-ID targeting, idempotent pinning, the current and protocol-1 payload shapes, `pinnedDate` transitions, filter/identity preservation, built-in isolation, and cleanup readback.

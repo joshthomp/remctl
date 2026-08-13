@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.1 — 2026-08-13
+
+- `show` now follows Reminders' persisted manual display order instead of always falling back to reminder creation order. The fix applies to JSON, plain, and table output, including each child list shown through a list group. Rows that have not merged into the ordering record yet remain visible after the positioned rows in their previous stable order.
+- Expanded custom smart-list pin validation. The disposable private matrix now covers name and numeric-ID targeting, repeated idempotent pinning, current and protocol-1 payloads, positive/cleared `pinnedDate` readback, filter and identity preservation, built-in isolation, and cleanup.
+
 ## 1.7.0 — 2026-08-13
 
 This release adds verified reminder ordering, makes every destructive command safe in non-interactive workflows, and hardens private ReminderKit behavior across Tahoe and Golden Gate.

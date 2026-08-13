@@ -156,7 +156,7 @@ Important limits:
 - `--emoji` writes a Reminders emoji badge for standard emoji such as `🥶` or `📌`.
 - `list-edit` resolves by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
 - `list-pin` and `list-unpin` can target regular lists or smart lists by name. If a name matches both, use `--list-id` or `--smart-list-id`.
-- Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. Successful smart-list writes can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL reports `pinned: true` when the smart-list pin date is positive. Built-in smart-list pinning fails before saving on hosts without the generic ReminderKit fetch.
+- Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. For a custom smart list, capture its `objectUUID` and filter, pin it, require `pinned: true` with a positive `pinnedDate`, then unpin it and require `pinned: false` with no positive pin date while identity and filter remain unchanged. Successful smart-list writes can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL therefore derives custom pin state from a positive pin date when needed. Built-in smart-list pinning fails before saving on hosts without the generic ReminderKit fetch.
 
 ## List Group Examples
 

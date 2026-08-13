@@ -280,7 +280,19 @@ class LiveMatrix:
         ])
         self.assert_true(moved.get("verified") is True, "reminder-move did not verify the stored order")
         self.assert_true(moved.get("anchorId") == order_first["numericId"], "reminder-move returned the wrong anchor")
-        self.record("reminder-move ordinary list", "passed", renamed)
+        expected_titles = [
+            f"{self.prefix} Order Second",
+            f"{self.prefix} Order First",
+        ]
+        shown_order = self.retry(
+            lambda: (
+                titles
+                if (titles := [item.get("title") for item in self.show_list(renamed)])[:2] == expected_titles
+                else None
+            )
+        )
+        self.assert_true(bool(shown_order), "show did not reflect the persisted reminder order")
+        self.record("reminder-move ordinary list", "passed", "show order: Second, First")
 
         grocery_row = self.create_list(grocery, "--private", "--groceries", "--grocery-locale", "en_US")
         self.assert_true(grocery_row.get("isGroceries"), "Groceries metadata did not persist")
@@ -497,13 +509,95 @@ class LiveMatrix:
         self.assert_true(edited.get("badge", {}).get("emoji") == "\U0001f3f7", "smart-list-edit emoji did not persist")
         self.record("smart-list-edit filter and appearance", "passed", summary)
 
-        self.json_command(["list-pin", editable, "--private", "--json"])
-        pinned = self.retry(lambda: self.smart_named(editable) and self.smart_named(editable).get("pinned"))
-        self.assert_true(bool(pinned), "smart-list pin did not persist")
-        self.json_command(["list-unpin", editable, "--private", "--json"])
-        unpinned = self.retry(lambda: self.smart_named(editable) and not self.smart_named(editable).get("pinned"))
-        self.assert_true(bool(unpinned), "smart-list unpin did not persist")
-        self.record("list-pin/list-unpin smart list", "passed", editable)
+        baseline = self.smart_named(editable)
+        self.assert_true(bool(baseline), "custom smart list disappeared before pin testing")
+        smart_id = baseline["id"]
+        smart_uuid = baseline["objectUUID"]
+        baseline_filter = baseline.get("filterJSON")
+        built_in_before = {
+            item["id"]: (item.get("pinned"), item.get("pinnedDate"))
+            for item in self.smart_lists()
+            if item.get("kind") == "built-in"
+        }
+
+        def assert_pin_state(expected: bool, label: str) -> dict:
+            current = self.retry(
+                lambda: (
+                    row
+                    if (row := self.smart_named(editable))
+                    and bool(row.get("pinned")) == expected
+                    else None
+                )
+            )
+            self.assert_true(bool(current), f"{label} did not persist")
+            self.assert_true(current.get("objectUUID") == smart_uuid, f"{label} changed the smart-list identity")
+            self.assert_true(current.get("filterJSON") == baseline_filter, f"{label} changed the smart-list filter")
+            if expected:
+                self.assert_true(
+                    isinstance(current.get("pinnedDate"), (int, float)) and current["pinnedDate"] > 0,
+                    f"{label} did not persist a positive pinnedDate",
+                )
+            else:
+                pinned_date = current.get("pinnedDate")
+                self.assert_true(
+                    pinned_date is None or (isinstance(pinned_date, (int, float)) and pinned_date <= 0),
+                    f"{label} left a positive pinnedDate",
+                )
+            return current
+
+        pin_by_name = self.json_command(["list-pin", editable, "--private", "--json"])
+        self.assert_true(pin_by_name.get("kind") == "smart-list", "name pin resolved to the wrong target kind")
+        self.assert_true(pin_by_name.get("id") == smart_id, "name pin returned the wrong smart-list ID")
+        self.assert_true(pin_by_name.get("private", {}).get("pinned") is True, "name pin helper result is wrong")
+        assert_pin_state(True, "custom smart-list pin by name")
+
+        pin_by_id = self.json_command([
+            "list-pin",
+            "--smart-list-id",
+            str(smart_id),
+            "--private",
+            "--json",
+        ])
+        self.assert_true(pin_by_id.get("private", {}).get("pinned") is True, "idempotent ID pin helper result is wrong")
+        assert_pin_state(True, "idempotent custom smart-list pin by ID")
+
+        unpin_by_id = self.json_command([
+            "list-unpin",
+            "--smart-list-id",
+            str(smart_id),
+            "--private",
+            "--json",
+        ])
+        self.assert_true(unpin_by_id.get("private", {}).get("pinned") is False, "ID unpin helper result is wrong")
+        assert_pin_state(False, "custom smart-list unpin by ID")
+
+        legacy_pin = self.private_helper_json({
+            "action": "set_smart_list_pinned",
+            "smartListId": smart_uuid,
+            "pinned": True,
+        })
+        self.assert_true(legacy_pin.get("pinned") is True, "legacy custom smart-list pin result is wrong")
+        assert_pin_state(True, "legacy payload custom smart-list pin")
+
+        legacy_unpin = self.private_helper_json({
+            "action": "set_smart_list_pinned",
+            "smartListId": smart_uuid,
+            "pinned": False,
+        })
+        self.assert_true(legacy_unpin.get("pinned") is False, "legacy custom smart-list unpin result is wrong")
+        assert_pin_state(False, "legacy payload custom smart-list unpin")
+
+        built_in_after = {
+            item["id"]: (item.get("pinned"), item.get("pinnedDate"))
+            for item in self.smart_lists()
+            if item.get("kind") == "built-in"
+        }
+        self.assert_true(built_in_after == built_in_before, "custom pin cycles changed a built-in smart list")
+        self.record(
+            "custom smart-list pinning",
+            "passed",
+            "name + ID + idempotent + protocol-1 payload pin/unpin with pinnedDate/filter/identity readback",
+        )
 
         built_in = next(
             (item for item in self.smart_lists() if item.get("kind") == "built-in" and item.get("objectUUID")),

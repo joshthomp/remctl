@@ -138,6 +138,8 @@ remctl tags
 remctl stats
 ```
 
+Direct `show` reads follow Reminders' persisted manual display order in JSON, plain, and table output. For `show <group>`, each child list uses its own stored order. Reminders that are not present in the ordering record yet remain visible afterward in their previous stable order. The limited `--via-eventkit` fallback does not expose this private ordering record.
+
 ## Flags, Priorities, Urgent, and Recurrence
 
 ```bash
@@ -210,7 +212,7 @@ remctl template-delete "Packing Template" --private --force
 
 ## CLI Syntax Rules
 
-RemCTL uses nouns for read-only inspectors (`lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, plus the `section-*`, `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands). Section-management commands keep the `section-*` prefix; list-management commands keep the `list-*` prefix; group writes keep the `group-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
+RemCTL uses nouns for read-only inspectors (`lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `reminder-move`, `delete`, plus the `section-*`, `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands). Section-management commands keep the `section-*` prefix; list-management commands keep the `list-*` prefix; group writes keep the `group-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
 
 Use `--json` on subcommands when scripting. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `groups`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command, so both `remctl --format table show Work` and `remctl show Work --format table` are valid. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
@@ -267,7 +269,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields. A subtask `due` given as a date without a time creates an all-day subtask, matching the parent's date-only behavior.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, reminder display ordering in ordinary lists and unsectioned custom smart lists, list appearance metadata, regular-list and custom-smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Built-in smart-list pinning is separately capability-gated and fails before saving when the host's generic fetch is unavailable. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts before creating or editing a reminder; rich subtask URLs follow the same rule. Non-private `--url` remains a notes fallback.
 
@@ -338,6 +340,7 @@ remctl delete 23880
 remctl delete 23880 --force
 ```
 
+<<<<<<< HEAD
 When the same reminder ID exists in more than one account, pass `--account NAME` to disambiguate:
 
 ```bash
@@ -345,10 +348,33 @@ remctl done 23 --account Exchange
 remctl edit 23 -d tomorrow --account iCloud
 remctl delete 23 --force --account Exchange
 ```
+=======
+Every destructive command (`delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, and `template-delete`) requires `--force` when `--json` is present or stdin is not a TTY. Without it, RemCTL performs no write, leaves stdout empty, emits a `confirmation_required` error on stderr in JSON mode, and exits 1. Human-only interactive prompts are written to stderr so command output stays clean.
+>>>>>>> origin/main
 
 `done --date WHEN` records an explicit completion date instead of "now". It also works on an already-completed reminder to correct the stored completion date. `WHEN` must be an absolute `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; recurring reminders reject `--date` because plain completion advances the series and EventKit discards a manually supplied completion date.
 
 For parent reminders with subtasks, Reminders rejects an in-place EventKit list move. Some ordinary reminders can also hit EventKit list/container boundaries when moving between private and shared CalDAV containers. For a pure list move, RemCTL handles those shapes by cloning the reminder into the destination list with ReminderKit, verifying the cloned reminder and subtask count, then deleting the original. JSON output includes `method: "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved` (`0` for ordinary reminders). Move first, then apply unrelated title/notes/due/private edits to the returned ID.
+
+## Reminder Ordering
+
+`reminder-move` changes a reminder's display position without moving it to another base list. It is an unsupported ReminderKit write and always requires `--private`.
+
+```bash
+remctl reminder-move 23880 --before 23881 --private
+remctl reminder-move 23880 --after 23881 --private
+remctl reminder-move 23880 --first --private
+remctl reminder-move 23880 --last --private --json
+
+remctl reminder-move 23880 --before 23881 --smart-list "Focus" --private
+remctl reminder-move 23880 --last --smart-list-id 170 --private --json
+```
+
+Without a smart-list target, the reminder and a `--before`/`--after` anchor must belong to the same ordinary list. With `--smart-list` or `--smart-list-id`, RemCTL reorders an unsectioned custom smart list and can position reminders whose base lists differ. Sectioned custom smart lists are refused before saving because their secondary-level `REMManualOrdering` shape has not been verified.
+
+Smart-list ordering requires an existing manual-order record, and relative anchors must already have persisted positions. RemCTL fails before writing when it cannot establish those boundaries. Successful commands re-read the local store and report `verified: true`; the helper writes through ReminderKit and never edits SQLite directly.
+
+For an ordinary list, `remctl show <list> --json` reads that same persisted identifier order, so the CLI output immediately reflects a verified `reminder-move`. Plain and table formats use the same ordered rows.
 
 ## Lists
 
@@ -381,7 +407,7 @@ remctl list-delete --list-id 144 --force
 
 `list-create --color NAME` uses EventKit and supports Reminders color names such as `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, and `cyan`.
 
-List symbols, emoji badges, Groceries mode, and pin state are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance and list-type editor; `list-pin` and `list-unpin` toggle the Reminders.app sidebar pin state for regular lists and smart lists. Use `--list-id` or `--smart-list-id` when duplicate or normalized names could match more than one target. With `--private`, `--color` also accepts `#RRGGBB`.
+List symbols, emoji badges, Groceries mode, and pin state are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance and list-type editor; `list-pin` and `list-unpin` toggle the Reminders.app sidebar pin state for regular lists and custom smart lists. Built-in smart-list pinning works only on macOS versions whose ReminderKit store exposes the generic smart-list fetch. Other versions return an unsupported-capability error before saving. Use `--list-id` or `--smart-list-id` when duplicate or normalized names could match more than one target. With `--private`, `--color` also accepts `#RRGGBB`.
 
 Groceries lists are detected from private list columns. Human `lists` and `show` output marks them with `🥕`, and `show` decorates known Groceries section headings with matching category emoji such as `🥛 Dairy, Eggs & Cheese`, `🥬 Produce`, and `🧻 Household Items`. `lists --json` includes `listType`, `isGroceries`, and `grocery` locale/categorization fields; `show --json` includes `sectionEmoji` when a reminder belongs to a known Groceries category. Use `list-create --private --groceries --grocery-locale en_US` for new Groceries lists, `list-edit --private --groceries` or `--standard` to convert existing lists, and `add/edit --private --grocery` to verify Reminders' automatic grocery sections, with an explicit ReminderKit categorizer fallback when needed.
 
@@ -426,7 +452,7 @@ remctl smart-list-edit "Priority or Today" --private --priority high --color red
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-`smart-lists` is a read-only inspector. It reports built-in and custom smart lists with numeric ID, object UUID, smart-list type, pin state, pin date, filter byte length, and a decoded summary when RemCTL recognizes the filter payload. Unrecognized or corrupt filter blobs surface as an `error` field in `--json` instead of failing the command. Smart-list pin verification should use `pinned`/`pinnedDate` from `smart-lists --json`; on macOS 26 smart-list pinning updates `ZPINNEDDATE` rather than the regular-list boolean.
+`smart-lists` is a read-only inspector. It reports built-in and custom smart lists with numeric ID, object UUID, smart-list type, pin state, pin date, filter byte length, and a decoded summary when RemCTL recognizes the filter payload. Unrecognized or corrupt filter blobs surface as an `error` field in `--json` instead of failing the command. Smart-list pin verification should use `pinned`/`pinnedDate` from `smart-lists --json`; on macOS 26 successful pinning can update `ZPINNEDDATE` rather than the regular-list boolean. Custom smart lists use the dedicated custom fetch. Built-in smart lists are rejected before a save when the host lacks `fetchSmartListWithObjectID:error:`.
 
 `smart-list-create` and `smart-list-edit` are private ReminderKit support and always require `--private`. They support private appearance flags (`--color`, `--symbol`, and `--emoji`) plus the filters that currently materialize in Reminders.app through this write path: `--any-tag`, selected tags via `--tags` with optional `--tag-match all|any`, date filters (`--date any|today`, today+past-due, on/before/after/range), time filters (`morning`, `afternoon`, `evening`, `night`), priority filters including comma-separated Priority: Any, `--flagged`, `--vehicle connected`, specific `--location-title`/coordinates, one `--include-list` or one `--include-list-id`, and top-level `--match all|any`. Known zero-filter writes are rejected before saving: legacy short selected-tag JSON, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list.
 
@@ -681,4 +707,4 @@ If an agent supplies an invalid due date, RemCTL creates nothing and exits with 
 
 For Groceries automation, detect eligible lists with `remctl lists --json` and `listType == "groceries"`. After `add --private --grocery`, verify with `remctl show <list> --json` and check that the reminder has a non-empty `section` once categorization completes.
 
-For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed.
+For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed. Custom smart-list pin coverage includes name and numeric-ID targeting, idempotent pinning, the current and protocol-1 payload shapes, `pinnedDate` transitions, filter/identity preservation, built-in isolation, and cleanup readback.

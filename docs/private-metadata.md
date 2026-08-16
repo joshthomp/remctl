@@ -2,7 +2,7 @@
 
 RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`. Location alarms remain behind the private command guardrail because agents should treat them as Reminders-only metadata, but RemCTL saves them with EventKit structured-location alarms because that path materializes reliably on current macOS.
 
-This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private section/list appearance, pinning, and group commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
+This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, `reminder-move`, private section/list appearance, pinning, and group commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
 
 RemCTL still does not write directly to SQLite.
 
@@ -23,6 +23,7 @@ Verified on macOS/iCloud sync:
 - section creation and assignment: `--private --new-section "Research"`
 - section management: `section-create "Research" -l Projects --private`, `section-rename "Research" --new-name "Archive" -l Projects --private`, and `section-delete "Archive" -l Projects --private --force`
 - shared-list assignment: `--private --assign Alex`, `--private --assign alex@example.com`, or `--private --assign me`
+- reminder ordering: `reminder-move 23880 --before 23881 --private`, or `reminder-move 23880 --before 23881 --smart-list "Focus" --private`
 - subtasks: `--private --subtask "Follow up"` or rich JSON objects with child metadata
 - image attachments: `--private --image ~/Desktop/mockup.png`
 - real flag state: `edit ID --private --flagged` or `add ... --private -f`
@@ -30,7 +31,7 @@ Verified on macOS/iCloud sync:
 - Early Reminders: `add "Leave early" -d "today 14:00" --private --early-reminder 15m`, `edit ID --private --early-reminder 1h`, or `edit ID --private --early-reminder clear`
 - location alarms: `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090` (guarded by `--private`, saved through `remctl-bridge`)
 - list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
-- list and smart-list pin state: `list-pin "Project X" --private`, `list-pin "Flagged" --private`, `list-unpin --smart-list-id 4 --private`
+- regular-list and custom-smart-list pin state: `list-pin "Project X" --private`, `list-pin "My Smart List" --private`, `list-unpin --smart-list-id 4 --private`; built-in smart-list pinning is host-capability-dependent
 - list groups: `group-create "Writing" --private --add-list Editorial`, `list-create "Ideas" --private --group Writing`, `group-edit "Writing" --private --add-list Ideas --remove-list Socials`, `group-edit "Writing" --private --move-list Ideas --last`, and `group-delete "Writing" --private --force`
 - custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
 - Reminders templates: `template-create "Packing Template" --from-list Packing --private`, `template-apply "Packing Template" --private`, and exact cleanup via `template-delete "Packing Template" --private --force`
@@ -155,7 +156,7 @@ Important limits:
 - `--emoji` writes a Reminders emoji badge for standard emoji such as `🥶` or `📌`.
 - `list-edit` resolves by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
 - `list-pin` and `list-unpin` can target regular lists or smart lists by name. If a name matches both, use `--list-id` or `--smart-list-id`.
-- Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. Smart-list rows can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL reports `pinned: true` when the smart-list pin date is positive.
+- Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. For a custom smart list, capture its `objectUUID` and filter, pin it, require `pinned: true` with a positive `pinnedDate`, then unpin it and require `pinned: false` with no positive pin date while identity and filter remain unchanged. Successful smart-list writes can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL therefore derives custom pin state from a positive pin date when needed. Built-in smart-list pinning fails before saving on hosts without the generic ReminderKit fetch.
 
 ## List Group Examples
 
@@ -199,7 +200,28 @@ Groceries writes use `REMListChangeItem.groceryContextChangeItem`: `list-create 
 
 `add --private --grocery` and `edit --private --grocery` verify automatic grocery sorting for the target reminder IDs. The target list must already be a detected Groceries list, and RemCTL fails before writing if it is not. RemCTL first polls the local section membership table because Reminders often sorts new items immediately; if the item is still unsectioned, RemCTL falls back to ReminderKit's explicit grocery categorizer. The JSON result includes `verifiedSections` and `source: "reminders_auto"` when the automatic sorter already handled it.
 
+The private grocery fallback supports both known selectors. Tahoe retains `categorizeGroceryItemsWithReminderIDs:` on the grocery-context change with UUID values. Golden Gate calls `autoCategorizeRemindersWithReminderIDs:` on the list change with `REMObjectID` values. A selector-name-only Golden Gate branch that reused Tahoe's receiver and UUID array returned a ReminderKit helper-communication error; the full Golden Gate branch persisted Produce section membership. A Tahoe experiment that substituted `REMObjectID` values returned success but tombstoned its disposable list, reminder, and section, so RemCTL deliberately keeps the existing Tahoe argument contract. RemCTL checks the live receivers before dispatch and catches Objective-C exceptions. The normal Reminders automatic-categorization wait remains first, so this private save runs only when the item is still unsectioned.
+
+## Reminder Ordering Examples
+
+```bash
+remctl reminder-move 23880 --before 23881 --private
+remctl reminder-move 23880 --first --private
+remctl reminder-move 23880 --after 23881 --smart-list "Focus" --private
+remctl reminder-move 23880 --last --smart-list-id 170 --private --json
+```
+
+Ordinary-list moves use ReminderKit's list ordering changes and require both relative reminders to share a base list. Unsectioned custom-smart-list moves update the existing `REMManualOrdering` object through `REMSmartListChangeItem`; they do not mutate the local SQLite row. Cross-list anchors are supported only when targeting a custom smart list.
+
+RemCTL intentionally refuses built-in smart lists, sectioned custom smart lists, missing manual-order records, and anchors without a persisted position. A custom smart list with no manual-order record must be manually reordered once in Reminders.app before RemCTL can preserve and update that ordering safely. Every successful command verifies the resulting identifier order from the local Reminders store before reporting success.
+
 ## Smart List Examples
+
+### Pinning compatibility
+
+RemCTL identifies the target as built-in or custom before it calls `remctl-private`. Custom smart lists always use `fetchCustomSmartListWithObjectID:error:`. Built-in smart lists use `fetchSmartListWithObjectID:error:` only when the host store exposes it. The tested Tahoe 26.2 and Golden Gate 27.0 builds both lack that generic selector, so built-in pin/unpin returns `Built-in smart-list pinning is unsupported on this macOS version` before RemCTL creates a save request. Other hosts that still expose the selector keep the existing behavior.
+
+This split matters because a built-in object ID is not a custom smart-list object ID. Passing it to the custom fetch returns ReminderKit error `-3000`; it is not a safe fallback. Read-only inspection through `smart-lists` is unaffected.
 
 ```bash
 remctl smart-lists

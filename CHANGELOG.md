@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.7.1 — 2026-08-13
+
+- `show` now follows Reminders' persisted manual display order instead of always falling back to reminder creation order. The fix applies to JSON, plain, and table output, including each child list shown through a list group. Rows that have not merged into the ordering record yet remain visible after the positioned rows in their previous stable order.
+- Expanded custom smart-list pin validation. The disposable private matrix now covers name and numeric-ID targeting, repeated idempotent pinning, current and protocol-1 payloads, positive/cleared `pinnedDate` readback, filter and identity preservation, built-in isolation, and cleanup.
+
+## 1.7.0 — 2026-08-13
+
+This release adds verified reminder ordering, makes every destructive command safe in non-interactive workflows, and hardens private ReminderKit behavior across Tahoe and Golden Gate.
+
+### Reminder ordering
+
+- Added `reminder-move --private` with `--before`, `--after`, `--first`, and `--last`. It changes display order without moving the reminder to another base list.
+- Ordinary-list ordering and unsectioned, manually ordered custom smart lists are supported. Sectioned custom smart lists are refused before saving because their secondary-level ordering contract has not been verified.
+- Every successful move re-reads the local Reminders store and returns `verified: true`. The helper protocol is now 2, so an older helper fails the existing preflight instead of receiving an unknown ordering payload.
+- The design was informed by PR #26 from @davidgliu and implemented independently after cross-version ABI inspection and disposable write/readback testing.
+
+### Agent-safe destructive commands
+
+- `delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, and `template-delete` now require `--force` whenever `--json` is present or stdin is not interactive.
+- Without `--force`, JSON workflows receive a structured `confirmation_required` error on stderr, stdout stays empty, and no write occurs. Human confirmation prompts are written to stderr and retain their existing behavior.
+- Fixes #27, reported by @tux234.
+
+### Private ReminderKit compatibility
+
+- Grocery fallback categorization preserves Tahoe's grocery-context/UUID contract and adds Golden Gate's list-change/`REMObjectID` contract. The unsafe Tahoe `REMObjectID` alternative is explicitly rejected by the implementation and audit.
+- Built-in smart-list pinning no longer sends built-in IDs through the custom-list fetch. It keeps the generic path on hosts that expose it and fails before saving on hosts that do not. Custom smart-list pinning is unchanged.
+- `remctl-private` now exposes a read-only `capabilities` action with watched selector availability, normalized encodings, the host OS, and `saveCalled: false`. The ordering selector set is included in protocol-2 capability reports.
+- Corrected the `REMColor.colorSpace` declaration to `NSUInteger`, removed dead helper code, and documented the Tahoe/Golden Gate audit and validation boundaries.
+
 ## 1.6.1 — 2026-07-30
 
 Two things: flagging is now honest end-to-end (it writes the real flag or fails — no more reporting success while writing nothing), and the recurrence grammar learned intervals and Nth-weekday rules.

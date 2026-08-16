@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.6.1
+"""remctl — Power-user Reminders CLI v1.7.1
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -64,9 +64,12 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.6.1"
-PRIVATE_PROTOCOL_VERSION = 1
+VERSION = "1.7.1"
+PRIVATE_PROTOCOL_VERSION = 2
 _private_protocol_probe = None
+
+MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
+CUSTOM_SMART_LIST_MANUAL_ORDER_TYPE = 2
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
@@ -149,6 +152,37 @@ def safe_display(value):
     if value is None:
         return ""
     return TERMINAL_CONTROL_RE.sub(" ", str(value))
+
+
+def confirm_destructive_action(a, prompt, *, identifier=None, cancel_message="Cancelled."):
+    """Confirm only in an interactive human session; keep JSON output deterministic."""
+    if getattr(a, "force", False):
+        return True
+    json_mode = bool(getattr(a, "json", False))
+    if json_mode or not sys.stdin.isatty():
+        message = "Refusing to continue without --force when --json is used or stdin is not interactive."
+        if json_mode:
+            payload = {
+                "status": "error",
+                "code": "confirmation_required",
+                "message": message,
+            }
+            if identifier is not None:
+                payload["id"] = identifier
+            print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(prompt, end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    if not answer:
+        print("Error: confirmation input ended before an answer was received.", file=sys.stderr)
+        raise SystemExit(1)
+    if answer.strip().lower() not in {"y", "yes"}:
+        print(cancel_message)
+        return False
+    return True
 
 # ── Splash Screen ────────────────────────────────────────────────────────────
 
@@ -1951,23 +1985,80 @@ def rem_cols(db):
     r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name,
     {_RECURRENCE_COLS}"""
 
-def q_reminders(db, list_pk=None, completed=False, parent_pk=None, top_level=False, limit=500):
+def sort_reminder_rows_by_identifier_order(rows, identifier_order):
+    """Return reminder rows in ReminderKit's persisted display order.
+
+    Rows that are absent from the ordering payload keep their query order and
+    follow the positioned rows. This preserves a useful fallback while a newly
+    created reminder is still merging into the list ordering record.
+    """
+    positions = {}
+    for index, identifier in enumerate(identifier_order or []):
+        if isinstance(identifier, str) and identifier:
+            positions.setdefault(identifier.casefold(), index)
+    if not positions:
+        return list(rows)
+
+    def key(indexed_row):
+        original_index, row = indexed_row
+        identifier = _row_get(row, "ZCKIDENTIFIER")
+        position = positions.get(identifier.casefold()) if isinstance(identifier, str) else None
+        if position is None:
+            return (1, original_index)
+        return (0, position, original_index)
+
+    return [row for _, row in sorted(enumerate(rows), key=key)]
+
+
+def q_reminders(
+    db,
+    list_pk=None,
+    completed=False,
+    parent_pk=None,
+    top_level=False,
+    limit=500,
+    manual_order=False,
+):
+    identifier_order = (
+        q_list_reminder_order(db, list_pk)
+        if manual_order and list_pk is not None
+        else []
+    )
     c, params = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL"], []
     if not completed: c.append("r.ZCOMPLETED = 0")
     if list_pk is not None: c.append("r.ZLIST = ?"); params.append(list_pk)
     if parent_pk is not None: c.append("r.ZPARENTREMINDER = ?"); params.append(parent_pk)
     elif top_level: c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
-    return db.execute(
+    query = (
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} AND l.Z_PK IS NOT NULL "
-        f"ORDER BY r.Z_PK LIMIT ?",
-        params + [limit]
-    ).fetchall()
+        f"ORDER BY r.Z_PK"
+    )
+    if not identifier_order:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    if identifier_order:
+        rows = sort_reminder_rows_by_identifier_order(rows, identifier_order)
+    return rows[:limit]
 
 
-def q_reminders_for_lists(db, list_pks, completed=False, top_level=False, limit=500):
+def q_reminders_for_lists(
+    db,
+    list_pks,
+    completed=False,
+    top_level=False,
+    limit=500,
+    manual_order=False,
+):
     if not list_pks:
         return []
+    identifier_orders = (
+        {list_pk: q_list_reminder_order(db, list_pk) for list_pk in list_pks}
+        if manual_order
+        else {}
+    )
+    has_identifier_order = any(identifier_orders.values())
     placeholders = ", ".join("?" for _ in list_pks)
     order_cases = " ".join(f"WHEN {int(pk)} THEN {idx}" for idx, pk in enumerate(list_pks))
     c = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL", f"r.ZLIST IN ({placeholders})"]
@@ -1975,12 +2066,29 @@ def q_reminders_for_lists(db, list_pks, completed=False, top_level=False, limit=
         c.append("r.ZCOMPLETED = 0")
     if top_level:
         c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
-    return db.execute(
+    query = (
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} "
-        f"ORDER BY CASE r.ZLIST {order_cases} ELSE {len(list_pks)} END, r.Z_PK LIMIT ?",
-        list(list_pks) + [limit],
-    ).fetchall()
+        f"ORDER BY CASE r.ZLIST {order_cases} ELSE {len(list_pks)} END, r.Z_PK"
+    )
+    params = list(list_pks)
+    if not has_identifier_order:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    if identifier_orders:
+        rows_by_list = {list_pk: [] for list_pk in list_pks}
+        for row in rows:
+            rows_by_list.setdefault(_row_get(row, "ZLIST"), []).append(row)
+        rows = [
+            row
+            for list_pk in list_pks
+            for row in sort_reminder_rows_by_identifier_order(
+                rows_by_list.get(list_pk, []),
+                identifier_orders.get(list_pk),
+            )
+        ]
+    return rows[:limit]
 
 
 def q_reminder(db, pk):
@@ -2079,8 +2187,21 @@ def q_section_memberships(db, list_pk):
     return {
         m["memberID"]: g2n[m["groupID"]]
         for m in data.get("memberships", [])
-        if m.get("groupID") in g2n and m.get("memberID")
+        if m.get("groupID") in g2n and m.get("memberID") and not m.get("isObsolete")
     }
+
+
+def q_smart_list_sections(db, smart_list_pk):
+    """Return sections owned by a custom smart list without changing ordinary-list queries."""
+    try:
+        return db.execute(
+            "SELECT Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER FROM ZREMCDBASESECTION "
+            "WHERE ZMARKEDFORDELETION = 0 AND ZSMARTLIST = ? ORDER BY Z_PK",
+            (smart_list_pk,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
 
 def q_section_member_counts(db, list_pk):
     row = db.execute(
@@ -2102,6 +2223,108 @@ def q_section_member_counts(db, list_pk):
         if group_id and member_id:
             counts[group_id] = counts.get(group_id, 0) + 1
     return counts
+
+
+def decode_manual_sort_hint_blob(blob):
+    if blob is None:
+        return None
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    if isinstance(blob, bytes):
+        if blob[:1] == b"\x01":
+            blob = blob[1:]
+        try:
+            blob = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(blob, str) and blob.startswith("\x01"):
+        blob = blob[1:]
+    if not isinstance(blob, str):
+        return None
+    try:
+        payload = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    top_level = payload.get("topLevelElementIDs", [])
+    secondary = payload.get("secondaryLevelElementIDsByTopLevelElementID", {})
+    if not isinstance(top_level, list) or not all(isinstance(item, str) and item for item in top_level):
+        return None
+    if not isinstance(secondary, dict):
+        return None
+    if any(
+        not isinstance(key, str)
+        or not isinstance(value, list)
+        or not all(isinstance(item, str) and item for item in value)
+        for key, value in secondary.items()
+    ):
+        return None
+    return {
+        "topLevelElementIDs": top_level,
+        "secondaryLevelElementIDsByTopLevelElementID": secondary,
+    }
+
+
+def q_manual_sort_hint(db, list_type, list_id):
+    try:
+        entity = db.execute(
+            "SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = ?",
+            (MANUAL_SORT_HINT_ENTITY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not entity:
+        return None
+    try:
+        row = db.execute(
+            "SELECT ZCKIDENTIFIER, ZLISTTYPERAWVALUE, ZLISTID, ZHINTDATA "
+            "FROM ZREMCDOBJECT WHERE Z_ENT = ? AND ZMARKEDFORDELETION = 0 "
+            "AND ZLISTTYPERAWVALUE = ? AND lower(ZLISTID) = lower(?) "
+            "ORDER BY Z_PK DESC LIMIT 1",
+            (entity["Z_ENT"], list_type, list_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or not row["ZCKIDENTIFIER"]:
+        return None
+    payload = decode_manual_sort_hint_blob(row["ZHINTDATA"])
+    if payload is None:
+        return None
+    return {
+        "objectUUID": row["ZCKIDENTIFIER"],
+        "listType": row["ZLISTTYPERAWVALUE"],
+        "listID": row["ZLISTID"],
+        **payload,
+    }
+
+
+def q_list_reminder_order(db, list_pk):
+    try:
+        row = db.execute(
+            "SELECT ZREMINDERIDSMERGEABLEORDERING_V2_JSON FROM ZREMCDBASELIST "
+            "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0",
+            (list_pk,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return []
+    if not row or row[0] is None:
+        return []
+    blob = row[0]
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    if isinstance(blob, bytes):
+        try:
+            blob = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
+    try:
+        ordering = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(ordering, list):
+        return []
+    return [item for item in ordering if isinstance(item, str) and item]
 
 
 def _sharee_display_name(row):
@@ -3902,7 +4125,9 @@ def require_private_metadata(a=None):
     probe = _probe_private_protocol_version()
     if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
         return
-    if probe.get("reason") == "outdated":
+    if probe.get("reason") == "outdated" or (
+        probe.get("ok") and probe.get("version", 0) < PRIVATE_PROTOCOL_VERSION
+    ):
         version = probe.get("version", 0)
         print(
             f"Error: remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.",
@@ -4843,13 +5068,18 @@ def apply_private_group_delete(db, group_ref, a):
     sys.exit(1)
 
 
-def apply_private_smart_list_pinned(db, smart_list_pk, a, pinned):
+def apply_private_smart_list_pinned(db, smart_list_ref, a, pinned):
     require_private_metadata(a)
-    ckid = q_smart_list_ckid(db, smart_list_pk)
+    ckid = smart_list_ref.get("objectUUID") or q_smart_list_ckid(db, smart_list_ref["id"])
     if not ckid:
         print("Error: target smart list has no stable CloudKit identifier.", file=sys.stderr)
         sys.exit(1)
-    result = private_call({"action": "set_smart_list_pinned", "smartListId": ckid, "pinned": bool(pinned)})
+    result = private_call({
+        "action": "set_smart_list_pinned",
+        "smartListId": ckid,
+        "isCustom": smart_list_ref.get("kind") == "custom",
+        "pinned": bool(pinned),
+    })
     if result and result.get("status") == "updated":
         return result
     message = result.get("message") if isinstance(result, dict) else "private helper failed"
@@ -6809,11 +7039,13 @@ def cmd_template_delete(a):
         name=getattr(a, "name", None),
         template_id=getattr(a, "template_id", None),
     )
-    if not a.force:
-        ans = input(f"Delete template '{safe_display(ref['name'])}'? [y/N] ")
-        if ans.strip().lower() not in ("y", "yes"):
-            print("Aborted.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete template '{safe_display(ref['name'])}'? [y/N] ",
+        identifier=ref.get("id"),
+        cancel_message="Aborted.",
+    ):
+        return
     result = private_call({
         "action": "delete_template",
         "templateId": ref["objectUUID"],
@@ -7138,11 +7370,13 @@ def cmd_smart_list_delete(a):
 
     row = matches[0]
     name = smart_list_display_name(row)
-    if not a.force:
-        ans = input(f"Delete custom smart list '{safe_display(name)}'? [y/N] ")
-        if ans.strip().lower() not in ("y", "yes"):
-            print("Aborted.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete custom smart list '{safe_display(name)}'? [y/N] ",
+        identifier=row["Z_PK"],
+        cancel_message="Aborted.",
+    ):
+        return
 
     result = private_call({
         "action": "delete_smart_list",
@@ -7686,13 +7920,13 @@ def cmd_group_delete(a):
         group_id=getattr(a, "group_id", None),
     )
     children = group_ref.get("children") or [list_ref_payload(row) for row in q_child_lists(db, group_ref["id"])]
-    if not a.force:
-        ans = input(
-            f"Delete group '{safe_display(group_ref['title'])}'? Child lists and reminders will be kept at top level. [y/N] "
-        )
-        if ans.strip().lower() not in ("y", "yes"):
-            print("Aborted.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete group '{safe_display(group_ref['title'])}'? Child lists and reminders will be kept at top level. [y/N] ",
+        identifier=group_ref.get("id"),
+        cancel_message="Aborted.",
+    ):
+        return
     detached = []
     for child in children:
         membership = apply_private_list_parent_group(
@@ -8071,7 +8305,13 @@ def cmd_show_group(a, db, group_ref):
         return
     child_ids = [child["Z_PK"] for child in children]
     child_by_id = {child["Z_PK"]: child for child in children}
-    items = q_reminders_for_lists(db, child_ids, completed=a.completed, top_level=True)
+    items = q_reminders_for_lists(
+        db,
+        child_ids,
+        completed=a.completed,
+        top_level=True,
+        manual_order=True,
+    )
     pks = [item["Z_PK"] for item in items]
     sc, ht = preload_extras(db, pks)
     att = preload_attachments(db, pks)
@@ -8156,7 +8396,13 @@ def cmd_show(a):
         return
     pk = list_ref["id"]
     list_name = list_ref["title"]
-    items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
+    items = q_reminders(
+        db,
+        list_pk=pk,
+        completed=a.completed,
+        top_level=True,
+        manual_order=True,
+    )
     pks = [i["Z_PK"] for i in items]
     sc, ht = preload_extras(db, pks)
     att = preload_attachments(db, pks)
@@ -8583,11 +8829,12 @@ def cmd_delete(a):
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
-    if not a.force:
-        ans = input(f"Delete '{safe_display(r['ZTITLE'])}' from {safe_display(r['list_name'])}? [y/N] ")
-        if not ans.lower().startswith("y"):
-            print("Cancelled.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete '{safe_display(r['ZTITLE'])}' from {safe_display(r['list_name'])}? [y/N] ",
+        identifier=a.id,
+    ):
+        return
 
     # Bridge-first for speed; AppleScript fallback.
     if bridge_available() and r["ZCKIDENTIFIER"]:
@@ -8938,6 +9185,216 @@ def cmd_edit(a):
         "edit it",
         "Identifier-based writes failed",
     )
+
+
+def reminder_move_relation(a):
+    choices = []
+    if getattr(a, "before", None) is not None:
+        choices.append(("before", a.before))
+    if getattr(a, "after", None) is not None:
+        choices.append(("after", a.after))
+    if getattr(a, "first", False):
+        choices.append(("first", None))
+    if getattr(a, "last", False):
+        choices.append(("last", None))
+    if len(choices) != 1:
+        print("Error: pass exactly one of --before, --after, --first, or --last.", file=sys.stderr)
+        sys.exit(1)
+    relation, anchor_id = choices[0]
+    if anchor_id == a.id:
+        print("Error: a reminder cannot be positioned relative to itself.", file=sys.stderr)
+        sys.exit(1)
+    return relation, anchor_id
+
+
+def reorder_identifier_list(ordering, moving_id, relation, anchor_id=None):
+    result = [item for item in ordering if item != moving_id]
+    if relation in {"before", "after"}:
+        if anchor_id not in result:
+            raise ValueError("anchor_missing")
+        index = result.index(anchor_id) + (1 if relation == "after" else 0)
+    else:
+        if relation == "first":
+            index = 0
+        elif relation == "last":
+            index = len(result)
+        else:
+            raise ValueError("invalid_relation")
+    result.insert(index, moving_id)
+    return result
+
+
+def _wait_for_order(read_order, expected, attempts=12, delay=0.25):
+    for _ in range(attempts):
+        if read_order() == expected:
+            return True
+        time.sleep(delay)
+    return False
+
+
+def _read_fresh_db_value(reader):
+    db = open_db()
+    try:
+        return reader(db)
+    finally:
+        db.close()
+
+
+def _smart_list_move_request(db, a, reminder, relation, anchor):
+    smart_ref = resolve_smart_list_or_die(db, name=a.smart_list, smart_list_id=a.smart_list_id)
+    if smart_ref["kind"] != "custom":
+        print("Error: reminder positioning currently supports custom smart lists only.", file=sys.stderr)
+        sys.exit(1)
+    smart_uuid = smart_ref.get("objectUUID")
+    hint = q_manual_sort_hint(db, CUSTOM_SMART_LIST_MANUAL_ORDER_TYPE, smart_uuid)
+    if hint is None:
+        print(
+            "Error: this smart list has no manual-order hint yet. Reorder one reminder in Reminders.app once, then retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sections = q_smart_list_sections(db, smart_ref["id"])
+    if sections or hint["secondaryLevelElementIDsByTopLevelElementID"]:
+        print(
+            "Error: reminder positioning in sectioned custom smart lists is not supported yet.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    moving_uuid = reminder["ZCKIDENTIFIER"]
+    if moving_uuid not in hint["topLevelElementIDs"]:
+        print(
+            f"Error: #{a.id} has no persisted position in smart list {smart_ref['title']!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    anchor_uuid = anchor["ZCKIDENTIFIER"] if anchor is not None else None
+    try:
+        ordered_ids = reorder_identifier_list(
+            hint["topLevelElementIDs"],
+            moving_uuid,
+            relation,
+            anchor_uuid,
+        )
+    except ValueError as exc:
+        if str(exc) == "anchor_missing":
+            print(
+                "Error: the anchor has no persisted manual position in this smart list. "
+                "Move the anchor once in Reminders.app or use --first/--last.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
+    return smart_ref, ordered_ids, {
+        "action": "set_smart_list_manual_order",
+        "id": moving_uuid,
+        "smartListId": smart_uuid,
+        "manualOrderingId": hint["objectUUID"],
+        "listType": hint["listType"],
+        "topLevelElementIds": ordered_ids,
+        "secondaryLevelElementIdsByTopLevelElementId": hint["secondaryLevelElementIDsByTopLevelElementID"],
+    }
+
+
+def cmd_reminder_move(a):
+    require_private_metadata(a)
+    relation, anchor_id = reminder_move_relation(a)
+    db = open_db()
+    reminder = q_reminder(db, a.id)
+    if not reminder or not reminder["ZCKIDENTIFIER"]:
+        print(f"Error: #{a.id} not found or has no stable identifier.", file=sys.stderr)
+        sys.exit(1)
+    anchor = q_reminder(db, anchor_id) if anchor_id is not None else None
+    if anchor_id is not None and (not anchor or not anchor["ZCKIDENTIFIER"]):
+        print(f"Error: anchor #{anchor_id} not found or has no stable identifier.", file=sys.stderr)
+        sys.exit(1)
+
+    smart_targeted = getattr(a, "smart_list", None) or getattr(a, "smart_list_id", None) is not None
+    smart_ref = None
+    expected_order = None
+    if smart_targeted:
+        smart_ref, expected_order, request = _smart_list_move_request(
+            db, a, reminder, relation, anchor
+        )
+    else:
+        if anchor is not None and anchor["ZLIST"] != reminder["ZLIST"]:
+            print("Error: reminders in different lists require --smart-list or --smart-list-id.", file=sys.stderr)
+            sys.exit(1)
+        list_uuid = q_list_ckid(db, reminder["ZLIST"])
+        if not list_uuid:
+            print("Error: target list has no stable identifier.", file=sys.stderr)
+            sys.exit(1)
+        current_order = q_list_reminder_order(db, reminder["ZLIST"])
+        if not current_order:
+            print("Error: this list has no readable ReminderKit ordering data.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            expected_order = reorder_identifier_list(
+                current_order,
+                reminder["ZCKIDENTIFIER"],
+                relation,
+                anchor["ZCKIDENTIFIER"] if anchor is not None else None,
+            )
+        except ValueError as exc:
+            if str(exc) == "anchor_missing":
+                print("Error: the anchor has no persisted position in this list.", file=sys.stderr)
+                sys.exit(1)
+            raise
+        request = {
+            "action": "move_reminder_in_list",
+            "id": reminder["ZCKIDENTIFIER"],
+            "listId": list_uuid,
+            "position": relation,
+        }
+        if anchor is not None:
+            request["anchorId"] = anchor["ZCKIDENTIFIER"]
+
+    if smart_ref is not None:
+        read_order = lambda: _read_fresh_db_value(
+            lambda current_db: (
+                q_manual_sort_hint(
+                    current_db, CUSTOM_SMART_LIST_MANUAL_ORDER_TYPE, smart_ref["objectUUID"]
+                ) or {}
+            ).get("topLevelElementIDs")
+        )
+    else:
+        read_order = lambda: _read_fresh_db_value(
+            lambda current_db: q_list_reminder_order(current_db, reminder["ZLIST"])
+        )
+
+    result = private_call(request)
+    helper_reported_error = not result or result.get("status") != "updated"
+    verified = _wait_for_order(read_order, expected_order)
+    if helper_reported_error and not verified:
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    if not verified:
+        print("Error: ReminderKit reported success, but the new reminder order could not be verified.", file=sys.stderr)
+        sys.exit(1)
+
+    payload = {
+        "status": "updated",
+        "id": a.id,
+        "title": reminder["ZTITLE"],
+        "position": relation,
+        "verified": True,
+    }
+    if helper_reported_error:
+        payload["verifiedAfterHelperError"] = True
+    if anchor is not None:
+        payload.update({"anchorId": anchor_id, "anchorTitle": anchor["ZTITLE"]})
+    if smart_ref is not None:
+        payload["smartList"] = smart_ref["title"]
+    else:
+        payload["list"] = reminder["list_name"]
+    if a.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        destination = f"smart list {smart_ref['title']!r}" if smart_ref else f"list {reminder['list_name']!r}"
+        anchor_text = f" #{anchor_id}" if anchor_id is not None else ""
+        print(f"Moved #{a.id} {relation}{anchor_text} in {destination}.")
 
 
 def cmd_search(a):
@@ -9647,7 +10104,7 @@ def _cmd_list_pin_state(a, pinned):
     if smart_list_id is not None:
         target_kind = "smart-list"
         target_ref = resolve_smart_list_or_die(db, smart_list_id=smart_list_id)
-        result = apply_private_smart_list_pinned(db, target_ref["id"], a, pinned)
+        result = apply_private_smart_list_pinned(db, target_ref, a, pinned)
     elif getattr(a, "list_id", None) is not None:
         target_kind = "list"
         target_ref = resolve_list_or_die(db, list_id=a.list_id)
@@ -9676,7 +10133,7 @@ def _cmd_list_pin_state(a, pinned):
         elif smart_ok:
             target_kind = "smart-list"
             target_ref = smart_ref
-            result = apply_private_smart_list_pinned(db, target_ref["id"], a, pinned)
+            result = apply_private_smart_list_pinned(db, target_ref, a, pinned)
         else:
             print(f"Error: list or smart list not found: {name}", file=sys.stderr)
             sys.exit(1)
@@ -9747,11 +10204,12 @@ def cmd_list_delete(a):
         print("Error: remctl-bridge required for list management", file=sys.stderr)
         sys.exit(1)
     target_name = list_ref["title"]
-    if not a.force:
-        ans = input(f"Delete list '{safe_display(target_name)}'? This cannot be undone. [y/N] ")
-        if not ans.lower().startswith("y"):
-            print("Cancelled.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete list '{safe_display(target_name)}'? This cannot be undone. [y/N] ",
+        identifier=list_ref.get("id"),
+    ):
+        return
     data = {"action": "delete_list", "title": target_name}
     data.update(bridge_list_target_payload(list_ref))
     result = bridge_call(data) if bridge_available() else None
@@ -9875,14 +10333,13 @@ def cmd_section_delete(a):
         print("Error: pass the section to delete by name or --section-id.", file=sys.stderr)
         sys.exit(1)
     label = getattr(a, "name", None) or section_ckid
-    if not a.force:
-        ans = input(
-            f"Delete section '{safe_display(label)}' in '{safe_display(list_ref['title'])}'? "
-            "Its reminders move to the list's default area. [y/N] "
-        )
-        if not ans.strip().lower().startswith("y"):
-            print("Cancelled.")
-            return
+    if not confirm_destructive_action(
+        a,
+        f"Delete section '{safe_display(label)}' in '{safe_display(list_ref['title'])}'? "
+        "Its reminders move to the list's default area. [y/N] ",
+        identifier=section_ckid,
+    ):
+        return
     result = _section_private_call_or_die(
         {"action": "delete_section", "sectionId": section_ckid},
         "deleted",
@@ -10031,6 +10488,7 @@ _remctl() {
         'done:Complete a reminder'
         'undone:Uncomplete a reminder'
         'edit:Edit a reminder'
+        'reminder-move:Reorder a reminder in a list or custom smart list'
         'delete:Delete a reminder'
         'search:Search reminders'
         'today:Due today + overdue'
@@ -10265,6 +10723,19 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        reminder-move)
+            _arguments \
+                '1:reminder id:' \
+                '(--after --first --last)--before[Place before reminder ID]:id:' \
+                '(--before --first --last)--after[Place after reminder ID]:id:' \
+                '(--before --after --last)--first[Place first in the current ordering]' \
+                '(--before --after --first)--last[Place last in the current ordering]' \
+                '(--smart-list-id)--smart-list[Target custom smart list]:smart-list:' \
+                '(--smart-list)--smart-list-id[Target custom smart list by numeric ID]:id:' \
+                '--private[Use private ReminderKit ordering]' \
+                '--json[JSON output]'
+            return
+            ;;
         doctor)
             _arguments \
                 '--for-agent[Print agent-focused context and TCC guidance]' \
@@ -10484,7 +10955,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -10495,6 +10966,9 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ "$cmd" = "edit" ]; then
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "reminder-move" ]; then
+        COMPREPLY=( $(compgen -W "--before --after --first --last --smart-list --smart-list-id --private --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -10607,6 +11081,7 @@ complete -c remctl -n "__fish_use_subcommand" -a add -d "Add a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a undone -d "Uncomplete a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a edit -d "Edit a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a reminder-move -d "Reorder a reminder in a list or custom smart list"
 complete -c remctl -n "__fish_use_subcommand" -a delete -d "Delete a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a search -d "Search reminders"
 complete -c remctl -n "__fish_use_subcommand" -a today -d "Due today + overdue"
@@ -10661,6 +11136,14 @@ complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -s v -
 complete -c remctl -n "__fish_seen_subcommand_from today" -l no-overdue -d "Exclude overdue reminders"
 complete -c remctl -n "__fish_seen_subcommand_from done" -l date -d "Set completion date" -r
 complete -c remctl -n "__fish_seen_subcommand_from done" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l before -d "Place before reminder ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l after -d "Place after reminder ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l first -d "Place first in the current ordering"
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l last -d "Place last in the current ordering"
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l smart-list -d "Target custom smart list" -r
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l smart-list-id -d "Target custom smart list by numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l private -d "Use private ReminderKit ordering"
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from link" -s l -l list -d "Get links for active reminders in list" -r
 complete -c remctl -n "__fish_seen_subcommand_from link" -l list-id -d "Get links for active reminders in list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from link" -l completed -d "Include completed reminders"
@@ -11788,7 +12271,7 @@ def build_parser():
     c.add_argument("name", nargs="?", help="Group name")
     c.add_argument("--group-id", type=int, help="Delete by numeric group ID from groups")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit group deletion")
-    c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation")
     js(c)
 
     c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c)
@@ -11812,7 +12295,14 @@ def build_parser():
     c.add_argument("--template-id", type=int, help="Read by numeric template ID from templates")
     js(c)
 
-    c = sub.add_parser("show", help="Show reminders in a list (grouped by section)")
+    c = sub.add_parser(
+        "show",
+        help="Show reminders in a list in Reminders display order",
+        description=(
+            "Show reminders in a list, grouped by section. Direct database reads follow "
+            "Reminders' stored manual display order when it is available."
+        ),
+    )
     c.add_argument("list", nargs="?", help="List name")
     c.add_argument("--list-id", type=int, help="Show a list by stable numeric ID")
     c.add_argument("--completed", action="store_true", help="Include completed")
@@ -11965,8 +12455,36 @@ def build_parser():
     c.add_argument("--address", help=argparse.SUPPRESS)
     js(c)
 
+    c = sub.add_parser(
+        "reminder-move",
+        help="Reorder a reminder in a list or custom smart list",
+        description=(
+            "Reorder a reminder through unsupported private ReminderKit APIs. "
+            "Without --smart-list, both reminders must share a base list. "
+            "Use --smart-list for cross-list ordering in an unsectioned custom smart list."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl reminder-move 23880 --before 23881 --private\n"
+            "  remctl reminder-move 23880 --after 23881 --smart-list 'Focus' --private\n"
+            "  remctl reminder-move 23880 --first --smart-list 'Focus' --private --json"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("id", type=int, help="Reminder numeric ID")
+    position = c.add_mutually_exclusive_group(required=True)
+    position.add_argument("--before", type=int, metavar="ID", help="Place immediately before reminder ID")
+    position.add_argument("--after", type=int, metavar="ID", help="Place immediately after reminder ID")
+    position.add_argument("--first", action="store_true", help="Place first in the current ordering")
+    position.add_argument("--last", action="store_true", help="Place last in the current ordering")
+    smart_target = c.add_mutually_exclusive_group()
+    smart_target.add_argument("--smart-list", help="Custom smart list containing the reminder")
+    smart_target.add_argument("--smart-list-id", type=int, help="Custom smart list numeric ID")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit ordering")
+    js(c)
+
     c = sub.add_parser("delete", help="Delete a reminder")
-    c.add_argument("id", type=int); c.add_argument("--force", action="store_true"); js(c)
+    c.add_argument("id", type=int); c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation"); js(c)
 
     c = sub.add_parser("search", help="Search reminders")
     c.add_argument("query"); c.add_argument("--completed", action="store_true"); vb(c); js(c)
@@ -12115,7 +12633,7 @@ def build_parser():
     c.add_argument("name", nargs="?", help="Custom smart list name")
     c.add_argument("--smart-list-id", type=int, help="Delete by numeric smart-list ID from smart-lists")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit smart-list deletion")
-    c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation")
     js(c)
 
     c = sub.add_parser(
@@ -12175,7 +12693,7 @@ def build_parser():
     c.add_argument("name", nargs="?", help="Template name")
     c.add_argument("--template-id", type=int, help="Delete by numeric template ID from templates")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit template deletion")
-    c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation")
     js(c)
 
     c = sub.add_parser("list-edit", help="Edit private list appearance by name or ID")
@@ -12191,14 +12709,30 @@ def build_parser():
     c.add_argument("--private", action="store_true", help="Required for list appearance and grocery metadata writes")
     js(c)
 
-    c = sub.add_parser("list-pin", help="Pin a list or smart list in Reminders.app")
+    c = sub.add_parser(
+        "list-pin",
+        help="Pin a list or supported smart list in Reminders.app",
+        description=(
+            "Pin a regular list or custom smart list through private ReminderKit. "
+            "Verify custom smart-list state with smart-lists --json and pinnedDate. "
+            "Built-in smart lists are rejected on hosts without the generic fetch capability."
+        ),
+    )
     c.add_argument("name", nargs="?", help="List or smart-list name to pin")
     c.add_argument("--list-id", type=int, help="Pin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Pin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
     js(c)
 
-    c = sub.add_parser("list-unpin", help="Unpin a list or smart list in Reminders.app")
+    c = sub.add_parser(
+        "list-unpin",
+        help="Unpin a list or supported smart list in Reminders.app",
+        description=(
+            "Unpin a regular list or custom smart list through private ReminderKit. "
+            "Verify custom smart-list state with smart-lists --json and pinnedDate. "
+            "Built-in smart lists are rejected on hosts without the generic fetch capability."
+        ),
+    )
     c.add_argument("name", nargs="?", help="List or smart-list name to unpin")
     c.add_argument("--list-id", type=int, help="Unpin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Unpin a smart list by stable numeric ID")
@@ -12215,7 +12749,7 @@ def build_parser():
     c = sub.add_parser("list-delete", help="Delete a list (bridge only)")
     c.add_argument("name", nargs="?", help="List name to delete")
     c.add_argument("--list-id", type=int, help="Delete a list by stable numeric ID")
-    c.add_argument("--force", action="store_true"); js(c)
+    c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation"); js(c)
 
     c = sub.add_parser(
         "section-create",
@@ -12252,7 +12786,7 @@ def build_parser():
     c.add_argument("-l", "--list", help="The section's list name")
     c.add_argument("--list-id", type=int, help="The section's list by stable numeric ID")
     c.add_argument("--section-id", help="Target the section by stable ID when names collide")
-    c.add_argument("--force", action="store_true", help="Skip the confirmation prompt")
+    c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit section deletion")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     js(c)
@@ -12445,6 +12979,7 @@ def main():
         "done": cmd_done,
         "undone": cmd_undone,
         "edit": cmd_edit,
+        "reminder-move": cmd_reminder_move,
         "delete": cmd_delete,
         "search": cmd_search,
         "today": cmd_today,

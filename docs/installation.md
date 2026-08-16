@@ -17,6 +17,8 @@ xcode-select --install
 
 ## Install
 
+Apple's Command Line Tools are sufficient to build RemCTL's Swift and Objective-C helpers. Homebrew and the full Xcode app are not required. The private-API compatibility audit additionally uses MachOSwiftSection's `swift-section`; it is an audit dependency, not a runtime dependency of `remctl`.
+
 Default install to `~/bin`:
 
 ```bash

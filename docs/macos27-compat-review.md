@@ -8,6 +8,14 @@ Host:
 - Darwin 27.0.0
 - RemCTL branch: `codex/macos27-compat-review`
 
+## 2026-08-13 Follow-up
+
+Golden Gate build `26A5406e` changed the private grocery fallback receiver, selector, and argument contract. The old `categorizeGroceryItemsWithReminderIDs:` selector is absent. The validated replacement calls `autoCategorizeRemindersWithReminderIDs:` on `REMListChangeItem` with `REMObjectID` values. An initial selector-name-only substitution that reused Tahoe's grocery-context receiver and UUID array failed with a ReminderKit helper-communication error. The cross-version helper now dispatches the tested receiver and argument type at runtime without changing Tahoe's shipped path.
+
+The same build also lacks `REMStore.fetchSmartListWithObjectID:error:`. Custom smart lists still use `fetchCustomSmartListWithObjectID:error:` and pass pin/unpin validation. Built-in smart-list pinning now returns a precise unsupported-capability error before creating a save request instead of sending a built-in ID through the custom fetch.
+
+Verification on `26A5406e` passed all 368 unit tests, strict Objective-C compilation with `-Wall -Wextra -Werror`, the read-only capability probe with `saveCalled: false`, and the full disposable private matrix. The matrix directly exercised the renamed grocery selector, custom-smart-list pin/unpin, the built-in no-save gate, rich private reminder metadata, templates, and cleanup. See [private-api-audit-2026-08-12.md](private-api-audit-2026-08-12.md#cross-version-follow-up) for the Golden Gate/Tahoe comparison.
+
 ## Public Release Notes
 
 Apple's macOS 27 beta release notes were checked on 2026-06-12. The page mentions SDK, security, plugin, Charts, and SwiftUI `@State` changes, but no Reminders, EventKit, or ReminderKit-specific compatibility changes surfaced in the scraped release notes.

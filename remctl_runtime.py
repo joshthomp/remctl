@@ -15,12 +15,117 @@ DEFAULT_STORE_SUBPATH = Path(
 )
 TRUTHY = {"1", "true", "yes", "on"}
 
+CAPABILITY_HOST_MODE_ENV = "REMCTL_CAPABILITY_HOST"
+CAPABILITY_HOST_ACTIVE_ENV = "REMCTL_CAPABILITY_HOST_ACTIVE"
+CAPABILITY_HOST_MODES = frozenset({"auto", "force", "direct"})
+LOCAL_COMMANDS = frozenset(
+    {
+        "completion",
+        "doctor",
+        "list-symbols",
+        "onboard",
+        "permissions",
+        "setup",
+    }
+)
+HOSTED_COMMANDS = frozenset(
+    {
+        "add",
+        "delete",
+        "done",
+        "edit",
+        "export",
+        "flag",
+        "flagged",
+        "group-create",
+        "group-delete",
+        "group-edit",
+        "group-info",
+        "groups",
+        "import",
+        "info",
+        "link",
+        "list-create",
+        "list-delete",
+        "list-edit",
+        "list-pin",
+        "list-rename",
+        "list-unpin",
+        "lists",
+        "open",
+        "overdue",
+        "reminder-move",
+        "search",
+        "section-create",
+        "section-delete",
+        "section-rename",
+        "sections",
+        "sharees",
+        "show",
+        "smart-list-create",
+        "smart-list-delete",
+        "smart-list-edit",
+        "smart-lists",
+        "stats",
+        "subtasks",
+        "tags",
+        "template-apply",
+        "template-create",
+        "template-delete",
+        "template-info",
+        "templates",
+        "today",
+        "undone",
+        "unflag",
+        "upcoming",
+        "urgent",
+    }
+)
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() in TRUTHY
+
+
+def capability_host_mode(environ: dict[str, str] | None = None) -> str:
+    """Return the requested execution mode after applying direct-only guards.
+
+    The host's internal child process always uses direct execution. A custom
+    Reminders store uses direct execution unless force mode requests the host,
+    which is an explicit configuration conflict.
+    """
+
+    environment = os.environ if environ is None else environ
+    if environment.get(CAPABILITY_HOST_ACTIVE_ENV) == "1":
+        return "direct"
+    raw_mode = environment.get(CAPABILITY_HOST_MODE_ENV, "auto").strip().lower()
+    mode = raw_mode or "auto"
+    if mode not in CAPABILITY_HOST_MODES:
+        choices = ", ".join(sorted(CAPABILITY_HOST_MODES))
+        raise ValueError(
+            f"invalid {CAPABILITY_HOST_MODE_ENV} value {raw_mode!r}; expected {choices}"
+        )
+    if environment.get("REMCTL_STORE_DIR"):
+        if mode == "force":
+            raise ValueError(
+                "REMCTL_CAPABILITY_HOST=force conflicts with REMCTL_STORE_DIR; "
+                "custom stores can run only in auto or direct mode"
+            )
+        return "direct"
+    return mode
+
+
+def capability_host_command_scope(command: str | None) -> str:
+    """Classify one parsed command as local-only or permission-bearing."""
+
+    if command is None or command in HOSTED_COMMANDS:
+        return "hosted"
+    if command in LOCAL_COMMANDS:
+        return "local"
+    raise ValueError(f"unclassified RemCTL command: {command!r}")
 
 
 def resolve_store_dir() -> Path:

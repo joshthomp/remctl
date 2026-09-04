@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>RemCTL Capability Host</string>
+    <key>CFBundleExecutable</key>
+    <string>RemCTL Capability Host</string>
+    <key>CFBundleIdentifier</key>
+    <string>net.macstories.remctl.capability-host</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>RemCTL Capability Host</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+	<string>1.8.0</string>
+    <key>CFBundleVersion</key>
+	<string>2</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>RemCTL automates Apple Reminders when you run commands that require Reminders.app.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>RemCTL reads and updates your reminders when you ask it to.</string>
+</dict>
+</plist>

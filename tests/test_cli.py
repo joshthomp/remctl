@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import os
+import plistlib
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -19,23 +21,62 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import remctl_runtime
 from helpers import load_module
 
 
 class CliTests(unittest.TestCase):
+    _absent_host_status = {
+        "status": "error",
+        "installed": False,
+        "available": False,
+        "ready": False,
+        "fullReady": False,
+        "protocolVersion": None,
+        "expectedProtocolVersion": 2,
+        "scope": "complete-protected-cli",
+        "socket": {"path": "/tmp/remctl-test.sock", "exists": False, "secure": False},
+        "launchAgent": {"path": "/tmp/remctl-test.plist", "installed": False, "loaded": False},
+        "app": {"path": "/tmp/RemCTL Capability Host.app", "installed": False},
+        "permissions": None,
+        "commandScope": None,
+        "error": {"code": "host_unavailable", "message": "not installed"},
+    }
+
     @classmethod
     def setUpClass(cls):
         cls.remctl = load_module("remctl_cli_test", "remctl")
+        cls._real_should_route = cls.remctl.remctl_broker.should_route
         cls._default_protocol_probe = mock.patch.object(
             cls.remctl,
             "_probe_private_protocol_version",
             return_value={"ok": True, "version": 2},
         )
         cls._default_protocol_probe.start()
+        cls._default_host_route = mock.patch.object(
+            cls.remctl.remctl_broker,
+            "should_route",
+            return_value=False,
+        )
+        cls._default_host_status = mock.patch.object(
+            cls.remctl.remctl_broker,
+            "status",
+            return_value=cls._absent_host_status,
+        )
+        cls._default_host_route.start()
+        cls._default_host_status.start()
 
     @classmethod
     def tearDownClass(cls):
+        cls._default_host_status.stop()
+        cls._default_host_route.stop()
         cls._default_protocol_probe.stop()
+
+    def setUp(self):
+        self._color_enabled_before_test = self.remctl.C.enabled
+
+    def tearDown(self):
+        self.remctl.C.enabled = self._color_enabled_before_test
 
     @staticmethod
     def _bridge_result(payload, returncode=0):
@@ -45,6 +86,34 @@ class CliTests(unittest.TestCase):
             "stderr": "",
             "payload": payload,
         }
+
+    def _valid_capability_host_status(self, app_path):
+        return {
+            **self._absent_host_status,
+            "installed": True,
+            "app": {
+                "path": str(app_path),
+                "installed": True,
+                "bundleIdentifier": self.remctl.remctl_broker.BUNDLE_IDENTIFIER,
+                "signature": {
+                    "valid": True,
+                    "identifier": self.remctl.remctl_broker.BUNDLE_IDENTIFIER,
+                    "teamID": "TEAM123",
+                    "cdhash": "0123456789abcdef0123456789abcdef01234567",
+                    "designatedRequirement": (
+                        "identifier net.macstories.remctl.capability-host and anchor apple generic"
+                    ),
+                    "error": None,
+                },
+            },
+        }
+
+    @staticmethod
+    def _write_capability_host_marker(root, app_path):
+        marker = Path(root) / ".remctl-capability-host-app"
+        marker.write_text(f"{app_path}\n")
+        marker.chmod(0o600)
+        return marker
 
     def test_parse_alarm_normalizes_relative_and_absolute_values(self):
         self.assertEqual(self.remctl.parse_alarm("15m"), "-15m")
@@ -594,6 +663,76 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "reminders_store_access_error", return_value=None),
             ):
                 self.assertEqual(self.remctl.find_main_db_path(), second)
+
+    def test_store_access_error_names_host_only_inside_sealed_child(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Path(tmpdir)
+            with (
+                mock.patch.object(self.remctl, "STORE_DIR", store),
+                mock.patch.object(self.remctl.os, "access", return_value=False),
+                mock.patch.dict(
+                    "os.environ",
+                    {"REMCTL_CAPABILITY_HOST_ACTIVE": "1"},
+                    clear=False,
+                ),
+            ):
+                hosted = self.remctl.reminders_store_access_error()
+
+            with (
+                mock.patch.object(self.remctl, "STORE_DIR", store),
+                mock.patch.object(self.remctl.os, "access", return_value=False),
+                mock.patch.dict(
+                    "os.environ",
+                    {
+                        "REMCTL_CAPABILITY_HOST": "direct",
+                        "REMCTL_CAPABILITY_HOST_ACTIVE": "",
+                    },
+                    clear=False,
+                ),
+            ):
+                direct = self.remctl.reminders_store_access_error()
+
+        self.assertIn("signed RemCTL Capability Host", hosted)
+        self.assertIn("Grant Full Disk Access only", hosted)
+        self.assertNotIn("app or interpreter", hosted)
+        self.assertIn("Direct access", direct)
+        self.assertIn("blocked for this caller", direct)
+        self.assertIn("Normal automatic mode uses the signed RemCTL Capability Host", direct)
+        self.assertIn("remctl onboard", direct)
+        self.assertIn("remctl doctor --for-agent", direct)
+        for forbidden in ("Grant Full Disk Access", "Hermes", "Python", "Terminal"):
+            self.assertNotIn(forbidden, direct)
+
+    def test_eventkit_access_guidance_names_host_only_inside_sealed_child(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"REMCTL_CAPABILITY_HOST_ACTIVE": "1"},
+            clear=False,
+        ):
+            hosted = self.remctl.eventkit_access_fix_text()
+
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"REMCTL_CAPABILITY_HOST_ACTIVE": ""},
+                clear=False,
+            ),
+            mock.patch.object(
+                self.remctl,
+                "doctor_execution_context",
+                return_value={
+                    "effective_context": "Terminal",
+                    "host_app": "Terminal.app",
+                },
+            ),
+        ):
+            direct = self.remctl.eventkit_access_fix_text()
+
+        self.assertIn("signed RemCTL Capability Host", hosted)
+        self.assertIn("request Reminders access for that host", hosted)
+        self.assertNotIn("same context", hosted)
+        self.assertIn("caller-scoped and self-managed", direct)
+        self.assertNotIn("same context", direct)
 
     def test_open_db_rejects_unexpected_schema(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1679,6 +1818,500 @@ class CliTests(unittest.TestCase):
         self.assertIn("remctl list-symbols --preview", output)
         self.assertIn("approx", output)
         self.assertIn("education3", output)
+
+    def test_capability_host_command_partition_covers_real_parser(self):
+        _parser, subparsers = self.remctl.build_parser()
+        parser_commands = set(subparsers.choices)
+        self.assertFalse(remctl_runtime.LOCAL_COMMANDS & remctl_runtime.HOSTED_COMMANDS)
+        self.assertEqual(
+            parser_commands,
+            remctl_runtime.LOCAL_COMMANDS | remctl_runtime.HOSTED_COMMANDS,
+        )
+        self.assertEqual(len(parser_commands), 55)
+
+    def test_internal_host_tty_state_requires_active_marker(self):
+        non_tty = SimpleNamespace(isatty=lambda: False)
+        with (
+            mock.patch.object(self.remctl.sys, "stdout", non_tty),
+            mock.patch.dict(
+                "os.environ",
+                {"REMCTL_CAPABILITY_STDOUT_TTY": "1"},
+                clear=False,
+            ),
+        ):
+            self.assertFalse(self.remctl.stdout_is_interactive())
+
+        with (
+            mock.patch.object(self.remctl.sys, "stdout", non_tty),
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "REMCTL_CAPABILITY_HOST_ACTIVE": "1",
+                    "REMCTL_CAPABILITY_STDOUT_TTY": "1",
+                },
+                clear=False,
+            ),
+        ):
+            self.assertTrue(self.remctl.stdout_is_interactive())
+
+    def test_internal_host_columns_require_active_marker_and_bounds(self):
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"REMCTL_CAPABILITY_COLUMNS": "144"},
+                clear=False,
+            ),
+            mock.patch.object(self.remctl.os, "get_terminal_size", side_effect=OSError),
+        ):
+            self.assertEqual(self.remctl.terminal_columns(80), 80)
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "REMCTL_CAPABILITY_HOST_ACTIVE": "1",
+                "REMCTL_CAPABILITY_COLUMNS": "144",
+            },
+            clear=False,
+        ):
+            self.assertEqual(self.remctl.terminal_columns(80), 144)
+
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "REMCTL_CAPABILITY_HOST_ACTIVE": "1",
+                    "REMCTL_CAPABILITY_COLUMNS": "1001",
+                },
+                clear=False,
+            ),
+            mock.patch.object(self.remctl.os, "get_terminal_size", side_effect=OSError),
+        ):
+            self.assertEqual(self.remctl.terminal_columns(80), 80)
+
+    def test_main_routes_once_then_onboards_flushes_and_dispatches_once(self):
+        events = []
+        stdout = SimpleNamespace(
+            isatty=lambda: True,
+            flush=lambda: events.append("stdout_flush"),
+        )
+        stderr = SimpleNamespace(flush=lambda: events.append("stderr_flush"))
+
+        def route(_args):
+            events.append("route")
+            return True
+
+        def onboard(_args):
+            events.append("onboard")
+            return {"ok": True}
+
+        def hosted_dispatch(*_args, **_kwargs):
+            events.append("dispatch")
+            return 0
+
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists"]),
+            mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False),
+            mock.patch.object(self.remctl.sys, "stdout", stdout),
+            mock.patch.object(self.remctl.sys, "stderr", stderr),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", side_effect=route) as should_route,
+            mock.patch.object(self.remctl.remctl_broker, "dispatch", side_effect=hosted_dispatch) as dispatch,
+            mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding", side_effect=onboard) as onboarding,
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(events, ["route", "onboard", "stdout_flush", "stderr_flush", "dispatch"])
+        should_route.assert_called_once()
+        onboarding.assert_called_once()
+        local_handler.assert_not_called()
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0], ["lists"])
+        self.assertEqual(dispatch.call_args.kwargs["parsed_args"].cmd, "lists")
+
+    def test_main_onboards_before_one_direct_handler_without_host_dispatch(self):
+        events = []
+        stdout = SimpleNamespace(
+            isatty=lambda: True,
+            flush=lambda: events.append("stdout_flush"),
+        )
+        stderr = SimpleNamespace(flush=lambda: events.append("stderr_flush"))
+
+        def route(_args):
+            events.append("route")
+            return False
+
+        def onboard(_args):
+            events.append("onboard")
+            return {"ok": False}
+
+        def direct_handler(_args, handler):
+            events.append("handler")
+            self.assertIs(handler, self.remctl.cmd_lists)
+
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists"]),
+            mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False),
+            mock.patch.object(self.remctl.sys, "stdout", stdout),
+            mock.patch.object(self.remctl.sys, "stderr", stderr),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", side_effect=route) as should_route,
+            mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+            mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding", side_effect=onboard) as onboarding,
+            mock.patch.object(self.remctl, "run_handler_with_fallback", side_effect=direct_handler) as local_handler,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(events, ["route", "onboard", "stdout_flush", "stderr_flush", "handler"])
+        should_route.assert_called_once()
+        onboarding.assert_called_once()
+        dispatch.assert_not_called()
+        local_handler.assert_called_once()
+
+    def test_main_makes_sanitized_host_presentation_defaults_explicit(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "show", "Work"]),
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "NO_COLOR": "1",
+                    "REMCTL_IMAGES": "1",
+                    "REMCTL_IMAGE_MODE": "kitty",
+                    "REMCTL_IMAGE_WIDTH": "72",
+                },
+                clear=False,
+            ),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch", return_value=0) as dispatch,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(
+            dispatch.call_args.args[0],
+            [
+                "--no-color",
+                "--images",
+                "--image-mode",
+                "kitty",
+                "--image-width",
+                "72",
+                "show",
+                "Work",
+            ],
+        )
+
+    def test_host_normalization_ignores_literal_no_color_after_terminator(self):
+        args = SimpleNamespace(
+            no_color=True,
+            images=False,
+            image_mode=None,
+            image_width=None,
+        )
+        self.assertEqual(
+            self.remctl._normalized_host_argv(
+                ["show", "--", "--no-color"],
+                args,
+            ),
+            ["--no-color", "show", "--", "--no-color"],
+        )
+
+    def test_host_normalization_ignores_literal_image_options_after_terminator(self):
+        args = SimpleNamespace(
+            no_color=False,
+            images=True,
+            image_mode="kitty",
+            image_width=72,
+        )
+        with mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False):
+            normalized = self.remctl._normalized_host_argv(
+                ["show", "--", "--images", "--image-mode=ascii", "--image-width"],
+                args,
+            )
+        self.assertEqual(
+            normalized,
+            [
+                "--images",
+                "--image-mode",
+                "kitty",
+                "--image-width",
+                "72",
+                "show",
+                "--",
+                "--images",
+                "--image-mode=ascii",
+                "--image-width",
+            ],
+        )
+
+    def test_main_keeps_local_command_out_of_capability_host(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "list-symbols", "--json"]),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=False) as should_route,
+            mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+            mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding") as onboard,
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+        ):
+            self.remctl.main()
+
+        should_route.assert_called_once()
+        self.assertEqual(should_route.call_args.args[0].cmd, "list-symbols")
+        dispatch.assert_not_called()
+        onboard.assert_called_once()
+        local_handler.assert_called_once()
+        self.assertIs(local_handler.call_args.args[1], self.remctl.cmd_list_symbols)
+
+    def test_no_command_keeps_splash_local_and_hosts_normalized_today(self):
+        color_enabled = self.remctl.C.enabled
+        try:
+            with (
+                mock.patch.object(sys, "argv", ["remctl", "--image-width", "64"]),
+                mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False),
+                mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+                mock.patch.object(self.remctl.remctl_broker, "dispatch", return_value=0) as dispatch,
+                mock.patch.object(self.remctl, "show_splash") as splash,
+                mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding") as onboard,
+                mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+            ):
+                self.remctl.main()
+        finally:
+            self.remctl.C.enabled = color_enabled
+
+        splash.assert_called_once_with()
+        onboard.assert_called_once()
+        local_handler.assert_not_called()
+        dispatch.assert_called_once()
+        self.assertEqual(
+            dispatch.call_args.args[0],
+            ["today", "--format", "plain", "--image-width", "64"],
+        )
+
+    def test_splash_names_signed_host_and_repair_commands(self):
+        self.remctl.C.enabled = False
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.remctl.show_splash()
+
+        output = stdout.getvalue()
+        self.assertIn("signed RemCTL Capability Host", output)
+        self.assertIn("First setup: remctl onboard", output)
+        self.assertIn("Diagnose or repair: remctl doctor --for-agent", output)
+        self.assertIn("Reopen FDA guide: remctl permissions full-disk-access", output)
+        self.assertNotIn("Setup or repair: remctl onboard", output)
+
+    def test_no_command_json_hosts_today_without_splash(self):
+        color_enabled = self.remctl.C.enabled
+        try:
+            with (
+                mock.patch.object(sys, "argv", ["remctl", "--format", "json"]),
+                mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False),
+                mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+                mock.patch.object(self.remctl.remctl_broker, "dispatch", return_value=0) as dispatch,
+                mock.patch.object(self.remctl, "show_splash") as splash,
+            ):
+                self.remctl.main()
+        finally:
+            self.remctl.C.enabled = color_enabled
+
+        splash.assert_not_called()
+        self.assertEqual(dispatch.call_args.args[0], ["today", "--format", "json"])
+
+    def test_existing_install_flushes_splash_before_hosted_dispatch(self):
+        events = []
+
+        class RecordingStdout:
+            def isatty(self):
+                return True
+
+            def write(self, value):
+                events.append("write")
+                return len(value)
+
+            def flush(self):
+                events.append("flush")
+
+        def hosted_dispatch(*_args, **_kwargs):
+            events.append("dispatch")
+            return 0
+
+        with (
+            mock.patch.object(sys, "argv", ["remctl"]),
+            mock.patch.dict("os.environ", {"NO_COLOR": ""}, clear=False),
+            mock.patch.object(self.remctl.sys, "stdout", RecordingStdout()),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+            mock.patch.object(
+                self.remctl.remctl_broker,
+                "dispatch",
+                side_effect=hosted_dispatch,
+            ) as dispatch,
+            mock.patch.object(
+                self.remctl,
+                "maybe_run_first_launch_onboarding",
+                return_value=None,
+            ) as onboard,
+        ):
+            self.remctl.main()
+
+        onboard.assert_called_once()
+        dispatch.assert_called_once()
+        self.assertEqual(events[-2:], ["flush", "dispatch"])
+
+    def test_hosted_command_exit_code_propagates_without_direct_retry(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "delete", "42", "--force"]),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch", return_value=7) as dispatch,
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 7)
+        dispatch.assert_called_once()
+        local_handler.assert_not_called()
+
+    def test_host_indeterminate_error_never_retries_directly(self):
+        error = self.remctl.remctl_broker.HostIndeterminate(
+            "connection ended after dispatch",
+            code="broker_command_timeout",
+        )
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "add", "Possibly created"]),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch", side_effect=error),
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        local_handler.assert_not_called()
+        output = stderr.getvalue()
+        self.assertIn("broker_command_timeout", output)
+        self.assertIn("may have run", output)
+        self.assertIn("did not retry", output)
+
+    def test_installed_host_unhealthy_error_fails_closed(self):
+        error = self.remctl.remctl_broker.HostUnhealthy(
+            "installed host has an unsafe socket"
+        )
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists", "--json"]),
+            mock.patch.object(self.remctl.remctl_broker, "should_route", return_value=True),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch", side_effect=error),
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        local_handler.assert_not_called()
+        self.assertIn("capability_host_unhealthy", stderr.getvalue())
+
+    def test_invalid_host_mode_is_a_clean_cli_error(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists"]),
+            mock.patch.object(
+                self.remctl.remctl_broker,
+                "should_route",
+                side_effect=ValueError(
+                    "invalid REMCTL_CAPABILITY_HOST value 'sometimes'"
+                ),
+            ),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+            mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding") as onboard,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        dispatch.assert_not_called()
+        onboard.assert_not_called()
+        self.assertIn("REMCTL_CAPABILITY_HOST", stderr.getvalue())
+
+    def test_force_host_with_custom_store_fails_before_execution(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists", "--json"]),
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "REMCTL_CAPABILITY_HOST": "force",
+                    "REMCTL_CAPABILITY_HOST_ACTIVE": "",
+                    "REMCTL_STORE_DIR": "/does/not/exist",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                self.remctl.remctl_broker,
+                "should_route",
+                side_effect=type(self)._real_should_route,
+            ),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        dispatch.assert_not_called()
+        local_handler.assert_not_called()
+        self.assertIn("conflicts with REMCTL_STORE_DIR", stderr.getvalue())
+
+    def test_custom_store_runs_direct_in_auto_and_direct_modes(self):
+        for mode in ("auto", "direct"):
+            with self.subTest(mode=mode):
+                with (
+                    mock.patch.object(sys, "argv", ["remctl", "lists", "--json"]),
+                    mock.patch.dict(
+                        "os.environ",
+                        {
+                            "REMCTL_CAPABILITY_HOST": mode,
+                            "REMCTL_CAPABILITY_HOST_ACTIVE": "",
+                            "REMCTL_STORE_DIR": "/tmp/custom-reminders-store",
+                        },
+                        clear=False,
+                    ),
+                    mock.patch.object(
+                        self.remctl.remctl_broker,
+                        "should_route",
+                        side_effect=type(self)._real_should_route,
+                    ),
+                    mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+                    mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding"),
+                    mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+                ):
+                    self.remctl.main()
+
+                dispatch.assert_not_called()
+                local_handler.assert_called_once()
+                self.assertIs(local_handler.call_args.args[1], self.remctl.cmd_lists)
+
+    def test_active_host_child_runs_direct_despite_force_and_custom_store(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "lists", "--json"]),
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "REMCTL_CAPABILITY_HOST": "force",
+                    "REMCTL_CAPABILITY_HOST_ACTIVE": "1",
+                    "REMCTL_STORE_DIR": "/sealed/host/store",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                self.remctl.remctl_broker,
+                "should_route",
+                side_effect=type(self)._real_should_route,
+            ),
+            mock.patch.object(self.remctl.remctl_broker, "dispatch") as dispatch,
+            mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding"),
+            mock.patch.object(self.remctl, "run_handler_with_fallback") as local_handler,
+        ):
+            self.remctl.main()
+
+        dispatch.assert_not_called()
+        local_handler.assert_called_once()
+        self.assertIs(local_handler.call_args.args[1], self.remctl.cmd_lists)
 
     def test_unknown_command_error_is_readable_and_suggests_list_symbols(self):
         with (
@@ -3174,6 +3807,7 @@ class CliTests(unittest.TestCase):
 
         def fake_cmd_add(args):
             created_args.append(args)
+            print(json.dumps({"status": "created", "id": "UUID-1", "numericId": 41}))
 
         payload = [{"title": "Buy milk", "dueDate": "2026-05-01T12:00:00"}]
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3189,6 +3823,112 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(len(created_args), 1)
         self.assertEqual(created_args[0].due, "2026-05-01T12:00:00")
+
+    def test_import_dash_reads_stdin_and_emits_one_json_result(self):
+        def fake_cmd_add(args):
+            print(json.dumps({"status": "created", "id": "UUID-1", "numericId": 41}))
+
+        args = SimpleNamespace(file="-", json=True)
+        with (
+            mock.patch.object(sys, "stdin", io.StringIO('[{"title":"Piped"}]')),
+            mock.patch.object(self.remctl, "cmd_add", side_effect=fake_cmd_add),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.remctl.cmd_import(args)
+
+        self.assertEqual(stderr.getvalue(), "imported index=0 id=41\n")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["createdIds"], [41])
+        self.assertEqual(stdout.getvalue().count("\n"), 1)
+
+    def test_import_preflights_entire_document_before_any_write(self):
+        payload = [{"title": "Would write"}, 42, {"title": ""}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "import.json"
+            input_path.write_text(json.dumps(payload))
+            args = SimpleNamespace(file=str(input_path), json=True)
+            with (
+                mock.patch.object(self.remctl, "cmd_add") as cmd_add,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as raised,
+            ):
+                self.remctl.cmd_import(args)
+
+        self.assertEqual(raised.exception.code, 1)
+        cmd_add.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        error = json.loads(stderr.getvalue())
+        self.assertEqual(error["code"], "invalid_import")
+        self.assertEqual(len(error["errors"]), 2)
+
+    def test_import_dash_rejects_tty_without_reading(self):
+        class TTYInput:
+            def isatty(self):
+                return True
+
+            def read(self, *_args):
+                raise AssertionError("TTY stdin must not be read")
+
+        args = SimpleNamespace(file="-", json=True)
+        with (
+            mock.patch.object(sys, "stdin", TTYInput()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.cmd_import(args)
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("requires piped standard input", stderr.getvalue())
+
+    def test_import_rejects_non_boolean_flagged_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "import.json"
+            input_path.write_text(json.dumps([{"title": "No write", "flagged": "false"}]))
+            args = SimpleNamespace(file=str(input_path), json=True)
+            with (
+                mock.patch.object(self.remctl, "cmd_add") as cmd_add,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_import(args)
+
+        cmd_add.assert_not_called()
+        self.assertEqual(json.loads(stderr.getvalue())["errors"][0]["message"], "flagged must be a boolean")
+
+    def test_import_partial_failure_reports_progress_before_next_add_and_exits_nonzero(self):
+        observed_before_second = []
+        progress = io.StringIO()
+
+        def fake_cmd_add(args):
+            if args.title == "First":
+                print(json.dumps({"status": "created", "numericId": 51}))
+                return
+            observed_before_second.append(progress.getvalue())
+            print(json.dumps({"status": "error", "message": "failed"}), file=sys.stderr)
+            raise SystemExit(1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "import.json"
+            input_path.write_text(json.dumps([{"title": "First"}, {"title": "Second"}]))
+            args = SimpleNamespace(file=str(input_path), json=True)
+            with (
+                mock.patch.object(self.remctl, "cmd_add", side_effect=fake_cmd_add),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(progress),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                self.remctl.cmd_import(args)
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(observed_before_second, ["imported index=0 id=51\n"])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["created"], 1)
+        self.assertEqual(payload["createdIds"], [51])
+        self.assertEqual(len(payload["errors"]), 1)
 
     def test_cmd_add_rejects_private_only_options_without_private_before_writing(self):
         args = SimpleNamespace(
@@ -4698,7 +5438,14 @@ class CliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("RemCTL setup", output)
         self.assertIn("Shell completion: skipped", output)
-        self.assertIn("remctl onboard", output)
+        first_install = output.split("First install:", 1)[1].split("Unchanged existing install:", 1)[0]
+        self.assertLess(first_install.index("remctl onboard"), first_install.index("restart the signed host"))
+        self.assertLess(first_install.index("restart the signed host"), first_install.index("remctl doctor --for-agent"))
+        existing = output.split("Unchanged existing install:", 1)[1].split("Upgrade or reinstall:", 1)[0]
+        self.assertLess(existing.index("remctl doctor --for-agent"), existing.index("remctl onboard only if doctor"))
+        upgrade = output.split("Upgrade or reinstall:", 1)[1]
+        self.assertIn("run ./install.sh first, then follow the checks above", upgrade)
+        self.assertIn("Repair: remctl permissions full-disk-access", output)
 
     def test_cmd_setup_zsh_reports_fpath_snippet_without_changing_json(self):
         args = SimpleNamespace(shell="zsh", doctor=False, json=False)
@@ -4753,7 +5500,10 @@ class CliTests(unittest.TestCase):
             "detail": "EventKit access error: The operation couldn’t be completed. (Mach error 4099 - unknown error code)",
             "fix": "Run remctl onboard from this same context.",
         }
-        with mock.patch.object(self.remctl, "bridge_access_check_for_onboarding", return_value=eventkit_check):
+        with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="direct"),
+            mock.patch.object(self.remctl, "bridge_access_check_for_onboarding", return_value=eventkit_check),
+        ):
             checks = self.remctl.gather_doctor_checks()
 
         self.assertIn(eventkit_check, checks)
@@ -4816,12 +5566,15 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch.object(self.remctl, "reminders_store_access_error", return_value="db blocked"),
             mock.patch.object(self.remctl, "find_main_db_path", return_value=None),
-            mock.patch.object(self.remctl, "full_disk_access_targets", return_value=["Terminal.app", "/tmp/python3"]),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
         ):
             check = self.remctl.database_access_check_for_onboarding()
         self.assertEqual(check["status"], "fail")
         self.assertIn("db blocked", check["detail"])
-        self.assertIn("Terminal.app", check["fix"])
+        self.assertIn("Reinstall RemCTL", check["fix"])
+        self.assertIn("add only that host", check["fix"])
+        for forbidden in ("Terminal.app", "/tmp/python3", "Hermes", "Codex"):
+            self.assertNotIn(forbidden, check["fix"])
 
     def test_detect_terminal_app_name_prefers_term_program(self):
         with mock.patch.dict("os.environ", {"TERM_PROGRAM": "Apple_Terminal"}, clear=False):
@@ -4866,45 +5619,22 @@ class CliTests(unittest.TestCase):
             self.assertIsNone(self.remctl.find_app_bundle_by_identifier("com.example' || *"))
         run.assert_not_called()
 
-    def test_full_disk_access_targets_skip_ghostty_when_embedder_is_known(self):
-        host_path = Path("/Users/test/Applications/awesoMux.app")
-        context = {
-            "host_app": "awesoMux.app",
-            "host_app_path": str(host_path),
-            "terminal_app": "Ghostty.app",
-            "effective_context": "awesoMux",
-        }
-        with (
-            mock.patch.object(self.remctl, "doctor_execution_context", return_value=context),
-            mock.patch.object(self.remctl, "detect_terminal_app_name", return_value="Ghostty.app"),
-            mock.patch.object(self.remctl, "find_app_bundle", return_value=Path("/Applications/Ghostty.app")),
-        ):
-            targets = self.remctl.full_disk_access_target_specs(include_cli=True)
-        titles = [target["title"] for target in targets]
-        self.assertIn("Current Python interpreter", titles)
-        self.assertIn("awesoMux.app", titles)
-        self.assertNotIn("Ghostty.app", titles)
+    def test_full_disk_access_fix_text_never_targets_callers(self):
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):
+            hosted = self.remctl.full_disk_access_fix_text(rerun_command="remctl doctor")
+        self.assertIn("signed RemCTL Capability Host", hosted)
+        self.assertIn("Reinstall RemCTL", hosted)
+        self.assertIn("add only that host", hosted)
+        self.assertLess(hosted.index("add only that host"), hosted.index("restart the signed host"))
+        self.assertLess(hosted.index("restart the signed host"), hosted.index("remctl doctor"))
 
-    def test_full_disk_access_fix_text_mentions_targets_and_fallback(self):
-        with mock.patch.object(
-            self.remctl,
-            "full_disk_access_targets",
-            return_value=["Terminal.app (recommended for CLI use)", "/tmp/python3"],
-        ), mock.patch.object(
-            self.remctl,
-            "doctor_execution_context",
-            return_value={"effective_context": "Codex"},
-        ):
-            text = self.remctl.full_disk_access_fix_text(
-                rerun_command="remctl doctor",
-                mention_onboard=True,
-            )
-        self.assertIn("Terminal.app", text)
-        self.assertIn("/tmp/python3", text)
-        self.assertIn("remctl onboard", text)
-        self.assertIn("Current execution context: Codex", text)
-        self.assertIn("Terminal does not grant access", text)
-        self.assertIn("Command-Shift-G", text)
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="direct"):
+            direct = self.remctl.full_disk_access_fix_text(rerun_command="remctl doctor")
+        self.assertIn("caller-scoped and self-managed", direct)
+        self.assertIn("does not configure direct callers", direct)
+        for text in (hosted, direct):
+            for forbidden in ("Terminal.app", "/tmp/python3", "Hermes", "Codex"):
+                self.assertNotIn(forbidden, text)
 
     def test_doctor_execution_context_reports_codex_ancestor(self):
         with mock.patch.object(
@@ -4941,21 +5671,62 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["context"]["effective_context"], "Codex")
-        self.assertIn("same context", payload["agent_note"])
+        self.assertIn("effective", payload["agent_note"])
+        self.assertIn("capabilityHost", payload)
 
-    def test_print_full_disk_access_guidance_copies_python_path(self):
+    def test_cmd_doctor_distinguishes_direct_and_effective_host_access(self):
+        status = {
+            **self._absent_host_status,
+            "status": "ok",
+            "installed": True,
+            "available": True,
+            "ready": True,
+            "fullReady": True,
+            "protocolVersion": 2,
+            "permissions": {
+                "fullDiskAccess": "authorized",
+                "reminders": "authorized",
+                "automation": "authorized",
+            },
+        }
+        checks = [
+            {"name": "database", "status": "warn", "detail": "direct blocked", "fix": None},
+            {"name": "effective_access", "status": "ok", "detail": "route=capabilityHost; ready=yes", "fix": None},
+        ]
         with (
-            mock.patch.object(self.remctl.sys, "executable", "/tmp/python3"),
-            mock.patch.object(self.remctl, "full_disk_access_targets", return_value=["Terminal.app", "/tmp/python3"]),
-            mock.patch.object(self.remctl, "copy_to_clipboard", return_value=True) as copy_to_clipboard,
+            mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=status),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(self.remctl, "gather_doctor_checks", return_value=checks),
+            mock.patch.object(self.remctl, "doctor_execution_context", return_value={"effective_context": "Hermes"}),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
-            self.remctl.print_full_disk_access_guidance(settings_opened=True)
-        expected_path = str(Path("/tmp/python3").resolve(strict=False))
+            self.remctl.cmd_doctor(SimpleNamespace(json=True, for_agent=True))
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["access"]["direct"]["ready"])
+        self.assertEqual(payload["access"]["effective"]["route"], "capabilityHost")
+        self.assertTrue(payload["access"]["effective"]["ready"])
+        self.assertTrue(payload["capabilityHost"]["fullReady"])
+
+    def test_print_full_disk_access_guidance_copies_only_signed_host_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_path = Path(tmpdir).resolve() / "RemCTL Capability Host.app"
+            app_path.mkdir()
+            status = self._valid_capability_host_status(app_path)
+            marker = self._write_capability_host_marker(tmpdir, app_path)
+            with (
+                mock.patch.object(self.remctl, "capability_host_install_marker_path", return_value=marker),
+                mock.patch.object(self.remctl, "copy_to_clipboard", return_value=True) as copy_to_clipboard,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.print_capability_host_full_disk_access_guidance(status, settings_opened=True)
+        expected_path = str(app_path)
         copy_to_clipboard.assert_called_once_with(expected_path)
         output = stdout.getvalue()
         self.assertIn(f"Copied path to clipboard: {expected_path}", output)
-        self.assertIn("Command-Shift-G", output)
+        self.assertIn("Do not add Hermes, Python, Codex, or Terminal", output)
+        self.assertIn("If you changed Full Disk Access, restart the host", output)
 
     def test_open_full_disk_access_settings_tries_modern_url_before_legacy(self):
         calls = []
@@ -4989,31 +5760,66 @@ class CliTests(unittest.TestCase):
         self.assertIn("        remctl doctor", output)
 
     def test_cmd_onboard_opens_full_disk_access_settings_when_database_not_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_path = Path(tmpdir).resolve() / "RemCTL Capability Host.app"
+            app_path.mkdir()
+            status = self._valid_capability_host_status(app_path)
+            marker = self._write_capability_host_marker(tmpdir, app_path)
+            result = {
+                "ok": True,
+                "warnings": 1,
+                "failures": 0,
+                "checks": [
+                    {"name": "database", "status": "warn", "detail": "db blocked", "fix": "Full Disk Access is required"},
+                ],
+                "capabilityHost": status,
+            }
+            with (
+                mock.patch.object(self.remctl, "capability_host_install_marker_path", return_value=marker),
+                mock.patch.object(self.remctl, "run_onboarding", return_value=result),
+                mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+                mock.patch.object(self.remctl, "print_check_report"),
+                mock.patch.object(self.remctl, "launch_full_disk_access_helper", return_value=False),
+                mock.patch.object(self.remctl, "open_full_disk_access_settings", return_value=True) as open_settings,
+                mock.patch.object(self.remctl, "print_capability_host_full_disk_access_guidance") as guidance,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_onboard(SimpleNamespace(json=False))
+        open_settings.assert_called_once_with()
+        guidance.assert_called_once_with(
+            status,
+            settings_opened=True,
+        )
+
+    def test_cmd_onboard_json_runs_onboarding_but_suppresses_fda_ui(self):
         result = {
             "ok": True,
             "warnings": 1,
             "failures": 0,
-            "checks": [
-                {"name": "database", "status": "warn", "detail": "db blocked", "fix": "Grant Full Disk Access to Terminal.app"},
-            ],
+            "checks": [{
+                "name": "database",
+                "status": "warn",
+                "detail": "Full Disk Access is blocked",
+                "fix": "Add Full Disk Access",
+            }],
+            "capabilityHost": self._absent_host_status,
         }
         with (
-            mock.patch.object(self.remctl, "run_onboarding", return_value=result),
-            mock.patch.object(self.remctl, "print_check_report"),
-            mock.patch.object(self.remctl, "launch_full_disk_access_helper", return_value=False),
-            mock.patch.object(self.remctl, "open_full_disk_access_settings", return_value=True) as open_settings,
-            mock.patch.object(self.remctl, "print_full_disk_access_guidance") as guidance,
-            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(self.remctl, "run_onboarding", return_value=result) as run_onboarding,
+            mock.patch.object(self.remctl, "launch_full_disk_access_helper") as launch,
+            mock.patch.object(self.remctl, "open_full_disk_access_settings") as open_settings,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
-            self.remctl.cmd_onboard(SimpleNamespace(json=False))
-        open_settings.assert_called_once_with()
-        guidance.assert_called_once_with(
-            settings_opened=True,
-            rerun_command="remctl doctor",
-        )
+            self.remctl.cmd_onboard(SimpleNamespace(json=True))
+
+        self.assertEqual(json.loads(stdout.getvalue()), result)
+        run_onboarding.assert_called_once_with(auto=False)
+        launch.assert_not_called()
+        open_settings.assert_not_called()
 
     def test_gather_onboarding_checks_includes_core_cli_checks(self):
         with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="direct"),
             mock.patch.object(
                 self.remctl,
                 "open_reminders_app_for_onboarding",
@@ -5039,6 +5845,126 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual([check["name"] for check in checks], ["open_reminders", "eventkit", "automation", "database"])
 
+    def test_gather_onboarding_checks_auto_requires_host_without_direct_prompts(self):
+        with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(self.remctl, "bridge_access_check_for_onboarding") as direct_bridge,
+            mock.patch.object(self.remctl, "applescript_access_check_for_onboarding") as direct_automation,
+            mock.patch.object(self.remctl, "database_access_check_for_onboarding") as direct_database,
+        ):
+            checks = self.remctl.gather_onboarding_checks(self._absent_host_status)
+        self.assertEqual([check["name"] for check in checks], ["capability_host"])
+        self.assertEqual(checks[0]["status"], "fail")
+        self.assertIn("Reinstall", checks[0]["fix"])
+        direct_bridge.assert_not_called()
+        direct_automation.assert_not_called()
+        direct_database.assert_not_called()
+
+    def test_gather_onboarding_checks_requests_permissions_from_installed_host(self):
+        status = {
+            **self._absent_host_status,
+            "status": "ok",
+            "installed": True,
+            "available": True,
+            "ready": True,
+            "fullReady": False,
+            "permissions": {
+                "fullDiskAccess": "authorized",
+                "reminders": "notDetermined",
+                "automation": "notDetermined",
+            },
+        }
+        refreshed = {
+            **status,
+            "fullReady": True,
+            "permissions": {
+                "fullDiskAccess": "authorized",
+                "reminders": "authorized",
+                "automation": "authorized",
+            },
+        }
+        with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(
+                self.remctl,
+                "open_reminders_app_for_onboarding",
+                return_value={"name": "open_reminders", "status": "ok", "detail": "opened", "fix": None},
+            ),
+            mock.patch.object(self.remctl.remctl_broker, "request_permission", return_value={}) as request_permission,
+            mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=refreshed),
+            mock.patch.object(self.remctl, "bridge_access_check_for_onboarding") as direct_bridge,
+            mock.patch.object(self.remctl, "applescript_access_check_for_onboarding") as direct_automation,
+            mock.patch.object(self.remctl, "database_access_check_for_onboarding") as direct_database,
+        ):
+            checks = self.remctl.gather_onboarding_checks(status)
+
+        self.assertEqual(
+            request_permission.call_args_list,
+            [mock.call("reminders", timeout=305), mock.call("automation", timeout=305)],
+        )
+        direct_bridge.assert_not_called()
+        direct_automation.assert_not_called()
+        direct_database.assert_not_called()
+        self.assertEqual(
+            [check["name"] for check in checks],
+            ["open_reminders", "eventkit", "automation", "database"],
+        )
+        self.assertTrue(all(check["status"] == "ok" for check in checks))
+
+    def test_gather_onboarding_checks_stops_after_terminal_reminders_prompt(self):
+        status = {
+            **self._absent_host_status,
+            "status": "ok",
+            "installed": True,
+            "available": True,
+            "ready": True,
+            "fullReady": False,
+            "permissions": {
+                "fullDiskAccess": "authorized",
+                "reminders": "notDetermined",
+                "automation": "notDetermined",
+            },
+        }
+        terminal_errors = {
+            "permission_prompt_cancelled": "was cancelled",
+            "permission_prompt_timed_out": "timed out",
+            "permission_prompt_unavailable": "could not present",
+        }
+        for code, message in terminal_errors.items():
+            with self.subTest(code=code):
+                error = self.remctl.remctl_broker.HostUnhealthy(message, code=code)
+                with (
+                    mock.patch.object(
+                        self.remctl,
+                        "open_reminders_app_for_onboarding",
+                        return_value={
+                            "name": "open_reminders",
+                            "status": "ok",
+                            "detail": "opened",
+                            "fix": None,
+                        },
+                    ),
+                    mock.patch.object(
+                        self.remctl.remctl_broker,
+                        "request_permission",
+                        side_effect=error,
+                    ) as request_permission,
+                    mock.patch.object(
+                        self.remctl,
+                        "capability_host_status_snapshot",
+                        return_value=status,
+                    ),
+                ):
+                    checks = self.remctl.gather_onboarding_checks(status)
+
+                request_permission.assert_called_once_with("reminders", timeout=305)
+                by_name = {check["name"]: check for check in checks}
+                self.assertEqual(by_name["eventkit"]["status"], "fail")
+                self.assertIn(message, by_name["eventkit"]["detail"])
+                self.assertEqual(by_name["automation"]["status"], "warn")
+                self.assertIn("did not request Automation", by_name["automation"]["detail"])
+                self.assertIn(message, by_name["automation"]["detail"])
+
     def test_needs_full_disk_access_guidance_false_for_missing_database(self):
         check = {
             "name": "database",
@@ -5058,39 +5984,277 @@ class CliTests(unittest.TestCase):
                 return_value={"ok": True, "warnings": 0, "failures": 0, "checks": []},
             ) as run_onboarding,
             mock.patch.object(self.remctl, "print_check_report") as print_report,
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             result = self.remctl.maybe_run_first_launch_onboarding(args)
 
         self.assertTrue(result["ok"])
         run_onboarding.assert_called_once_with(auto=True)
         print_report.assert_called_once_with("RemCTL onboard", [])
+        output = stdout.getvalue()
+        self.assertIn(
+            "First launch detected. Running remctl onboard for the signed RemCTL Capability Host.",
+            output,
+        )
+        self.assertIn(
+            "Approve the Reminders and Automation prompts for the Capability Host. "
+            "The original command will then continue.",
+            output,
+        )
 
-    def test_should_auto_onboard_skips_admin_commands(self):
-        args = SimpleNamespace(cmd="setup", json=False, format="plain")
+    def test_first_launch_full_disk_helper_targets_only_installed_host(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_path = Path(tmpdir).resolve() / "RemCTL Capability Host.app"
+            app_path.mkdir()
+            status = self._valid_capability_host_status(app_path)
+            marker = self._write_capability_host_marker(tmpdir, app_path)
+            result = {
+                "ok": False,
+                "warnings": 0,
+                "failures": 1,
+                "checks": [{
+                    "name": "database",
+                    "status": "fail",
+                    "detail": "Full Disk Access is blocked",
+                    "fix": "Add Full Disk Access",
+                }],
+                "capabilityHost": status,
+            }
+            with (
+                mock.patch.object(self.remctl, "capability_host_install_marker_path", return_value=marker),
+                mock.patch.object(self.remctl, "should_auto_onboard", return_value=True),
+                mock.patch.object(self.remctl, "run_onboarding", return_value=result),
+                mock.patch.object(self.remctl, "print_check_report"),
+                mock.patch.object(self.remctl, "launch_full_disk_access_helper", return_value=True) as launch,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.maybe_run_first_launch_onboarding(SimpleNamespace(cmd="today", json=False, format="plain"))
+            launch.assert_called_once()
+            launched_targets = launch.call_args.kwargs["targets"]
+            self.assertEqual(len(launched_targets), 1)
+            self.assertEqual(launched_targets[0]["path"], str(app_path))
+
+    def test_first_launch_direct_mode_never_launches_full_disk_helper(self):
+        status = {
+            **self._absent_host_status,
+            "installed": True,
+            "app": {"path": "/Applications/RemCTL Capability Host.app", "installed": True},
+        }
+        result = {
+            "ok": False,
+            "warnings": 0,
+            "failures": 1,
+            "checks": [{
+                "name": "database",
+                "status": "fail",
+                "detail": "Full Disk Access is blocked",
+                "fix": "Add Full Disk Access",
+            }],
+            "capabilityHost": status,
+        }
         with (
-            mock.patch.object(self.remctl, "load_onboard_state", return_value=None),
-            mock.patch.object(self.remctl.sys, "platform", "darwin"),
-            mock.patch.dict("os.environ", {}, clear=False),
-            mock.patch.object(self.remctl.sys, "stdout", SimpleNamespace(isatty=lambda: True)),
+            mock.patch.object(self.remctl, "should_auto_onboard", return_value=True),
+            mock.patch.object(self.remctl, "run_onboarding", return_value=result),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="direct"),
+            mock.patch.object(self.remctl, "capability_host_target_specs") as host_targets,
+            mock.patch.object(self.remctl, "launch_full_disk_access_helper") as launch,
+            mock.patch.object(self.remctl, "print_check_report"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
-            result = self.remctl.should_auto_onboard(args)
+            self.remctl.maybe_run_first_launch_onboarding(
+                SimpleNamespace(cmd="today", json=False, format="plain")
+            )
+        host_targets.assert_not_called()
+        launch.assert_not_called()
+        self.assertIn("caller-scoped and self-managed", stdout.getvalue())
 
-        self.assertFalse(result)
+    def test_should_auto_onboard_requires_an_interactive_protected_caller(self):
+        def evaluate(
+            args,
+            *,
+            stdin_tty=True,
+            stdout_tty=True,
+            platform="darwin",
+            environment=None,
+        ):
+            with (
+                mock.patch.object(self.remctl, "load_onboard_state", return_value=None),
+                mock.patch.object(self.remctl.sys, "platform", platform),
+                mock.patch.dict("os.environ", environment or {}, clear=True),
+                mock.patch.object(
+                    self.remctl.sys,
+                    "stdin",
+                    SimpleNamespace(isatty=lambda: stdin_tty),
+                ),
+                mock.patch.object(
+                    self.remctl.sys,
+                    "stdout",
+                    SimpleNamespace(isatty=lambda: stdout_tty),
+                ),
+            ):
+                return self.remctl.should_auto_onboard(args)
 
-    def test_cmd_permissions_reports_helper_targets_in_json(self):
+        interactive = SimpleNamespace(cmd="today", json=False, format="plain")
+        self.assertTrue(evaluate(interactive))
+        self.assertFalse(evaluate(interactive, stdin_tty=False))
+        self.assertFalse(evaluate(interactive, stdout_tty=False))
+        self.assertFalse(evaluate(interactive, platform="linux"))
+        self.assertFalse(
+            evaluate(interactive, environment={"REMCTL_SKIP_ONBOARD": "1"})
+        )
+        self.assertFalse(
+            evaluate(
+                interactive,
+                environment={"REMCTL_CAPABILITY_HOST_ACTIVE": "1"},
+            )
+        )
+        self.assertFalse(
+            evaluate(SimpleNamespace(cmd="today", json=True, format="plain"))
+        )
+        self.assertFalse(
+            evaluate(SimpleNamespace(cmd="today", json=False, format="json"))
+        )
+        for command in sorted(self.remctl.AUTO_ONBOARD_SKIP_COMMANDS):
+            with self.subTest(command=command):
+                self.assertFalse(
+                    evaluate(
+                        SimpleNamespace(cmd=command, json=False, format="plain")
+                    )
+                )
+
+    def test_cmd_permissions_missing_host_fails_without_caller_targets(self):
         args = SimpleNamespace(cmd="permissions", topic="full-disk-access", scope="cli", wait=False, json=True)
-        target = [{"title": "CLI Python", "path": "/tmp/python3", "subtitle": "CLI target"}]
         with (
-            mock.patch.object(self.remctl, "full_disk_access_target_specs", return_value=target),
+            mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=self._absent_host_status),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
             mock.patch.object(self.remctl, "current_permissions_path", return_value=Path("/tmp/remctl-permissions")),
             mock.patch.object(self.remctl, "permission_helper_available", return_value=True),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
+            self.assertRaises(SystemExit),
         ):
             self.remctl.cmd_permissions(args)
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["available"])
-        self.assertEqual(payload["targets"], target)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["targets"], [])
+        self.assertEqual(payload["error"]["code"], "capability_host_not_installed")
+
+    def test_cmd_permissions_targets_only_installed_capability_host(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_path = Path(tmpdir).resolve() / "RemCTL Capability Host.app"
+            app_path.mkdir()
+            status = self._valid_capability_host_status(app_path)
+            marker = self._write_capability_host_marker(tmpdir, app_path)
+            args = SimpleNamespace(topic="full-disk-access", wait=False, json=True)
+            with (
+                mock.patch.object(self.remctl, "capability_host_install_marker_path", return_value=marker),
+                mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=status),
+                mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+                mock.patch.object(self.remctl, "current_permissions_path", return_value=Path("/tmp/remctl-permissions")),
+                mock.patch.object(self.remctl, "permission_helper_available", return_value=True),
+                mock.patch.object(self.remctl, "launch_full_disk_access_helper") as launch,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_permissions(args)
+            launch.assert_not_called()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload["targets"]), 1)
+        self.assertEqual(
+            payload["targets"][0]["path"],
+            str(app_path),
+        )
+        self.assertNotIn("Python", payload["targets"][0]["title"])
+
+    def test_capability_host_target_specs_rejects_untrusted_status_and_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            app_path = root / "RemCTL Capability Host.app"
+            app_path.mkdir()
+            valid_status = self._valid_capability_host_status(app_path)
+            marker = self._write_capability_host_marker(root, app_path)
+            marker_patch = mock.patch.object(
+                self.remctl,
+                "capability_host_install_marker_path",
+                return_value=marker,
+            )
+            marker_patch.start()
+            self.addCleanup(marker_patch.stop)
+            self.assertEqual(
+                self.remctl.capability_host_target_specs(valid_status)[0]["path"],
+                str(app_path),
+            )
+
+            other_root = root / "other"
+            other_root.mkdir()
+            other_app = other_root / "RemCTL Capability Host.app"
+            other_app.mkdir()
+            marker.write_text(f"{other_app}\n")
+            self.assertEqual(self.remctl.capability_host_target_specs(valid_status), [])
+            marker.write_text(f"{app_path}\n")
+
+            invalid_signature = self._valid_capability_host_status(app_path)
+            invalid_signature["app"]["signature"] = {
+                **invalid_signature["app"]["signature"],
+                "valid": False,
+            }
+            self.assertEqual(self.remctl.capability_host_target_specs(invalid_signature), [])
+
+            wrong_identifier = self._valid_capability_host_status(app_path)
+            wrong_identifier["app"]["bundleIdentifier"] = "com.example.fake-host"
+            self.assertEqual(self.remctl.capability_host_target_specs(wrong_identifier), [])
+
+            nonexistent = root / "missing" / "RemCTL Capability Host.app"
+            self.assertEqual(
+                self.remctl.capability_host_target_specs(
+                    self._valid_capability_host_status(nonexistent)
+                ),
+                [],
+            )
+
+            wrong_name = root / "Python.app"
+            wrong_name.mkdir()
+            self.assertEqual(
+                self.remctl.capability_host_target_specs(
+                    self._valid_capability_host_status(wrong_name)
+                ),
+                [],
+            )
+
+            (root / "segment").mkdir()
+            noncanonical = root / "segment" / ".." / "RemCTL Capability Host.app"
+            self.assertEqual(
+                self.remctl.capability_host_target_specs(
+                    self._valid_capability_host_status(noncanonical)
+                ),
+                [],
+            )
+
+            link_root = root / "linked"
+            link_root.mkdir()
+            symlink_path = link_root / "RemCTL Capability Host.app"
+            symlink_path.symlink_to(app_path, target_is_directory=True)
+            self.assertEqual(
+                self.remctl.capability_host_target_specs(
+                    self._valid_capability_host_status(symlink_path)
+                ),
+                [],
+            )
+
+    def test_cmd_permissions_direct_mode_is_self_managed(self):
+        args = SimpleNamespace(topic="full-disk-access", wait=False, json=True)
+        with (
+            mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=self._absent_host_status),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="direct"),
+            mock.patch.object(self.remctl, "launch_full_disk_access_helper") as launch,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_permissions(args)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["error"]["code"], "direct_mode_self_managed")
+        self.assertEqual(payload["targets"], [])
+        launch.assert_not_called()
 
     def test_launch_full_disk_access_helper_passes_targets_and_after_commands(self):
         class FakePath:
@@ -5101,20 +6265,40 @@ class CliTests(unittest.TestCase):
                 return "/tmp/remctl-permissions"
 
         targets = [
-            {"title": "CLI Python", "path": "/tmp/python3", "subtitle": "CLI target"},
+            {"title": "RemCTL Capability Host.app", "path": "/Applications/RemCTL Capability Host.app", "subtitle": "Signed host"},
         ]
         with (
             mock.patch.object(self.remctl, "current_permissions_path", return_value=FakePath()),
+            mock.patch.object(self.remctl, "current_cli_path", return_value=Path("/tmp/RemCTL Tools/remctl")),
             mock.patch.object(self.remctl.os, "access", return_value=True),
-            mock.patch.object(self.remctl, "full_disk_access_target_specs", return_value=targets),
+            mock.patch.object(self.remctl.os, "getuid", return_value=501),
             mock.patch.object(self.remctl.subprocess, "Popen") as popen,
         ):
-            launched = self.remctl.launch_full_disk_access_helper(include_cli=True)
+            launched = self.remctl.launch_full_disk_access_helper(targets=targets)
         self.assertTrue(launched)
         args = popen.call_args.args[0]
-        self.assertIn("--target", args)
-        self.assertIn("/tmp/python3", args)
-        self.assertIn("Run Doctor", args)
+        self.assertEqual(args.count("--target"), 1)
+        target_index = args.index("--target")
+        self.assertEqual(
+            args[target_index + 1 : target_index + 4],
+            [
+                "RemCTL Capability Host.app",
+                "/Applications/RemCTL Capability Host.app",
+                "Signed host",
+            ],
+        )
+        after_index = args.index("--after")
+        self.assertEqual(args[after_index + 1], "Restart Host + Run Doctor")
+        self.assertEqual(
+            args[after_index + 2],
+            "/bin/launchctl kickstart -k "
+            f"gui/501/{self.remctl.remctl_broker.LAUNCH_AGENT_LABEL} && "
+            "'/tmp/RemCTL Tools/remctl' doctor --for-agent",
+        )
+        self.assertLess(
+            args[after_index + 2].index("launchctl kickstart"),
+            args[after_index + 2].index("doctor --for-agent"),
+        )
 
     # --- Regression: mutating-op routing (bridge vs AppleScript) ---
     # 2026-04-17: we discovered EKEventStore.save() from a short-lived CLI
@@ -6727,6 +7911,11 @@ class CliTests(unittest.TestCase):
         args = SimpleNamespace(cmd="today", json=False, no_overdue=False, format="plain", via_eventkit=False)
         handler = mock.Mock(side_effect=self.remctl.RemindersDBUnavailable("db unavailable"))
         with (
+            mock.patch.dict(
+                "os.environ",
+                {"REMCTL_CAPABILITY_HOST_ACTIVE": ""},
+                clear=False,
+            ),
             contextlib.redirect_stderr(io.StringIO()) as stderr,
             self.assertRaises(SystemExit) as raised,
         ):
@@ -6736,8 +7925,37 @@ class CliTests(unittest.TestCase):
         handler.assert_called_once_with(args)
         output = stderr.getvalue()
         self.assertIn("--via-eventkit", output)
+        self.assertIn("when Full Disk Access is unavailable", output)
         self.assertIn("not full fidelity", output)
         self.assertIn("does not return RemCTL numeric ids", output)
+
+    def test_run_handler_with_fallback_names_host_inside_sealed_child(self):
+        args = SimpleNamespace(
+            cmd="today",
+            json=False,
+            no_overdue=False,
+            format="plain",
+            via_eventkit=False,
+        )
+        handler = mock.Mock(
+            side_effect=self.remctl.RemindersDBUnavailable("host database unavailable")
+        )
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"REMCTL_CAPABILITY_HOST_ACTIVE": "1"},
+                clear=False,
+            ),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.run_handler_with_fallback(args, handler)
+
+        self.assertEqual(raised.exception.code, 1)
+        output = stderr.getvalue()
+        self.assertIn("signed Capability Host lacks Full Disk Access", output)
+        self.assertIn("--via-eventkit", output)
+        self.assertNotIn("when Full Disk Access is unavailable", output)
 
     def test_fmt_supports_sqlite_row_without_dict_get(self):
         conn = sqlite3.connect(":memory:")
@@ -8500,8 +9718,10 @@ class CliTests(unittest.TestCase):
         env.pop("PREFIX", None)
         env.update({
             "HOME": str(tmp / "home"),
+            "PREFIX": str(tmp / "prefix"),
             "REMCTL_BIN_DIR": str(tmp / "bin"),
             "REMCTL_CONFIG_DIR": str(tmp / "home" / ".config" / "remctl"),
+            "REMCTL_SKIP_LAUNCHSERVICES": "1",
         })
         return subprocess.run(
             ["bash", str(root / "uninstall.sh"), *args],
@@ -8511,7 +9731,7 @@ class CliTests(unittest.TestCase):
             timeout=10,
         )
 
-    def test_uninstall_dry_run_keeps_files(self):
+    def test_uninstall_dry_run_without_ownership_marker_keeps_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             bin_dir = tmp / "bin"
@@ -8529,8 +9749,9 @@ class CliTests(unittest.TestCase):
             self.assertTrue((bin_dir / "remctl-bridge").exists())
             self.assertTrue((bin_dir / "completions" / "_remctl").exists())
             self.assertTrue(config_dir.exists())
+            self.assertIn("Keeping unowned config directory", result.stdout)
 
-    def test_uninstall_removes_only_known_files_and_config(self):
+    def test_uninstall_without_ownership_marker_keeps_bin_and_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             bin_dir = tmp / "bin"
@@ -8545,12 +9766,14 @@ class CliTests(unittest.TestCase):
             result = self._run_uninstall(tmp)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((bin_dir / "remctl").exists())
-            self.assertFalse((bin_dir / "remctl_runtime.py").exists())
-            self.assertFalse((bin_dir / "remctl-bridge").exists())
-            self.assertFalse((bin_dir / "completions").exists())
+            self.assertTrue((bin_dir / "remctl").exists())
+            self.assertTrue((bin_dir / "remctl_runtime.py").exists())
+            self.assertTrue((bin_dir / "remctl-bridge").exists())
+            self.assertTrue((bin_dir / "completions" / "_remctl").exists())
             self.assertTrue((bin_dir / "unrelated").exists())
-            self.assertFalse(config_dir.exists())
+            self.assertTrue(config_dir.exists())
+            self.assertIn("Keeping unowned config directory", result.stdout)
+            self.assertIn("Nothing found to remove", result.stdout)
 
 # ── Inline Images (feature/inline-images) ────────────────────────────────────
 
@@ -9845,6 +11068,327 @@ class InlineImageTests(unittest.TestCase):
             db.close()
         self.assertEqual(len(result["attachments"]), 1)
         self.assertEqual(result["attachments"][0]["filename"], "photo.png")
+
+
+class CapabilityHostHelpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.remctl = load_module("remctl_help_test", "remctl")
+
+    def test_root_and_setup_help_describe_one_signed_permission_host(self):
+        parser, sub = self.remctl.build_parser()
+        root_help = parser.format_help()
+        self.assertIn("signed RemCTL Capability Host", root_help)
+        self.assertIn("Python 3.10+ CLI", root_help)
+        self.assertIn("access.effective and protocol v2", root_help)
+        self.assertNotIn("writes via remctl-bridge", root_help)
+        self.assertIn("add/edit/reminder-move", root_help)
+        self.assertIn("section-create/section-rename/section-delete", root_help)
+        self.assertIn("group-create/group-edit/group-delete", root_help)
+        self.assertIn("template-create/template-apply/template-delete", root_help)
+        self.assertNotIn("group-*", root_help)
+        self.assertNotIn("template-*", root_help)
+        self.assertNotIn("group-info", root_help.split("Private metadata writes", 1)[1])
+        self.assertNotIn("template-info", root_help.split("Private metadata writes", 1)[1])
+        self.assertIn(f"{self.remctl.CLI_NAME} setup --shell auto", root_help)
+        self.assertNotIn(f"{self.remctl.CLI_NAME} setup --shell auto --doctor", root_help)
+
+        setup_help = " ".join(sub.choices["setup"].format_help().split())
+        self.assertIn("does not grant macOS permissions", setup_help)
+        self.assertIn("remctl onboard", setup_help)
+        self.assertIn("opens the host-only FDA guide if needed", setup_help)
+        self.assertIn("restart the host before doctor", setup_help)
+        self.assertIn("remctl doctor --for-agent", setup_help)
+        self.assertIn("unchanged existing install", setup_help)
+        self.assertIn("onboard only if doctor reports host permission trouble", setup_help)
+        self.assertIn("upgrade or reinstall, run `./install.sh`, then doctor", setup_help)
+        self.assertIn("only to reopen the guide for repair", setup_help)
+        self.assertIn("remctl setup --shell auto", setup_help)
+        self.assertNotIn("remctl setup --shell auto --doctor", setup_help)
+        self.assertIn("unchanged installs or completed upgrades/reinstalls only, after any FDA restart", setup_help)
+
+        cli_name = self.remctl.CLI_NAME
+        first_install = root_help.split("First install:", 1)[1].split("Upgrade or reinstall:", 1)[0]
+        self.assertLess(first_install.index(f"{cli_name} onboard"), first_install.index("restart the signed host"))
+        self.assertLess(first_install.index("restart the signed host"), first_install.index(f"{cli_name} doctor --for-agent"))
+        upgrade = root_help.split("Upgrade or reinstall:", 1)[1].split("Repair:", 1)[0]
+        self.assertLess(upgrade.index(f"{cli_name} doctor --for-agent"), upgrade.index(f"{cli_name} onboard only if doctor"))
+        self.assertIn(f"Repair: {cli_name} permissions full-disk-access", root_help)
+
+    def test_permission_and_diagnostic_help_never_target_callers(self):
+        _, sub = self.remctl.build_parser()
+        onboard = sub.choices["onboard"].format_help()
+        doctor = sub.choices["doctor"].format_help()
+        permissions = sub.choices["permissions"].format_help()
+        onboard_compact = " ".join(onboard.split())
+        permissions_compact = " ".join(permissions.split())
+
+        self.assertIn("cannot grant Full Disk Access", onboard)
+        self.assertIn("request Reminders and Automation access", onboard)
+        self.assertIn("still requests Reminders and Automation", onboard_compact)
+        self.assertIn("does not open the FDA helper", onboard_compact)
+        self.assertIn("`access.effective` is authoritative", doctor)
+        self.assertIn("`capabilityHost.fullReady`", doctor)
+        self.assertIn("remctl-private helper protocol version (required: v2)", doctor)
+        self.assertIn("only the exact installed signed host", permissions)
+        self.assertIn("JSON reports the validated target without opening UI", permissions_compact)
+        self.assertIn("reports state and targets but does not open", permissions_compact)
+        self.assertIn("Explicit direct mode is self-managed", permissions)
+        self.assertNotIn("direct CLI reads", onboard)
+        self.assertNotIn("Terminal can pass", doctor)
+
+    def test_hosted_command_help_names_signed_execution_target(self):
+        _, sub = self.remctl.build_parser()
+        self.assertIn("Signed-host database reads", sub.choices["show"].format_help())
+        self.assertIn("signed host's EventKit bridge", sub.choices["add"].format_help())
+        self.assertIn("inside the signed host by default", sub.choices["edit"].format_help())
+        self.assertIn("inside the signed host", sub.choices["flag"].description or sub.choices["flag"].format_help())
+
+    def test_zsh_and_fish_completion_descriptions_match_host_contract(self):
+        for shell in ("zsh", "fish"):
+            script = self.remctl.get_completion_script(shell)
+            self.assertIn("Request signed-host Reminders and Automation access", script)
+            self.assertIn("Diagnose signed-host and effective access", script)
+            self.assertIn("Reopen the signed host Full Disk Access guide for repair", script)
+            self.assertIn("authoritative access.effective readiness", script)
+            self.assertIn("signed-host or direct read-only fallback", script)
+            self.assertNotIn("TCC guidance", script)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "AppKit helper requires macOS")
+class PermissionHelperTests(unittest.TestCase):
+    @staticmethod
+    def _create_host_app(root, host_binary, *, name="RemCTL Capability Host.app", sign=False):
+        app = Path(root) / name
+        executable = app / "Contents" / "MacOS" / "RemCTL Capability Host"
+        executable.parent.mkdir(parents=True)
+        shutil.copy2(host_binary, executable)
+        info = {
+            "CFBundleIdentifier": "net.macstories.remctl.capability-host",
+            "CFBundleExecutable": "RemCTL Capability Host",
+            "CFBundleName": "RemCTL Capability Host",
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleVersion": "1",
+        }
+        with (app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump(info, handle)
+        if sign:
+            identity = "-" if sign is True else str(sign)
+            subprocess.run(
+                ["/usr/bin/codesign", "--force", "--deep", "--sign", identity, str(app)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        return app
+
+    @classmethod
+    def setUpClass(cls):
+        swiftc = shutil.which("swiftc")
+        if swiftc is None or not Path("/usr/bin/codesign").exists():
+            raise unittest.SkipTest("swiftc or codesign is unavailable")
+        cls._temp_dir = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._temp_dir.name)
+        cls.source = Path(__file__).resolve().parents[1] / "remctl-permissions.swift"
+        cls.binary = cls.root / "remctl-permissions"
+        subprocess.run(
+            [
+                swiftc,
+                "-framework",
+                "AppKit",
+                "-framework",
+                "Foundation",
+                "-o",
+                str(cls.binary),
+                str(cls.source),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        host_source = cls.root / "signed-host.swift"
+        host_source.write_text("import Foundation\n")
+        host_binary = cls.root / "signed-host"
+        subprocess.run(
+            [swiftc, "-o", str(host_binary), str(host_source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cls.valid_app = cls._create_host_app(cls.root / "valid", host_binary, sign=True)
+        identities = subprocess.run(
+            ["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+        match = re.search(r'(?m)^\s*\d+\)\s+([0-9A-F]{40})\s+"Apple Development:', identities)
+        cls.development_identity = match.group(1) if match else None
+        cls.stable_app = (
+            cls._create_host_app(
+                cls.root / "stable",
+                host_binary,
+                sign=cls.development_identity,
+            )
+            if cls.development_identity
+            else None
+        )
+        cls.unsigned_app = cls._create_host_app(cls.root / "unsigned", host_binary)
+        cls.invalid_signature_app = cls._create_host_app(
+            cls.root / "invalid-signature", host_binary, sign=True
+        )
+        with (
+            cls.invalid_signature_app / "Contents" / "MacOS" / "RemCTL Capability Host"
+        ).open("ab") as executable:
+            executable.write(b"tampered")
+        cls.wrong_name_app = cls._create_host_app(
+            cls.root / "wrong-name", host_binary, name="Python.app", sign=True
+        )
+        cls.marker = cls.binary.parent / ".remctl-capability-host-app"
+        cls.identity_marker = cls.binary.parent / ".remctl-capability-host-signing-identity"
+
+    def setUp(self):
+        if self.marker.exists() or self.marker.is_symlink():
+            self.marker.unlink()
+        self.marker.write_text(f"{self.valid_app}\n")
+        self.marker.chmod(0o600)
+        self.identity_marker.write_text("0" * 40 + "\n")
+        self.identity_marker.chmod(0o600)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temp_dir.cleanup()
+
+    def _run_target(self, path, *, targets=1):
+        args = [str(self.binary)]
+        for _ in range(targets):
+            args.extend([
+                "--target",
+                "RemCTL Capability Host.app",
+                str(path),
+                "Signed host",
+            ])
+        args.append("--validate-only")
+        return subprocess.run(args, capture_output=True, text=True, timeout=5)
+
+    def test_direct_launch_without_target_fails_closed(self):
+        result = subprocess.run(
+            [str(self.binary)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("exactly one canonical", result.stderr)
+        self.assertIn("remctl permissions full-disk-access", result.stderr)
+        self.assertNotIn("/usr/bin/python3", result.stderr)
+        self.assertNotIn("process", result.stderr.lower())
+
+    def test_direct_launch_rejects_explicit_python_target(self):
+        result = subprocess.run(
+            [
+                str(self.binary),
+                "--target",
+                "Current Python interpreter",
+                "/usr/bin/python3",
+                "Caller access",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("RemCTL Capability Host.app", result.stderr)
+        self.assertNotIn("/usr/bin/python3", result.stderr)
+
+    def test_ad_hoc_signed_marker_target_fails_closed(self):
+        result = self._run_target(self.valid_app)
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("stable signing identity", result.stderr)
+
+    def test_matching_preserved_development_identity_passes_preflight(self):
+        if self.stable_app is None or self.development_identity is None:
+            self.skipTest("Apple Development signing identity is unavailable")
+        self.marker.write_text(f"{self.stable_app}\n")
+        self.identity_marker.write_text(f"{self.development_identity}\n")
+        result = self._run_target(self.stable_app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "valid\n")
+
+    def test_missing_preserved_identity_fails_closed(self):
+        self.identity_marker.unlink()
+        result = self._run_target(self.valid_app)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("preserved signing identity is missing or unsafe", result.stderr)
+
+    def test_unsafe_preserved_identity_marker_fails_closed(self):
+        self.identity_marker.chmod(0o666)
+        result = self._run_target(self.valid_app)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("preserved signing identity is missing or unsafe", result.stderr)
+
+    def test_multiple_targets_fail_closed(self):
+        result = self._run_target(self.valid_app, targets=2)
+        self.assertEqual(result.returncode, 64)
+
+    def test_wrong_named_signed_app_fails_closed(self):
+        self.marker.write_text(f"{self.wrong_name_app}\n")
+        result = self._run_target(self.wrong_name_app)
+        self.assertEqual(result.returncode, 64)
+
+    def test_same_basename_nonexistent_app_fails_closed(self):
+        missing = self.root / "missing" / "RemCTL Capability Host.app"
+        self.marker.write_text(f"{missing}\n")
+        result = self._run_target(missing)
+        self.assertEqual(result.returncode, 64)
+
+    def test_same_basename_unsigned_app_fails_closed(self):
+        self.marker.write_text(f"{self.unsigned_app}\n")
+        result = self._run_target(self.unsigned_app)
+        self.assertEqual(result.returncode, 64)
+
+    def test_same_basename_invalid_signature_fails_closed(self):
+        self.marker.write_text(f"{self.invalid_signature_app}\n")
+        result = self._run_target(self.invalid_signature_app)
+        self.assertEqual(result.returncode, 64)
+
+    def test_noncanonical_target_and_marker_fail_closed(self):
+        segment = self.valid_app.parent / "segment"
+        segment.mkdir(exist_ok=True)
+        noncanonical = segment / ".." / self.valid_app.name
+        self.marker.write_text(f"{noncanonical}\n")
+        result = self._run_target(noncanonical)
+        self.assertEqual(result.returncode, 64)
+
+    def test_symlink_target_fails_closed(self):
+        link_root = self.root / "symlink"
+        link_root.mkdir(exist_ok=True)
+        link = link_root / "RemCTL Capability Host.app"
+        if not link.exists():
+            link.symlink_to(self.valid_app, target_is_directory=True)
+        self.marker.write_text(f"{link}\n")
+        result = self._run_target(link)
+        self.assertEqual(result.returncode, 64)
+
+    def test_unsafe_marker_permissions_fail_closed(self):
+        self.marker.chmod(0o666)
+        result = self._run_target(self.valid_app)
+        self.assertEqual(result.returncode, 64)
+
+    def test_helper_source_has_no_implicit_python_target(self):
+        source = self.source.read_text()
+        self.assertNotIn("/usr/bin/python3", source)
+        self.assertNotIn("Grant Full Disk Access to the processes", source)
+        self.assertNotIn("Store readable", source)
+        self.assertNotIn("Access verified", source)
+        self.assertIn("Verify after restarting the signed host", source)
 
 
 class ImageFlagParsingTests(unittest.TestCase):

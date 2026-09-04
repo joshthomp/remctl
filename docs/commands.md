@@ -54,7 +54,7 @@ remctl edit 23880 --recurrence "weekly mon,wed"
 RemCTL keeps these states distinct:
 
 - priority is written with `-p high`, `-p medium`, or `-p low` and shown as `!!!`, `!!`, or `!`
-- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`, which write the real flag through Reminders automation and need the Automation permission
+- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`, which write the real flag through Reminders automation and need the signed Capability Host's Automation permission
 - macOS 26 urgent reminders are shown with `⏰` and listed with `urgent`
 - urgent is stored in private ReminderKit metadata; power users can opt into unsupported writes with `add --private --urgent` or `edit --private --urgent`
 - recurring reminders are shown with a `↻` badge and, in table output, a `Repeat` column
@@ -115,7 +115,7 @@ Use `--json` on subcommands when scripting. For tabular read commands (`today`, 
 
 ### Limited EventKit Read Fallback
 
-`--via-eventkit` is a limited read-only fallback for hosts that cannot get Full Disk Access. It is never the default and is supported only by:
+`--via-eventkit` is a limited read-only fallback that is never selected automatically and is supported only by:
 
 ```bash
 remctl show Work --via-eventkit
@@ -124,7 +124,7 @@ remctl today --via-eventkit --json
 remctl upcoming 14 --via-eventkit --json
 ```
 
-This mode uses EventKit through `remctl-bridge`, so it can return basic reminder fields without opening the Reminders SQLite database. It is not full RemCTL output. It does not support `--list-id`, table output, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, or exact numeric ID compatibility. When no list target is given, these reads are scoped to iCloud reminders.
+The flag does not change routing. In normal installed `auto` mode, the signed Capability Host performs the read through its sealed `remctl-bridge`; in explicit `direct` mode or a custom-store workflow, the caller performs it through the direct bridge. This can return basic reminder fields without opening the Reminders SQLite database, but it is not full RemCTL output. It does not support `--list-id`, table output, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, or exact numeric ID compatibility. When no list target is given, these reads are scoped to iCloud reminders.
 
 JSON output is a wrapper object, not the normal read-command array:
 
@@ -144,7 +144,7 @@ JSON output is a wrapper object, not the normal read-command array:
 }
 ```
 
-Treat `eventKitId` as display/readback data only. Never pass it to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any command that expects a RemCTL numeric `id`. If an automation needs chainable IDs or private Reminders metadata, fix Full Disk Access and use the normal read path.
+Treat `eventKitId` as display/readback data only. Never pass it to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any command that expects a RemCTL numeric `id`. Use the fallback only when the selected route lacks Full Disk Access and the task explicitly accepts limited fidelity. In normal `auto` mode, keep routing through the signed host; do not grant Full Disk Access to the caller.
 
 Date-only `add -d` inputs create all-day reminders instead of midnight timed reminders. This applies to forms such as `today`, `tomorrow`, `2026-06-01`, `+3d`, `in 2 weeks`, and `next friday`, and to natural-language date-only inputs parsed by `parsedatetime` such as `March 30` or `next week`; only inputs that resolve to a specific clock time remain timed reminders.
 
@@ -166,7 +166,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields. A subtask `due` given as a date without a time creates an all-day subtask, matching the parent's date-only behavior.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, reminder display ordering in ordinary lists and unsectioned custom smart lists, list appearance metadata, regular-list and custom-smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Built-in smart-list pinning is separately capability-gated and fails before saving when the host's generic fetch is unavailable. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, reminder display ordering in ordinary lists and unsectioned custom smart lists, list appearance metadata, regular-list and custom-smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Built-in smart-list pinning is separately capability-gated and fails before saving when the host's generic fetch is unavailable. Location alarms belong to the guarded `--private` command surface, but the write is EventKit-backed: `remctl-bridge` saves a structured-location alarm because the private ReminderKit mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts before creating or editing a reminder; rich subtask URLs follow the same rule. Non-private `--url` remains a notes fallback.
 
@@ -379,7 +379,14 @@ remctl export --list Shopping --format json > shopping.json
 remctl export --list-id 153 --format json > shopping.json
 remctl export --format csv > all-reminders.csv
 remctl import shopping.json
+remctl import - --json < shopping.json
 ```
+
+`import` accepts a JSON array from a file, or from piped, non-TTY standard input when the path is `-`. Standard input is limited to 8 MiB; `import -` from an interactive terminal fails before reading. Import supports only these input fields: required string `title`; optional string `list`, `notes`, `due` or `dueDate`, `priority`, `url`, `recurrence`, and `alarm`; and optional Boolean `flagged`. Other keys are ignored for compatibility. It creates ordinary reminders through the normal `add` path. It does not restore completion state, tags, sections, subtasks, attachments, assignments, urgent state, Early Reminders, location alarms, list metadata, or private rich-link attachments. Export JSON is therefore not a lossless backup format for re-import.
+
+RemCTL validates the complete array before its first write. An unreadable input, invalid JSON, or a non-array document creates nothing, exits 1, leaves stdout empty, and prints a plain `Error:` message on stderr even with `--json`. Once the array is decoded, an invalid supported field also creates nothing and exits 1; with `--json`, that field-validation failure is a structured `invalid_import` object on stderr with `created: 0`, `createdIds: []`, indexed `errors`, and `total`.
+
+After validation, items are created in array order. Each successful `--json` item immediately emits and flushes `imported index=N id=ID` on stderr; `ID` is the numeric ID when available, then the stable returned ID, or `unknown`. The displayed ID is control-character-safe and capped at 128 characters, so each progress line is bounded. Runtime failures do not emit a progress line. The final summary is exactly one JSON object on stdout: `status` is `completed` when every item succeeds or `partial` when a runtime write fails, with `created`, `createdIds`, indexed `errors`, and `total`. Full success exits 0. A partial import exits 1 and keeps the reminders already created; do not rerun the complete file blindly. Remove successful items or build a retry file from the reported failed indexes. Human output prints each successful title, reports each failure on stderr, and ends with the imported/error counts.
 
 ## Links
 
@@ -534,7 +541,7 @@ Each entry has this shape:
 }
 ```
 
-`path` is the sha512-verified on-disk file inside Reminders' group container. Agents can read that file directly — vision-capable models can open the image. For legacy attachments that were never downloaded to this Mac, `path` is `null` and `resolved` is `false`; treat those as unavailable rather than an error.
+In hosted output, `path` is host-verified metadata for the sha512-verified on-disk file inside Reminders' protected group container. It does not prove that the caller can open the file and does not justify granting Full Disk Access to Hermes, Codex, Python, Terminal, or another caller. Treat the path as verified metadata unless RemCTL delivers or renders the content through a supported command. For legacy attachments that were never downloaded to this Mac, `path` is `null` and `resolved` is `false`; treat those as unavailable rather than an error.
 
 ## Due Date Formats
 
@@ -559,39 +566,83 @@ If `-d/--due` is present and RemCTL cannot parse it, `add` and `edit` fail befor
 ## Setup Commands
 
 ```bash
+# First install: request and verify the signed host's permissions.
 remctl onboard
-remctl permissions full-disk-access
+
+# Only if onboarding says Full Disk Access is missing:
+# pause while the user adds the exact signed host in System Settings.
+# Only after that grant changes, restart the host:
+launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
+
+# After onboarding, and after the conditional restart above:
 remctl doctor
 remctl doctor --for-agent --json
-remctl setup --shell auto --doctor
+
+# Repair only: reopen the exact-host Full Disk Access guide if needed.
+remctl permissions full-disk-access
+
+# Other setup and routing diagnostics:
+REMCTL_CAPABILITY_HOST=force remctl stats --json
+REMCTL_CAPABILITY_HOST=direct remctl stats --json
+remctl setup --shell auto
 remctl completion zsh
 ```
 
-Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor --for-agent`, then adding the printed target in System Settings. Run `doctor` from the same terminal, app, or agent runner that will run the RemCTL write; `doctor` checks both direct database access and EventKit Reminders write authorization for that context.
+Use [installation.md](installation.md) for the first-run visual permission flow. `onboard` is the guided first-install command: it asks the signed host to request Reminders and Automation, verifies the permission state, and opens the exact-host Full Disk Access guide only when needed. If that guide opens, pause while the user adds only the app path it shows; the default is `~/Applications/RemCTL Capability Host.app`. Restart the host only after the Full Disk Access grant changes, then run `doctor`. If the guide does not open, skip both the manual Full Disk Access step and the restart.
 
-`doctor` reports the `remctl-private` protocol version alongside its path. After updating RemCTL you must rebuild the private helper; an outdated helper is flagged with a "re-run install.sh" message and `--private` writes fail until it is rebuilt.
+`permissions full-disk-access` is not a second required onboarding step. Use it only to reopen the same guide for inspection or repair. `onboard --json` still runs the host permission checks and reports their status, but does not open the Full Disk Access helper. `permissions full-disk-access --json` reports helper availability, the exact target, and host state without opening the helper or System Settings.
+
+On an unchanged existing installation, start with `doctor --for-agent --json`. For an upgrade, run `./install.sh` first so the signed host and sealed helpers are updated, then run `doctor --for-agent --json`. In either case, rerun `onboard` only if doctor reports a host permission problem, and reopen the Full Disk Access guide only when that repair requires it. Normal installed callers share the signed host's Full Disk Access, Reminders, and Automation grants; Terminal, Hermes, Codex, and other runners do not need separate grants.
+
+`doctor --for-agent --json` reports direct access separately from effective access. For normal automation, use `access.effective.route`, `access.effective.ready`, and `capabilityHost.fullReady` as the readiness gate. A failed direct check is expected when the effective route is the fully ready Capability Host. `force` is a useful installed-host smoke test. `direct` bypasses the host and is only for diagnostics, development, and custom-store work.
+
+For hosted `auto` execution, `doctor --for-agent --json` reports private-helper readiness under `capabilityHost.privateProtocol.compatible`; use that field with `capabilityHost.fullReady`. The direct `private_helper` check and its path apply only to explicit direct diagnostics. After updating RemCTL, rerun `install.sh` when the hosted protocol is incompatible or a deliberate direct helper is outdated.
 
 `doctor` also checks whether an installed zsh completion file appears in exported `FPATH` or the usual zsh startup files. If it warns, add the printed `fpath=(... $fpath)` and `compinit` lines to `~/.zshrc`, then open a new terminal.
 
 ## Agent Fast Path
 
-For task creation, agents should avoid setup checks once the context is known-good:
+For task creation, agents should avoid setup checks once the effective Capability Host route is known-good. All normal permission-bearing commands use `auto` routing, so agents do not need their own macOS TCC grants:
 
 ```bash
 remctl add "Title" -l Projects --private --section "Section" -d "2026-05-12 15:00" --url "https://example.com" --json
 remctl info <numericId> --json
 ```
 
-`add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks. Attachment entries include a sha512-verified `path` to the local file (or `path: null` with `resolved: false` for legacy attachments not downloaded on this Mac); list-command JSON carries the same `attachments` array for parent reminders. See [Inline Images](#inline-images) and [Attachments in JSON](#attachments-in-json).
+`add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks. Attachment entries include a host-resolved, sha512-verified `path` (or `path: null` with `resolved: false` for legacy attachments not downloaded on this Mac); the path is metadata, not proof that the caller can open the protected file, and callers must not receive Full Disk Access to compensate. List-command JSON carries the same `attachments` array for parent reminders. See [Inline Images](#inline-images) and [Attachments in JSON](#attachments-in-json).
 
 If a `--private` write partially fails after the reminder already exists, `add --json` returns `{"status":"partial", ...}` (text mode prints an explicit "Do NOT re-run add" line) carrying the created `numericId`. Re-run `edit` on that ID to finish the remaining metadata; do not re-run `add`, which would duplicate the reminder.
 
-If `flag` or `unflag` fails, RemCTL exits 1 with `code: "applescript_flag_failed"` on stderr and the flag is unchanged; nothing else was written. Grant the Automation permission for the running context, or set the flag with `edit <id> --private --flagged` / `--no-flagged`. `add --flag --json` returning `status: "created"` with a `warnings` entry `flag_not_set: ...` means the reminder exists but is not flagged — do not re-run `add`; set the flag on the returned `numericId`.
+If `flag` or `unflag` fails, RemCTL exits 1 with `code: "applescript_flag_failed"` on stderr and the flag is unchanged; nothing else was written. Grant Automation permission to `RemCTL Capability Host.app`, or set the flag with `edit <id> --private --flagged` / `--no-flagged`. `add --flag --json` returning `status: "created"` with a `warnings` entry `flag_not_set: ...` means the reminder exists but is not flagged — do not re-run `add`; set the flag on the returned `numericId`.
 
-Agents must not use `--via-eventkit` by default. It is a limited read-only fallback only for `show`, `search`, `today`, and `upcoming` when Full Disk Access blocks a basic read and the task does not need chainable IDs or private metadata. Its `eventKitId` values are not RemCTL numeric IDs and must not be used with `info`, `edit`, `done`, `delete`, `link`, `open`, or `subtasks`.
+Agents must not use `--via-eventkit` by default. The flag never changes routing: normal `auto` mode runs it inside the signed host, while explicit direct or custom-store execution runs it in the caller. Use the fallback only for `show`, `search`, `today`, and `upcoming` when the selected route lacks Full Disk Access and the task does not need chainable IDs or private metadata. Its `eventKitId` values are not RemCTL numeric IDs and must not be used with `info`, `edit`, `done`, `delete`, `link`, `open`, or `subtasks`.
 
 If an agent supplies an invalid due date, RemCTL creates nothing and exits with a structured `invalid_due_date` error on stderr. Retry the same `add` command with one of the provided examples, using `YYYY-MM-DD` for all-day reminders or `YYYY-MM-DD HH:MM` for timed reminders; do not create first and patch the due date afterward.
 
 For Groceries automation, detect eligible lists with `remctl lists --json` and `listType == "groceries"`. After `add --private --grocery`, verify with `remctl show <list> --json` and check that the reminder has a non-empty `section` once categorization completes.
 
-For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed. Custom smart-list pin coverage includes name and numeric-ID targeting, idempotent pinning, the current and protocol-1 payload shapes, `pinnedDate` transitions, filter/identity preservation, built-in isolation, and cleanup readback.
+For live release verification of the installed signed generation, require hosted execution and point the matrix at the installed CLI:
+
+```bash
+REMCTL_CAPABILITY_HOST=force \
+python3 scripts/live_private_matrix.py --remctl "$HOME/bin/remctl"
+```
+
+This verifies the helpers sealed into the published Capability Host. Caller-side helper overrides do not affect this mode.
+
+To verify freshly compiled source helpers instead, use explicit direct routing and provide the exact build outputs:
+
+```bash
+REMCTL_CAPABILITY_HOST=direct \
+REMCTL_BRIDGE_PATH=/absolute/path/to/source-built/remctl-bridge \
+REMCTL_PRIVATE_PATH=/absolute/path/to/source-built/remctl-private \
+python3 scripts/live_private_matrix.py --remctl "$PWD/remctl"
+```
+
+Do not omit `REMCTL_CAPABILITY_HOST=direct` from a source-helper test. The default `auto` route can select the installed host and silently test its sealed helpers instead of the source-built files.
+
+The matrix creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed. Custom smart-list pin coverage includes name and numeric-ID targeting, idempotent pinning, the current and protocol-1 payload shapes, `pinnedDate` transitions, filter/identity preservation, built-in isolation, and cleanup readback.
+
+Smart-list cleanup does not accept one empty snapshot as final. After normal cleanup, the matrix polls local `smart-lists --json` output every 5 seconds and requires 120 continuous seconds with no uniquely prefixed disposable smart list, within a 300-second total cap. If a matching smart list reappears, the empty timer resets and the matrix deletes that exact current numeric `--smart-list-id` before it resumes polling. The matrix fails if a targeted delete fails or the sustained-empty window is not reached before the cap. `--keep` skips cleanup inventory, retries, and settle waits.
+
+This proves only a bounded, sustained-empty readback from the local Reminders store used by that matrix run. It does not prove that deletion has converged through iCloud to every other device. A matching disposable smart list reappearing after an earlier empty snapshot is an observed state change; the matrix does not assign it to CloudKit, ReminderKit, or another native cause.

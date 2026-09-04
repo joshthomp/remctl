@@ -35,7 +35,18 @@ class CommandResult:
 
 
 class LiveMatrix:
-    def __init__(self, remctl: str, prefix: str, keep: bool = False):
+    def __init__(
+        self,
+        remctl: str,
+        prefix: str,
+        keep: bool = False,
+        *,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+        cleanup_quiet_seconds: float = 120,
+        cleanup_poll_seconds: float = 5,
+        cleanup_max_seconds: float = 300,
+    ):
         self.remctl = remctl
         self.prefix = prefix
         self.keep = keep
@@ -45,9 +56,15 @@ class LiveMatrix:
         self.results: list[dict] = []
         self.created_lists: set[str] = set()
         self.created_smart_lists: set[str] = set()
+        self.created_smart_list_ids: dict[int, str] = {}
         self.created_templates: set[str] = set()
         self.created_reminders: set[int] = set()
         self.private_capabilities: dict = {}
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.cleanup_quiet_seconds = cleanup_quiet_seconds
+        self.cleanup_poll_seconds = cleanup_poll_seconds
+        self.cleanup_max_seconds = cleanup_max_seconds
 
     def close(self):
         self.tmpdir.cleanup()
@@ -93,14 +110,14 @@ class LiveMatrix:
             last = fn()
             if last:
                 return last
-            time.sleep(delay)
+            self.sleep(delay)
         return last
 
     def retry_absent(self, fn, *, attempts: int = 30, delay: float = 0.25) -> bool:
         for _ in range(attempts):
             if not fn():
                 return True
-            time.sleep(delay)
+            self.sleep(delay)
         return False
 
     def lists(self) -> list[dict]:
@@ -114,6 +131,25 @@ class LiveMatrix:
 
     def smart_named(self, name: str) -> dict | None:
         return next((item for item in self.smart_lists() if item.get("name") == name), None)
+
+    def prefixed_custom_smart_lists(self) -> list[dict]:
+        return [
+            item for item in self.smart_lists()
+            if item.get("kind") == "custom"
+            and item.get("id") is not None
+            and isinstance(item.get("name"), str)
+            and item["name"].startswith(self.prefix)
+        ]
+
+    def remember_smart_list_identity(self, item: dict) -> bool:
+        smart_list_id = int(item["id"])
+        current_uuid = str(item.get("objectUUID") or "")
+        expected_uuid = self.created_smart_list_ids.get(smart_list_id)
+        if expected_uuid and expected_uuid != current_uuid:
+            return False
+        if expected_uuid is None or (not expected_uuid and current_uuid):
+            self.created_smart_list_ids[smart_list_id] = current_uuid
+        return True
 
     def templates(self) -> list[dict]:
         return self.json_command(["templates", "--json"])
@@ -182,6 +218,8 @@ class LiveMatrix:
         found = self.retry(lambda: self.smart_named(name))
         if not found:
             raise AssertionError(f"Smart list did not appear: {name}")
+        if found.get("id") is not None:
+            self.created_smart_list_ids[int(found["id"])] = str(found.get("objectUUID") or "")
         return found
 
     def assert_true(self, condition: bool, message: str):
@@ -344,7 +382,7 @@ class LiveMatrix:
             )
             self.assert_true(bool(categorized_row), "direct grocery selector did not persist a section")
             self.record(
-                "direct grocery selector dispatch",
+                "standalone helper: direct grocery selector dispatch",
                 "passed",
                 f"{expected_selector} -> {categorized_row['section']}",
             )
@@ -578,6 +616,7 @@ class LiveMatrix:
         })
         self.assert_true(legacy_pin.get("pinned") is True, "legacy custom smart-list pin result is wrong")
         assert_pin_state(True, "legacy payload custom smart-list pin")
+        self.record("standalone helper: protocol-1 pin payload", "passed", str(smart_id))
 
         legacy_unpin = self.private_helper_json({
             "action": "set_smart_list_pinned",
@@ -586,6 +625,7 @@ class LiveMatrix:
         })
         self.assert_true(legacy_unpin.get("pinned") is False, "legacy custom smart-list unpin result is wrong")
         assert_pin_state(False, "legacy payload custom smart-list unpin")
+        self.record("standalone helper: protocol-1 unpin payload", "passed", str(smart_id))
 
         built_in_after = {
             item["id"]: (item.get("pinned"), item.get("pinnedDate"))
@@ -683,6 +723,9 @@ class LiveMatrix:
                 and isinstance(item.get("name"), str)
                 and item["name"].startswith(self.prefix)
             )
+            for item in self.prefixed_custom_smart_lists():
+                if not self.remember_smart_list_identity(item):
+                    issues.append(f"smart-list id {item['id']} changed UUID before cleanup")
             self.created_lists.update(
                 item["title"]
                 for item in self.lists()
@@ -707,14 +750,25 @@ class LiveMatrix:
                         issues.append(f"template delete failed for {name}: {result.stderr or result.stdout}")
             except Exception as exc:
                 issues.append(f"template cleanup failed for {name}: {exc}")
-        for name in sorted(self.created_smart_lists, reverse=True):
+        for smart_list_id in sorted(self.created_smart_list_ids, reverse=True):
             try:
-                if self.smart_named(name):
-                    result = self.command(["smart-list-delete", name, "--private", "--force", "--json"], expect=None)
-                    if result.returncode != 0:
-                        issues.append(f"smart-list delete failed for {name}: {result.stderr or result.stdout}")
+                current = next(
+                    (item for item in self.prefixed_custom_smart_lists() if int(item["id"]) == smart_list_id),
+                    None,
+                )
+                if current is None:
+                    continue
+                if not self.remember_smart_list_identity(current):
+                    issues.append(f"smart-list id {smart_list_id} changed UUID before delete")
+                    continue
+                result = self.command([
+                    "smart-list-delete", "--smart-list-id", str(smart_list_id),
+                    "--private", "--force", "--json",
+                ], expect=None)
+                if result.returncode != 0 and "not found" not in (result.stderr + result.stdout).lower():
+                    issues.append(f"smart-list delete failed for id {smart_list_id}: {result.stderr or result.stdout}")
             except Exception as exc:
-                issues.append(f"smart-list cleanup failed for {name}: {exc}")
+                issues.append(f"smart-list cleanup failed for id {smart_list_id}: {exc}")
         for rid in sorted(self.created_reminders, reverse=True):
             try:
                 result = self.command(["delete", str(rid), "--force", "--json"], expect=None)
@@ -739,10 +793,6 @@ class LiveMatrix:
                         for item in self.templates()
                     )
                     or any(
-                        isinstance(item.get("name"), str) and item["name"].startswith(self.prefix)
-                        for item in self.smart_lists()
-                    )
-                    or any(
                         isinstance(item.get("title"), str) and item["title"].startswith(self.prefix)
                         for item in self.lists()
                     )
@@ -757,20 +807,101 @@ class LiveMatrix:
         except Exception as exc:
             issues.append(f"cleanup readback failed: {exc}")
 
+        # Cloud-backed creates can reappear after one empty local snapshot. Require
+        # a sustained empty window and delete only exact numeric IDs discovered
+        # under this run's unique prefix if they return.
+        try:
+            started = self.monotonic()
+            empty_since = None
+            while True:
+                matching = self.prefixed_custom_smart_lists()
+                now = self.monotonic()
+                if matching:
+                    empty_since = None
+                    for item in matching:
+                        smart_list_id = int(item["id"])
+                        if not self.remember_smart_list_identity(item):
+                            issues.append(f"smart-list id {smart_list_id} changed UUID after delete")
+                            break
+                        result = self.command([
+                            "smart-list-delete", "--smart-list-id", str(smart_list_id),
+                            "--private", "--force", "--json",
+                        ], expect=None)
+                        if result.returncode != 0 and "not found" not in (result.stderr + result.stdout).lower():
+                            issues.append(
+                                f"reappeared smart-list delete failed for id {smart_list_id}: "
+                                f"{result.stderr or result.stdout}"
+                            )
+                            break
+                elif empty_since is None:
+                    empty_since = now
+                elif now - empty_since >= self.cleanup_quiet_seconds:
+                    break
+
+                if issues or now - started >= self.cleanup_max_seconds:
+                    if not issues:
+                        issues.append(
+                            "smart-list cleanup never reached a sustained empty local readback "
+                            f"for {self.cleanup_quiet_seconds:g}s within {self.cleanup_max_seconds:g}s"
+                        )
+                    break
+                self.sleep(self.cleanup_poll_seconds)
+        except Exception as exc:
+            issues.append(f"sustained smart-list cleanup readback failed: {exc}")
+
+        try:
+            final_leftovers = []
+            final_leftovers.extend(
+                f"template {item['name']}" for item in self.templates()
+                if isinstance(item.get("name"), str) and item["name"].startswith(self.prefix)
+            )
+            final_leftovers.extend(
+                f"smart-list {item['name']}" for item in self.prefixed_custom_smart_lists()
+            )
+            final_leftovers.extend(
+                f"list {item['title']}" for item in self.lists()
+                if isinstance(item.get("title"), str) and item["title"].startswith(self.prefix)
+            )
+            final_leftovers.extend(
+                f"reminder {item['title']}"
+                for item in self.json_command(["search", self.prefix, "--completed", "--json"])
+                if isinstance(item.get("title"), str) and item["title"].startswith(self.prefix)
+            )
+            if final_leftovers:
+                issues.append("final prefix inventory is not empty: " + ", ".join(final_leftovers))
+        except Exception as exc:
+            issues.append(f"final cleanup inventory failed: {exc}")
+
         if issues:
             raise AssertionError("; ".join(issues))
-        self.record("cleanup readback", "passed", "no prefix-matched data remains")
+        self.record(
+            "cleanup readback",
+            "passed",
+            f"smart lists remained absent for {self.cleanup_quiet_seconds:g}s locally; final prefix inventory was empty",
+        )
 
     def run(self):
         doctor = self.json_command(["doctor", "--for-agent", "--json"])
         checks = {item["name"]: item["status"] for item in doctor.get("checks", [])}
         self.assert_true(checks.get("private_helper") == "ok", "private helper is not available")
-        self.record("doctor private helper", "passed", "ok")
+        effective_route = doctor.get("access", {}).get("effective", {}).get("route", "unknown")
+        requested_mode = os.environ.get("REMCTL_CAPABILITY_HOST", "auto")
+        if requested_mode.strip().lower() == "force":
+            self.assert_true(
+                effective_route == "capabilityHost",
+                f"force mode did not select the Capability Host (effective route: {effective_route})",
+            )
+        self.record(
+            "CLI execution route",
+            "passed",
+            f"requested={requested_mode}; effective={effective_route}",
+        )
+        self.record("CLI doctor private helper", "passed", "ok")
         self.private_capabilities = self.private_helper_json({"action": "capabilities"})
         self.assert_true(self.private_capabilities.get("status") == "ok", "private capability probe failed")
         self.assert_true(self.private_capabilities.get("saveCalled") is False, "capability probe must not save")
         self.record(
-            "private helper capability probe",
+            "standalone helper: read-only capability probe",
             "passed",
             self.private_capabilities.get("operatingSystemVersion", "unknown OS"),
         )

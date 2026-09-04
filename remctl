@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.7.1
+"""remctl — Power-user Reminders CLI v1.8.0
 
-Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
-attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
-with AppleScript fallback. Zero Python dependencies with small shared helpers.
+Normal installed commands run through the signed RemCTL Capability Host, which
+owns database, Reminders, and Automation access. The client supports Python
+3.10+ and has zero third-party dependencies.
 """
 
-import argparse, base64, csv, hashlib, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+import argparse, base64, contextlib, csv, hashlib, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+
+import remctl_broker
 
 CLI_NAME = os.path.basename(sys.argv[0])
 from datetime import datetime, timedelta
@@ -21,6 +23,8 @@ from remctl_images import (
     resolve_attachment_file,
 )
 from remctl_runtime import (
+    CAPABILITY_HOST_ACTIVE_ENV,
+    LOCAL_COMMANDS,
     due_today_window,
     env_bool,
     is_safe_remote_url,
@@ -55,7 +59,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 PRIVATE_PROTOCOL_VERSION = 2
 _private_protocol_probe = None
 
@@ -70,7 +74,7 @@ PERMISSIONS_PATH = resolve_binary_path(__file__, "remctl-permissions", "REMCTL_P
 CONFIG_DIR = resolve_config_dir("remctl")
 ONBOARD_STATE_FILE = CONFIG_DIR / "onboard-state.json"
 AUTO_ONBOARD_SKIP_ENV = "REMCTL_SKIP_ONBOARD"
-AUTO_ONBOARD_SKIP_COMMANDS = {"completion", "doctor", "onboard", "permissions", "setup"}
+AUTO_ONBOARD_SKIP_COMMANDS = set(LOCAL_COMMANDS)
 FULL_DISK_ACCESS_SETTINGS_URLS = [
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles",
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
@@ -100,6 +104,37 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefau
 
 class RemindersDBUnavailable(RuntimeError):
     """Raised when the local Reminders CoreData store is unavailable."""
+
+
+def stdout_is_interactive():
+    """Honor broker-validated TTY state only inside the sealed host child."""
+
+    try:
+        if sys.stdout.isatty():
+            return True
+    except (AttributeError, OSError):
+        pass
+    return bool(
+        os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1"
+        and os.environ.get("REMCTL_CAPABILITY_STDOUT_TTY") == "1"
+    )
+
+
+def terminal_columns(default):
+    """Return direct or broker-validated terminal width."""
+
+    if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1":
+        raw_columns = os.environ.get("REMCTL_CAPABILITY_COLUMNS", "")
+        try:
+            columns = int(raw_columns)
+        except ValueError:
+            columns = 0
+        if 20 <= columns <= 1000:
+            return columns
+    try:
+        return os.get_terminal_size().columns
+    except (ValueError, OSError):
+        return default
 
 
 # ── Color System ─────────────────────────────────────────────────────────────
@@ -211,17 +246,28 @@ def show_splash():
     print(C.dim("    templates   Saved templates              template-info Inspect template"))
     print(C.dim("    sections    Inspect sections             section-*   Manage sections"))
     print()
+    print(C.dim("  Protected commands use the signed RemCTL Capability Host."))
+    print(C.dim("  First setup: remctl onboard   Diagnose or repair: remctl doctor --for-agent"))
+    print(C.dim("  Reopen FDA guide: remctl permissions full-disk-access"))
+    print()
     print(C.dim(f"  {CLI_NAME} --help for full command reference"))
     print()
+    sys.stdout.flush()
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
 def reminders_store_access_error():
     if STORE_DIR.exists() and not os.access(STORE_DIR, os.R_OK):
+        if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1":
+            return (
+                f"The signed RemCTL Capability Host cannot read the Reminders store at {STORE_DIR}. "
+                "Grant Full Disk Access only to the signed RemCTL Capability Host, restart it, "
+                "then rerun `remctl doctor --for-agent`."
+            )
         return (
-            f"Direct CLI reads are blocked because the Reminders store at {STORE_DIR} "
-            f"is not readable from this process context ({sys.executable}). This usually means "
-            "Full Disk Access is missing for the app or interpreter that is running remctl here."
+            f"Direct access to the Reminders store at {STORE_DIR} is blocked for this caller. "
+            "Normal automatic mode uses the signed RemCTL Capability Host instead of caller permissions. "
+            "Run `remctl onboard`, then `remctl doctor --for-agent` to verify effective access."
         )
     return None
 
@@ -3203,7 +3249,7 @@ def _image_render_enabled(a):
     if not C.enabled:
         return False
     # REMCTL_IMAGES_FORCE bypasses ONLY the isatty check (test-only escape hatch).
-    if not sys.stdout.isatty() and not env_bool("REMCTL_IMAGES_FORCE"):
+    if not stdout_is_interactive() and not env_bool("REMCTL_IMAGES_FORCE"):
         return False
     return True
 
@@ -3217,10 +3263,7 @@ def _default_image_width(mode=None):
     when the terminal size can't be determined.
     """
     cap = 64 if mode == "halfblock" else 100
-    try:
-        cols = os.get_terminal_size().columns
-    except OSError:
-        return 48
+    cols = terminal_columns(120)
     return max(24, min(cap, int(cols * 0.4)))
 
 
@@ -3315,10 +3358,7 @@ def fmt_table(rows_data, max_width=None, *, date_mode="due", include_list=True, 
     if not rows_data:
         return ""
     if max_width is None:
-        try:
-            max_width = os.get_terminal_size().columns
-        except (ValueError, OSError):
-            max_width = 80
+        max_width = terminal_columns(80)
 
     if columns is None:
         date_key, date_label = ("completed", "Completed") if date_mode == "completed" else ("due", "Due")
@@ -3631,15 +3671,18 @@ def bridge_failure_is_execution_error(result):
 
 
 def eventkit_access_fix_text(*, rerun_command="remctl doctor --for-agent"):
-    context = doctor_execution_context()
-    effective_context = context.get("effective_context") or "this runner"
-    host_app = context.get("host_app") or "the app or terminal launching remctl"
+    if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1":
+        return "\n".join([
+            "Reminders access is blocked for the signed RemCTL Capability Host.",
+            "Run `remctl onboard` to request Reminders access for that host.",
+            f"Then rerun `{rerun_command}` before writing.",
+            "Do not grant Reminders access to Terminal, Python, Hermes, or Codex for hosted execution.",
+        ])
     return "\n".join([
-        f"EventKit writes are blocked in the current process context: {effective_context}.",
-        f"Host app: {host_app}.",
-        "Run `remctl onboard` from this same context so macOS can grant Reminders access.",
-        f"Then rerun `{rerun_command}` from the same context before writing.",
-        "If the same command works in Terminal but fails here, Terminal's permission grant does not carry over to this app or agent runner.",
+        "Direct mode bypasses the signed RemCTL Capability Host, so Reminders access is caller-scoped and self-managed.",
+        "Use automatic mode and run `remctl onboard` to request Reminders access for the signed host.",
+        f"Then rerun `{rerun_command}` before writing.",
+        "If you deliberately remain in direct mode, manage that caller's Reminders access yourself.",
     ])
 
 
@@ -5742,6 +5785,131 @@ def doctor_execution_context():
     }
 
 
+def capability_host_status_snapshot():
+    """Return a diagnostic host snapshot even if an older transport raises."""
+
+    try:
+        status = remctl_broker.status(timeout=10)
+    except remctl_broker.CapabilityHostError as exc:
+        return {
+            "status": "error",
+            "installed": False,
+            "available": False,
+            "ready": False,
+            "fullReady": False,
+            "protocolVersion": None,
+            "expectedProtocolVersion": getattr(remctl_broker, "PROTOCOL_VERSION", None),
+            "scope": None,
+            "socket": None,
+            "launchAgent": None,
+            "app": None,
+            "permissions": None,
+            "commandScope": None,
+            "error": {"code": getattr(exc, "code", "capability_host_error"), "message": str(exc)},
+        }
+    return status if isinstance(status, dict) else {
+        "status": "error",
+        "installed": False,
+        "available": False,
+        "ready": False,
+        "fullReady": False,
+        "error": {"code": "invalid_host_status", "message": "Capability Host returned an invalid status."},
+    }
+
+
+def capability_host_requested_mode():
+    try:
+        return remctl_broker.mode()
+    except (ValueError, remctl_broker.CapabilityHostError):
+        return "invalid"
+
+
+def capability_host_install_marker_path():
+    return (
+        current_permissions_path().resolve(strict=True).parent
+        / ".remctl-capability-host-app"
+    )
+
+
+def capability_host_is_effective(status):
+    mode = capability_host_requested_mode()
+    if mode == "direct":
+        return False
+    return bool(
+        mode == "force"
+        or status.get("installed")
+        or status.get("available")
+    )
+
+
+def capability_host_target_specs(status=None):
+    snapshot = status or capability_host_status_snapshot()
+    app = snapshot.get("app") if isinstance(snapshot.get("app"), dict) else {}
+    app_path_text = app.get("path")
+    signature = app.get("signature") if isinstance(app.get("signature"), dict) else {}
+    if (
+        snapshot.get("installed") is not True
+        or app.get("installed") is not True
+        or not isinstance(app_path_text, str)
+        or not app_path_text
+        or app.get("bundleIdentifier") != remctl_broker.BUNDLE_IDENTIFIER
+        or signature.get("valid") is not True
+        or signature.get("identifier") != remctl_broker.BUNDLE_IDENTIFIER
+        or not isinstance(signature.get("teamID"), str)
+        or not signature.get("teamID")
+        or signature.get("teamID") == "not set"
+        or not isinstance(signature.get("cdhash"), str)
+        or not signature.get("cdhash")
+        or not isinstance(signature.get("designatedRequirement"), str)
+        or not signature.get("designatedRequirement")
+    ):
+        return []
+    app_path = Path(app_path_text)
+    if (
+        not app_path.is_absolute()
+        or app_path_text != str(app_path)
+        or app_path.name != "RemCTL Capability Host.app"
+        or app_path.is_symlink()
+        or not app_path.is_dir()
+    ):
+        return []
+    try:
+        if app_path.resolve(strict=True) != app_path:
+            return []
+    except OSError:
+        return []
+    try:
+        marker_path = capability_host_install_marker_path()
+    except OSError:
+        return []
+    installed_path = remctl_broker._installed_path_marker(
+        marker_path,
+        expected_name="RemCTL Capability Host.app",
+    )
+    if installed_path != app_path:
+        return []
+    return [{
+        "title": "RemCTL Capability Host.app",
+        "path": app_path_text,
+        "subtitle": (
+            "The signed RemCTL host is the only Full Disk Access target needed by "
+            "Terminal, Hermes, Codex, and other callers."
+        ),
+    }]
+
+
+def capability_host_full_disk_access_fix(status):
+    targets = capability_host_target_specs(status)
+    if not targets:
+        return "Reinstall the RemCTL Capability Host, then rerun `remctl onboard`."
+    path = targets[0]["path"]
+    return (
+        "Open System Settings > Privacy & Security > Full Disk Access and add only "
+        f"the signed RemCTL Capability Host: {path}. Then restart the host and rerun "
+        "`remctl doctor --for-agent`."
+    )
+
+
 def find_app_bundle(app_name):
     if not app_name:
         return None
@@ -5772,92 +5940,20 @@ def find_app_bundle(app_name):
     return None
 
 
-def _add_permission_target(targets, seen, title, path, subtitle):
-    if not path:
-        return
-    path = str(Path(path).expanduser().resolve(strict=False))
-    key = path.lower()
-    if key in seen:
-        return
-    seen.add(key)
-    targets.append({"title": title, "path": path, "subtitle": subtitle})
-
-
-def full_disk_access_target_specs(*, include_cli=True):
-    targets = []
-    seen = set()
-    if include_cli:
-        context = doctor_execution_context()
-        _add_permission_target(
-            targets,
-            seen,
-            "Current Python interpreter",
-            sys.executable,
-            "Required when direct CLI reads cannot see the Reminders database.",
-        )
-        host_app = context.get("host_app")
-        host_path_value = context.get("host_app_path")
-        host_path = Path(host_path_value) if host_path_value else (
-            find_app_bundle(host_app) if host_app and host_app.endswith(".app") else None
-        )
-        if host_path:
-            _add_permission_target(
-                targets,
-                seen,
-                host_app,
-                host_path,
-                "Required when this host app launches remctl or an agent runner.",
-            )
-        terminal_name = detect_terminal_app_name()
-        skip_terminal = (
-            terminal_name == "Ghostty.app"
-            and host_path is not None
-            and host_app
-            and host_app != terminal_name
-        )
-        terminal_path = None if skip_terminal else (find_app_bundle(terminal_name) if terminal_name else None)
-        if terminal_path:
-            _add_permission_target(
-                targets,
-                seen,
-                terminal_name,
-                terminal_path,
-                "Alternative target for direct CLI reads from this terminal app.",
-            )
-    return targets
-
-
-def full_disk_access_targets():
-    specs = full_disk_access_target_specs(include_cli=True)
-    targets = [f"{spec['title']}: {spec['path']}" for spec in specs]
-    if not any(spec["title"].endswith(".app") for spec in specs):
-        terminal_name = detect_terminal_app_name()
-        if terminal_name:
-            targets.append(f"{terminal_name} (recommended for CLI use)")
-        else:
-            targets.append("the terminal app that is running remctl (recommended for CLI use)")
-    return targets
-
-
 def full_disk_access_fix_text(*, rerun_command="remctl doctor", mention_onboard=False):
-    targets = full_disk_access_targets()
-    context = doctor_execution_context()
-    effective_context = context.get("effective_context") or "this runner"
-    if mention_onboard:
-        intro = "`remctl onboard` can open a guided permission helper, but macOS still requires you to add the access target manually."
-    else:
-        intro = "Full Disk Access is missing for this process context; macOS cannot grant it from the command line."
-    parts = [
-        intro,
-        f"Current execution context: {effective_context} ({sys.executable}).",
-        "A green `remctl doctor` in Terminal does not grant access to a separate agent or app runner.",
-        "For the guided flow, run: remctl permissions full-disk-access",
-        "Open System Settings > Privacy & Security > Full Disk Access and add:",
-        *[f"  {target}" for target in targets],
-        "Tip: click +, press Command-Shift-G, paste the path, press Return, then click Open.",
-        f"Then relaunch the app or terminal that will run remctl and rerun `{rerun_command}` from that same context.",
-    ]
-    return "\n".join(parts)
+    mode = capability_host_requested_mode()
+    if mode == "direct":
+        return "\n".join([
+            "Direct mode bypasses the signed RemCTL Capability Host, so Full Disk Access is caller-scoped and self-managed.",
+            "The normal RemCTL permission helper does not configure direct callers.",
+            f"Manage the deliberate direct caller yourself, then rerun `{rerun_command}`.",
+        ])
+    return "\n".join([
+        "The signed RemCTL Capability Host is unavailable, so effective Full Disk Access is not ready.",
+        "Reinstall RemCTL to restore the exact signed host, then run `remctl onboard`.",
+        "Use `remctl permissions full-disk-access` to add only that host in System Settings.",
+        f"After adding or changing Full Disk Access, restart the signed host, then rerun `{rerun_command}`.",
+    ])
 
 
 def copy_to_clipboard(text):
@@ -5890,26 +5986,24 @@ def open_full_disk_access_settings():
     return False
 
 
-def print_full_disk_access_guidance(*, settings_opened=False, rerun_command="remctl doctor"):
-    clipboard_target = str(current_python_path())
-    copied = copy_to_clipboard(clipboard_target)
-    context = doctor_execution_context()
+def print_capability_host_full_disk_access_guidance(status, *, settings_opened=False):
+    targets = capability_host_target_specs(status)
+    path = targets[0]["path"] if targets else None
+    copied = bool(path and copy_to_clipboard(path))
     print()
     print(C.bold("Full Disk Access"))
     if settings_opened:
         print(C.dim("  Opened System Settings > Privacy & Security > Full Disk Access."))
     else:
         print(C.dim("  Open System Settings > Privacy & Security > Full Disk Access."))
-    print(C.dim("  macOS requires you to add the access target manually for this process context."))
-    print(C.dim(f"  Current context: {context.get('effective_context') or 'unknown'} ({sys.executable})"))
-    for target in full_disk_access_targets():
-        print(C.dim(f"  Add: {target}"))
-    if copied:
-        print(C.dim(f"  Copied path to clipboard: {clipboard_target}"))
+    if path:
+        print(C.dim(f"  Add only the signed RemCTL Capability Host: {path}"))
+        if copied:
+            print(C.dim(f"  Copied path to clipboard: {path}"))
+        print(C.dim("  Do not add Hermes, Python, Codex, or Terminal for hosted RemCTL access."))
     else:
-        print(C.dim(f"  Copy this path if you need the file picker: {clipboard_target}"))
-    print(C.dim("  In the file picker, press Command-Shift-G, paste the path, press Return, then click Open."))
-    print(C.dim(f"  Then relaunch the app or terminal that will run remctl and rerun `{rerun_command}`."))
+        print(C.dim("  Reinstall the RemCTL Capability Host before granting access."))
+    print(C.dim("  If you changed Full Disk Access, restart the host, then rerun `remctl doctor --for-agent`."))
 
 
 def permission_helper_available():
@@ -5917,24 +6011,31 @@ def permission_helper_available():
     return helper.exists() and os.access(helper, os.X_OK)
 
 
-def launch_full_disk_access_helper(*, include_cli=True, wait=False):
+def launch_full_disk_access_helper(*, wait=False, targets):
     helper = current_permissions_path()
     if not helper.exists() or not os.access(helper, os.X_OK):
         return False
-    targets = full_disk_access_target_specs(include_cli=include_cli)
+    targets = list(targets)
     if not targets:
-        targets = full_disk_access_target_specs(include_cli=True)
+        return False
     args = [
         str(helper),
         "--title",
         "RemCTL Full Disk Access",
         "--subtitle",
-        "Drag these targets into System Settings, or use Command-Shift-G and paste the copied path.",
+        "Drag the signed host into System Settings, or use Command-Shift-G and paste its copied path.",
     ]
     for target in targets:
         args.extend(["--target", target["title"], target["path"], target["subtitle"]])
+    service_target = shlex.quote(
+        f"gui/{os.getuid()}/{remctl_broker.LAUNCH_AGENT_LABEL}"
+    )
     cli_command = shlex.quote(str(current_cli_path()))
-    args.extend(["--after", "Run Doctor", f"{cli_command} doctor"])
+    repair_command = (
+        f"/bin/launchctl kickstart -k {service_target} && "
+        f"{cli_command} doctor --for-agent"
+    )
+    args.extend(["--after", "Restart Host + Run Doctor", repair_command])
     try:
         if wait:
             return subprocess.run(args).returncode == 0
@@ -5948,8 +6049,9 @@ def print_permission_helper_opened():
     print()
     print(C.bold("Guided Full Disk Access"))
     print(C.dim("  Opened the RemCTL permission helper."))
-    print(C.dim("  It opens System Settings, copies the first target path, and provides draggable targets."))
+    print(C.dim("  It opens System Settings, copies the signed host path, and provides one draggable target."))
     print(C.dim("  In the file picker, press Command-Shift-G if drag-and-drop is not accepted."))
+    print(C.dim("  After changing access, click Restart Host + Run Doctor to verify the restarted host."))
 
 
 def needs_full_disk_access_guidance(check):
@@ -6069,7 +6171,7 @@ def bridge_access_check_for_onboarding():
         "eventkit",
         "fail",
         message,
-        "Re-run `remctl onboard` from the same terminal and click Allow when macOS asks for Reminders access.",
+        "Direct mode is self-managed. Rerun `remctl onboard` in the deliberate direct caller and allow Reminders access.",
     )
 
 
@@ -6087,14 +6189,14 @@ def applescript_access_check_for_onboarding():
             "automation",
             "warn",
             "AppleScript automation probe timed out while talking to Reminders.app.",
-            "Re-run `remctl onboard` from the same terminal and approve the Automation prompt if macOS asks.",
+            "Direct mode is self-managed. Rerun `remctl onboard` in the deliberate direct caller and approve Automation access.",
         )
     except OSError as exc:
         return check_result(
             "automation",
             "warn",
             f"Could not run osascript: {exc}",
-            "Re-run `remctl onboard` from Terminal after opening Reminders.app.",
+            "Direct mode is self-managed. Open Reminders.app, then rerun `remctl onboard` in the deliberate direct caller.",
         )
 
     if proc.returncode == 0:
@@ -6109,7 +6211,7 @@ def applescript_access_check_for_onboarding():
         "automation",
         "warn",
         message,
-        "Re-run `remctl onboard` from the same terminal and approve the Automation prompt if macOS asks. `flag`/`unflag` require this access and have no bridge fallback; AppleScript fallback writes rely on it too.",
+        "Direct mode is self-managed. Rerun `remctl onboard` in the deliberate direct caller and approve Automation access. `flag`/`unflag` require it and have no EventKit fallback.",
     )
 
 
@@ -6133,7 +6235,130 @@ def database_access_check_for_onboarding():
     )
 
 
-def gather_onboarding_checks():
+def _host_permission_check(name, key, permissions, *, denied_fix):
+    value = permissions.get(key) if isinstance(permissions, dict) else None
+    if value == "authorized":
+        return check_result(name, "ok", f"Capability Host: {key} access is authorized.")
+    if value in {"denied", "restricted", "writeOnly"}:
+        return check_result(
+            name,
+            "fail",
+            f"Capability Host: {key} access is {value}.",
+            denied_fix,
+        )
+    return check_result(
+        name,
+        "warn",
+        f"Capability Host: {key} access is {value or 'unknown'}.",
+        denied_fix,
+    )
+
+
+def capability_host_onboarding_checks(status):
+    checks = [open_reminders_app_for_onboarding()]
+    if not status.get("available"):
+        error = status.get("error")
+        detail = error.get("message") if isinstance(error, dict) else str(error or "Capability Host is unavailable.")
+        checks.append(check_result(
+            "capability_host",
+            "fail",
+            detail,
+            "Reinstall or restart the RemCTL Capability Host, then rerun `remctl onboard`.",
+        ))
+        return checks
+
+    terminal_permission_error_codes = {
+        "permission_prompt_cancelled",
+        "permission_prompt_timed_out",
+        "permission_prompt_unavailable",
+    }
+    request_errors = {}
+    skipped_requests = {}
+    terminal_error = None
+    for kind in ("reminders", "automation"):
+        if terminal_error is not None:
+            skipped_requests[kind] = terminal_error
+            continue
+        try:
+            remctl_broker.request_permission(kind, timeout=305)
+        except remctl_broker.CapabilityHostError as exc:
+            request_errors[kind] = exc
+            if exc.code in terminal_permission_error_codes:
+                terminal_error = (kind, exc)
+
+    refreshed = capability_host_status_snapshot()
+    permissions = refreshed.get("permissions")
+    if "reminders" in request_errors:
+        exc = request_errors["reminders"]
+        checks.append(check_result(
+            "eventkit",
+            "fail",
+            f"Capability Host could not request Reminders access: {exc}",
+            "Restart the signed host and rerun `remctl onboard`.",
+        ))
+    else:
+        checks.append(_host_permission_check(
+            "eventkit",
+            "reminders",
+            permissions,
+            denied_fix=(
+                "Open System Settings > Privacy & Security > Reminders, enable the "
+                "RemCTL Capability Host, then rerun `remctl onboard`."
+            ),
+        ))
+    if "automation" in skipped_requests:
+        previous_kind, exc = skipped_requests["automation"]
+        checks.append(check_result(
+            "automation",
+            "warn",
+            (
+                "Capability Host did not request Automation because the "
+                f"{previous_kind.capitalize()} permission flow ended: {exc}"
+            ),
+            "Rerun `remctl onboard` when you are ready to continue.",
+        ))
+    elif "automation" in request_errors:
+        exc = request_errors["automation"]
+        checks.append(check_result(
+            "automation",
+            "fail",
+            f"Capability Host could not request Automation access: {exc}",
+            "Restart the signed host and rerun `remctl onboard`.",
+        ))
+    else:
+        checks.append(_host_permission_check(
+            "automation",
+            "automation",
+            permissions,
+            denied_fix=(
+                "Open System Settings > Privacy & Security > Automation and allow the "
+                "RemCTL Capability Host to control Reminders."
+            ),
+        ))
+    checks.append(_host_permission_check(
+        "database",
+        "fullDiskAccess",
+        permissions,
+        denied_fix=capability_host_full_disk_access_fix(refreshed),
+    ))
+    return checks
+
+
+def gather_onboarding_checks(capability_host=None):
+    host_status = capability_host or capability_host_status_snapshot()
+    if capability_host_is_effective(host_status):
+        return capability_host_onboarding_checks(host_status)
+    if capability_host_requested_mode() != "direct":
+        error = host_status.get("error")
+        detail = error.get("message") if isinstance(error, dict) else str(
+            error or "The signed RemCTL Capability Host is unavailable."
+        )
+        return [check_result(
+            "capability_host",
+            "fail",
+            detail,
+            "Reinstall the signed RemCTL Capability Host, then rerun `remctl onboard`.",
+        )]
     checks = [
         open_reminders_app_for_onboarding(),
         bridge_access_check_for_onboarding(),
@@ -6145,7 +6370,9 @@ def gather_onboarding_checks():
 
 
 def run_onboarding(*, auto=False):
-    checks = gather_onboarding_checks()
+    initial_host_status = capability_host_status_snapshot()
+    checks = gather_onboarding_checks(initial_host_status)
+    final_host_status = capability_host_status_snapshot()
     fail_count = sum(1 for check in checks if check["status"] == "fail")
     warn_count = sum(1 for check in checks if check["status"] == "warn")
     result = {
@@ -6153,6 +6380,7 @@ def run_onboarding(*, auto=False):
         "warnings": warn_count,
         "failures": fail_count,
         "checks": checks,
+        "capabilityHost": final_host_status,
     }
     write_onboard_state(result, auto=auto)
     return result
@@ -6161,13 +6389,15 @@ def run_onboarding(*, auto=False):
 def should_auto_onboard(args):
     if sys.platform != "darwin":
         return False
+    if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1":
+        return False
     if os.environ.get(AUTO_ONBOARD_SKIP_ENV):
         return False
     if getattr(args, "cmd", None) in AUTO_ONBOARD_SKIP_COMMANDS:
         return False
     if getattr(args, "json", False) or getattr(args, "format", None) == "json":
         return False
-    if not sys.stdout.isatty():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
         return False
     return load_onboard_state() is None
 
@@ -6175,20 +6405,25 @@ def should_auto_onboard(args):
 def maybe_run_first_launch_onboarding(args):
     if not should_auto_onboard(args):
         return None
-    print(C.bold("First launch detected. Running remctl onboard."))
-    print(C.dim("Approve any macOS prompts for Reminders or Automation access, then the original command will continue."))
+    print(C.bold("First launch detected. Running remctl onboard for the signed RemCTL Capability Host."))
+    print(C.dim("Approve the Reminders and Automation prompts for the Capability Host. The original command will then continue."))
     print()
     result = run_onboarding(auto=True)
     print_check_report("RemCTL onboard", result["checks"])
     database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
     if needs_full_disk_access_guidance(database_check):
-        if launch_full_disk_access_helper(include_cli=True):
-            print_permission_helper_opened()
+        mode = capability_host_requested_mode()
+        if mode == "direct":
+            print()
+            for line in full_disk_access_fix_text(rerun_command="remctl doctor").splitlines():
+                print(C.dim(f"  {line}"))
         else:
-            print_full_disk_access_guidance(
-                settings_opened=False,
-                rerun_command="remctl doctor",
-            )
+            host_status = result.get("capabilityHost") or capability_host_status_snapshot()
+            host_targets = capability_host_target_specs(host_status)
+            if host_targets and launch_full_disk_access_helper(targets=host_targets):
+                print_permission_helper_opened()
+            else:
+                print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
     print()
     return result
 
@@ -9807,10 +10042,15 @@ def _fail_flag_applescript(a, r, operation, error_text):
         else f"remctl edit {a.id} --private --no-flagged"
     )
     title = safe_display(r["ZTITLE"] or "(untitled)")
+    permission_target = (
+        "the signed RemCTL Capability Host"
+        if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1"
+        else "the deliberate direct caller"
+    )
     message = (
         f"AppleScript could not {operation} #{a.id} ('{title}'): {error_text}. "
         f"EventKit cannot set the real flagged state, so there is no bridge fallback. "
-        f"Approve the Automation prompt with `remctl onboard` from this same context; "
+        f"Approve Reminders Automation access for {permission_target} with `remctl onboard`; "
         f"if Reminders automation stays unavailable, use: {hint}"
     )
     if getattr(a, "json", False):
@@ -10371,14 +10611,25 @@ def cmd_export(a):
         print(json.dumps(data, indent=2))
 
 def cmd_import(a):
-    filepath = Path(a.file)
-    if not filepath.exists():
-        print(f"Error: File '{a.file}' not found", file=sys.stderr)
-        sys.exit(1)
     try:
-        with open(filepath) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
+        if a.file == "-":
+            if sys.stdin.isatty():
+                raise ValueError("import - requires piped standard input")
+            input_stream = getattr(sys.stdin, "buffer", sys.stdin)
+            raw = input_stream.read(8 * 1024 * 1024 + 1)
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            if len(raw) > 8 * 1024 * 1024:
+                raise ValueError("standard input exceeds 8 MiB")
+            data = json.loads(raw.decode("utf-8"))
+        else:
+            filepath = Path(a.file)
+            if not filepath.exists():
+                print(f"Error: File '{a.file}' not found", file=sys.stderr)
+                sys.exit(1)
+            with open(filepath) as f:
+                data = json.load(f)
+    except (json.JSONDecodeError, IOError, UnicodeError, ValueError) as e:
         print(f"Error: Failed to read JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -10386,42 +10637,117 @@ def cmd_import(a):
         print("Error: JSON must be an array of reminder objects", file=sys.stderr)
         sys.exit(1)
 
-    created = 0
-    errors = 0
-    for item in data:
-        title = item.get("title")
-        if not title:
-            print("Warning: Skipping item without title", file=sys.stderr)
-            errors += 1
+    # Validate and normalize the complete document before the first write.
+    add_args = []
+    validation_errors = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            validation_errors.append({"index": index, "message": "item must be an object"})
             continue
-
-        # Build a namespace that looks like cmd_add's args
+        title = item.get("title")
+        if not isinstance(title, str) or not title.strip():
+            validation_errors.append({"index": index, "message": "item requires a non-empty string title"})
+            continue
+        string_fields = ("list", "notes", "due", "dueDate", "priority", "url", "recurrence", "alarm")
+        invalid_field = next(
+            (field for field in string_fields if item.get(field) is not None and not isinstance(item.get(field), str)),
+            None,
+        )
+        if invalid_field is not None:
+            validation_errors.append({"index": index, "message": f"{invalid_field} must be a string"})
+            continue
+        due = item.get("due") or item.get("dueDate")
+        if due and parse_due(due) is None:
+            validation_errors.append({"index": index, "message": f"could not parse due date {due!r}"})
+            continue
+        recurrence = item.get("recurrence")
+        if recurrence and parse_recurrence(recurrence) is None:
+            validation_errors.append({"index": index, "message": f"could not parse recurrence {recurrence!r}"})
+            continue
+        alarm = item.get("alarm")
+        if alarm and parse_alarm(alarm) is None:
+            validation_errors.append({"index": index, "message": f"could not parse alarm {alarm!r}"})
+            continue
+        priority = item.get("priority")
+        if priority and priority.lower() not in {"high", "h", "medium", "med", "m", "low", "l", "none"}:
+            validation_errors.append({"index": index, "message": "priority must be high, medium, low, or none"})
+            continue
+        if "flagged" in item and not isinstance(item["flagged"], bool):
+            validation_errors.append({"index": index, "message": "flagged must be a boolean"})
+            continue
         class AddArgs:
             pass
         aa = AddArgs()
         aa.title = title
         aa.list = item.get("list")
         aa.notes = item.get("notes")
-        aa.due = item.get("due") or item.get("dueDate")
+        aa.due = due
         aa.priority = item.get("priority")
         aa.flag = item.get("flagged", False)
         aa.tags = None
         aa.url = item.get("url")
-        aa.recurrence = item.get("recurrence")
-        aa.alarm = item.get("alarm")
-        aa.json = False
+        aa.recurrence = recurrence
+        aa.alarm = alarm
+        aa.json = True
+        add_args.append(aa)
 
+    if validation_errors:
+        payload = {
+            "status": "error",
+            "code": "invalid_import",
+            "message": "Import validation failed; no reminders were created.",
+            "created": 0,
+            "createdIds": [],
+            "errors": validation_errors,
+            "total": len(data),
+        }
+        if getattr(a, "json", False):
+            print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+        else:
+            print(f"Error: {payload['message']}", file=sys.stderr)
+            for error in validation_errors:
+                print(f"  Item {error['index']}: {error['message']}", file=sys.stderr)
+        sys.exit(1)
+
+    created_ids = []
+    created = 0
+    errors = []
+    for index, aa in enumerate(add_args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         try:
-            cmd_add(aa)
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                cmd_add(aa)
+            result = json.loads(stdout.getvalue())
             created += 1
-        except SystemExit:
-            errors += 1
+            created_id = result.get("numericId") or result.get("id")
+            if created_id is not None:
+                created_ids.append(created_id)
+            if getattr(a, "json", False):
+                ident = created_id if created_id is not None else "unknown"
+                progress_id = safe_display(str(ident))[:128]
+                print(f"imported index={index} id={progress_id}", file=sys.stderr, flush=True)
+            if not getattr(a, "json", False):
+                print(f"Created: {safe_display(aa.title)}")
+        except (SystemExit, json.JSONDecodeError) as exc:
+            message = stderr.getvalue().strip() or stdout.getvalue().strip() or str(exc)
+            errors.append({"index": index, "title": aa.title, "message": message})
+            if not getattr(a, "json", False):
+                print(f"Error: Failed to import {safe_display(aa.title)}: {message}", file=sys.stderr)
 
-    summary = {"created": created, "errors": errors, "total": len(data)}
+    summary = {
+        "status": "completed" if not errors else "partial",
+        "created": created,
+        "createdIds": created_ids,
+        "errors": errors,
+        "total": len(data),
+    }
     if getattr(a, 'json', False):
-        print(json.dumps(summary))
+        print(json.dumps(summary, ensure_ascii=False))
     else:
-        print(f"\nImported {created}/{len(data)} reminders ({errors} errors)")
+        print(f"\nImported {created}/{len(data)} reminders ({len(errors)} errors)")
+    if errors:
+        sys.exit(1)
 
 def add_smart_list_filter_arguments(parser, *, match_default="all", tag_match_default="any"):
     parser.add_argument("--match", choices=["all", "any"], default=match_default, help="Match all or any supplied filters")
@@ -10507,10 +10833,10 @@ _remctl() {
         'list-unpin:Unpin a list or smart list in Reminders'
         'list-rename:Rename a list'
         'list-delete:Delete a list'
-        'onboard:Prompt for macOS permissions and verify readiness'
-        'doctor:Diagnose setup and runtime issues'
+        'onboard:Request signed-host Reminders and Automation access'
+        'doctor:Diagnose signed-host and effective access'
         'setup:Install shell completions'
-        'permissions:Open guided macOS permission helper'
+        'permissions:Reopen the signed host Full Disk Access guide for repair'
         'completion:Generate shell completions'
     )
     case "$words[2]" in
@@ -10518,7 +10844,7 @@ _remctl() {
             _arguments \
                 '--list-id[Show list by stable numeric ID]:id:' \
                 '--completed[Include completed reminders]' \
-                '--via-eventkit[Limited read-only EventKit fallback; no numeric ids or private metadata]' \
+                '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
@@ -10529,7 +10855,7 @@ _remctl() {
         search)
             _arguments \
                 '--completed[Include completed reminders]' \
-                '--via-eventkit[Limited read-only EventKit fallback; no numeric ids or private metadata]' \
+                '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
@@ -10540,7 +10866,7 @@ _remctl() {
         today)
             _arguments \
                 '--no-overdue[Exclude overdue reminders]' \
-                '--via-eventkit[Limited read-only EventKit fallback; no numeric ids or private metadata]' \
+                '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
@@ -10550,7 +10876,7 @@ _remctl() {
             ;;
         upcoming)
             _arguments \
-                '--via-eventkit[Limited read-only EventKit fallback; no numeric ids or private metadata]' \
+                '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
@@ -10721,7 +11047,7 @@ _remctl() {
             ;;
         doctor)
             _arguments \
-                '--for-agent[Print agent-focused context and TCC guidance]' \
+                '--for-agent[Explain authoritative access.effective readiness]' \
                 '--json[JSON output]'
             return
             ;;
@@ -11100,21 +11426,21 @@ complete -c remctl -n "__fish_use_subcommand" -a list-pin -d "Pin a list or smar
 complete -c remctl -n "__fish_use_subcommand" -a list-unpin -d "Unpin a list or smart list in Reminders"
 complete -c remctl -n "__fish_use_subcommand" -a list-rename -d "Rename a list"
 complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
-complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Prompt for macOS permissions and verify readiness"
-complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose setup and runtime issues"
+complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Request signed-host Reminders and Automation access"
+complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose signed-host and effective access"
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
-complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Open guided macOS permission helper"
+complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the signed host Full Disk Access guide for repair"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
 complete -c remctl -l images -d "Render image attachments inline"
 complete -c remctl -l image-mode -d "Image rendering protocol" -x -a "kitty iterm2 halfblock none"
 complete -c remctl -l image-width -d "Image render width in cells" -x
-complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Print agent-focused context and TCC guidance"
+complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Explain authoritative access.effective readiness"
 complete -c remctl -n "__fish_seen_subcommand_from show" -l list-id -d "Show list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l completed -d "Include completed reminders"
-complete -c remctl -n "__fish_seen_subcommand_from show" -l via-eventkit -d "Limited read-only EventKit fallback; no numeric ids or private metadata"
+complete -c remctl -n "__fish_seen_subcommand_from show" -l via-eventkit -d "Limited signed-host or direct read-only fallback; no numeric ids or private metadata"
 complete -c remctl -n "__fish_seen_subcommand_from show" -s v -l verbose -d "Verbose output"
 complete -c remctl -n "__fish_seen_subcommand_from search" -l completed -d "Include completed reminders"
-complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -l via-eventkit -d "Limited read-only EventKit fallback; no numeric ids or private metadata"
+complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -l via-eventkit -d "Limited signed-host or direct read-only fallback; no numeric ids or private metadata"
 complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -s v -l verbose -d "Verbose output"
 complete -c remctl -n "__fish_seen_subcommand_from today" -l no-overdue -d "Exclude overdue reminders"
 complete -c remctl -n "__fish_seen_subcommand_from done" -l date -d "Set completion date" -r
@@ -11708,13 +12034,99 @@ def run_handler_with_fallback(args, handler):
             and hasattr(args, "via_eventkit")
             and not eventkit_read_requested(args)
         ):
+            access_context = (
+                "while the signed Capability Host lacks Full Disk Access"
+                if os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1"
+                else "when Full Disk Access is unavailable"
+            )
             print(
                 "Limited fallback: rerun with --via-eventkit for a read-only EventKit result "
-                "when Full Disk Access is unavailable. This mode is not full fidelity and does "
+                f"{access_context}. This mode is not full fidelity and does "
                 "not return RemCTL numeric ids.",
                 file=sys.stderr,
             )
         sys.exit(1)
+
+
+def _should_route_capability_host(args):
+    try:
+        return remctl_broker.should_route(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _dispatch_capability_host(argv, args):
+    """Run one already-parsed command in the signed capability host."""
+
+    try:
+        exit_code = remctl_broker.dispatch(argv, parsed_args=args)
+        remctl_broker.exit_with_status(exit_code)
+    except remctl_broker.CapabilityHostError as exc:
+        code = getattr(exc, "code", "capability_host_error")
+        print(f"Error: RemCTL Capability Host [{code}]: {exc}", file=sys.stderr)
+        if getattr(exc, "indeterminate", False):
+            print(
+                "The request may have run. RemCTL did not retry or fall back to direct execution; "
+                "inspect the exact reminder or list state before retrying.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+
+def _no_command_host_argv(args):
+    """Translate the local splash invocation into one normalized hosted today command."""
+
+    argv = []
+    if getattr(args, "no_color", False) or os.environ.get("NO_COLOR"):
+        argv.append("--no-color")
+    argv.append("today")
+    argv.extend(["--format", getattr(args, "format", "plain")])
+    if getattr(args, "images", False):
+        argv.append("--images")
+    image_mode = getattr(args, "image_mode", None)
+    if not image_mode and getattr(args, "images", False):
+        image_mode = detect_image_mode()
+    if image_mode:
+        argv.extend(["--image-mode", image_mode])
+    image_width = getattr(args, "image_width", None)
+    if image_width is not None:
+        argv.extend(["--image-width", str(image_width)])
+    return argv
+
+
+def _normalized_host_argv(argv, args):
+    """Make caller-side presentation defaults explicit for the sanitized host."""
+
+    values = list(argv)
+    try:
+        option_end = values.index("--")
+    except ValueError:
+        option_end = len(values)
+    option_values = values[:option_end]
+    prefix = []
+    if (
+        (getattr(args, "no_color", False) or os.environ.get("NO_COLOR"))
+        and "--no-color" not in option_values
+    ):
+        prefix.append("--no-color")
+    if getattr(args, "images", False) and "--images" not in option_values:
+        prefix.append("--images")
+    image_mode = getattr(args, "image_mode", None)
+    if not image_mode and getattr(args, "images", False):
+        image_mode = detect_image_mode()
+    if image_mode and not any(
+        value == "--image-mode" or value.startswith("--image-mode=")
+        for value in option_values
+    ):
+        prefix.extend(["--image-mode", image_mode])
+    image_width = getattr(args, "image_width", None)
+    if image_width is not None and not any(
+        value == "--image-width" or value.startswith("--image-width=")
+        for value in option_values
+    ):
+        prefix.extend(["--image-width", str(image_width)])
+    return prefix + values
 
 
 def cmd_completion(a):
@@ -11726,8 +12138,12 @@ def cmd_completion(a):
         sys.exit(1)
 
 
-def gather_doctor_checks():
+def gather_doctor_checks(capability_host=None):
     checks = []
+    host_status = capability_host or capability_host_status_snapshot()
+    mode = capability_host_requested_mode()
+    host_effective = capability_host_is_effective(host_status)
+    host_store_ready = host_effective and bool(host_status.get("ready"))
 
     def add(name, status, detail, fix=None):
         checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
@@ -11748,11 +12164,21 @@ def gather_doctor_checks():
         None if py_ok else "Install Python 3.10 or newer.",
     )
 
+    store_exists = STORE_DIR.exists()
     add(
         "store_dir",
-        "ok" if STORE_DIR.exists() else "fail",
+        "ok" if store_exists else ("warn" if host_store_ready else "fail"),
         str(STORE_DIR),
-        None if STORE_DIR.exists() else "Set REMCTL_STORE_DIR if your Reminders store lives elsewhere.",
+        (
+            None
+            if store_exists
+            else (
+                "Direct access is unavailable in this caller; the signed Capability Host "
+                "can read the store."
+                if host_store_ready
+                else "Set REMCTL_STORE_DIR if your Reminders store lives elsewhere."
+            )
+        ),
     )
 
     db_access_error = reminders_store_access_error()
@@ -11760,20 +12186,35 @@ def gather_doctor_checks():
     if db_access_error:
         add(
             "database",
-            "fail",
+            "warn" if host_store_ready else "fail",
             db_access_error,
-            full_disk_access_fix_text(
-                rerun_command="remctl doctor --for-agent",
-                mention_onboard=True,
+            (
+                "Direct caller access is blocked, but effective database access is available "
+                "through the signed RemCTL Capability Host."
+                if host_store_ready
+                else full_disk_access_fix_text(
+                    rerun_command="remctl doctor --for-agent",
+                    mention_onboard=True,
+                )
             ),
         )
     else:
         add(
             "database",
-            "ok" if db_path else "fail",
+            "ok" if db_path else ("warn" if host_store_ready else "fail"),
             str(db_path) if db_path else "No Reminders database found",
-            None if db_path else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard.",
+            (
+                None
+                if db_path
+                else (
+                    "Direct caller access is unavailable, but effective database access is "
+                    "available through the signed RemCTL Capability Host."
+                    if host_store_ready
+                    else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard."
+                )
+            ),
         )
+    direct_database_ready = not db_access_error and bool(db_path)
 
     cli_path = current_cli_path()
     cli_on_path = shutil.which(CLI_NAME) is not None
@@ -11787,29 +12228,69 @@ def gather_doctor_checks():
     bridge_path = current_bridge_path()
     bridge_ok = bridge_path.exists() and os.access(bridge_path, os.X_OK)
     bridge_fix = None
-    if not bridge_ok:
+    if host_effective:
+        bridge_ok = bool(host_status.get("available"))
+        bridge_fix = None if bridge_ok else "Restart or reinstall the signed RemCTL Capability Host."
+    elif not bridge_ok:
         bridge_fix = "Run ./install.sh or compile remctl-bridge.swift with swiftc, then run remctl onboard."
     add(
         "bridge",
         "ok" if bridge_ok else "warn",
-        str(bridge_path),
+        (
+            "Sealed EventKit bridge in the signed Capability Host."
+            if host_effective
+            else str(bridge_path)
+        ),
         bridge_fix,
     )
-    if bridge_ok:
+    if host_effective:
+        permissions = host_status.get("permissions")
+        reminders_access = permissions.get("reminders") if isinstance(permissions, dict) else None
+        add(
+            "eventkit",
+            "ok" if reminders_access == "authorized" else "fail",
+            f"Capability Host Reminders access: {reminders_access or 'unknown'}",
+            (
+                None
+                if reminders_access == "authorized"
+                else "Run `remctl onboard` to request Reminders access for the signed host."
+            ),
+        )
+        automation_access = permissions.get("automation") if isinstance(permissions, dict) else None
+        add(
+            "automation",
+            "ok" if automation_access == "authorized" else "fail",
+            f"Capability Host Automation access: {automation_access or 'unknown'}",
+            (
+                None
+                if automation_access == "authorized"
+                else "Run `remctl onboard` to request Automation access for the signed host."
+            ),
+        )
+    elif mode == "direct" and bridge_ok:
         checks.append(bridge_access_check_for_onboarding())
     else:
         add(
             "eventkit",
             "warn",
-            "EventKit write access was not checked because remctl-bridge is unavailable.",
-            bridge_fix,
+            (
+                "Direct EventKit access was not checked because the signed Capability Host is unavailable."
+                if mode != "direct"
+                else "EventKit write access was not checked because remctl-bridge is unavailable."
+            ),
+            "Reinstall the signed RemCTL Capability Host." if mode != "direct" else bridge_fix,
         )
 
     private_path = current_private_path()
     private_ok = private_path.exists() and os.access(private_path, os.X_OK)
     private_detail = str(private_path)
     private_fix = None
-    if private_ok:
+    if host_effective:
+        private_ok = bool(host_status.get("available"))
+        private_detail = "Sealed private ReminderKit helper in the signed Capability Host."
+        if not private_ok:
+            private_fix = "Restart or reinstall the signed RemCTL Capability Host."
+    elif mode == "direct" and private_ok:
         probe = _probe_private_protocol_version()
         if probe.get("ok"):
             private_detail = f"{private_path} (protocol {probe['version']})"
@@ -11820,8 +12301,12 @@ def gather_doctor_checks():
             private_fix = "Re-run ./install.sh to rebuild remctl-private."
         elif probe.get("message"):
             private_detail = f"{private_path} ({probe['message']})"
-    else:
+    elif mode == "direct":
         private_fix = "Run ./install.sh to compile remctl-private, or avoid --private writes."
+    else:
+        private_ok = False
+        private_detail = "Signed Capability Host is unavailable; its sealed private helper was not checked."
+        private_fix = "Reinstall the signed RemCTL Capability Host."
     add(
         "private_helper",
         "ok" if private_ok else "warn",
@@ -11877,11 +12362,62 @@ def gather_doctor_checks():
     else:
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
+    if mode == "invalid":
+        add(
+            "capability_host",
+            "fail",
+            "REMCTL_CAPABILITY_HOST has an invalid value.",
+            "Use REMCTL_CAPABILITY_HOST=auto, force, or direct.",
+        )
+        effective_route = "unavailable"
+        effective_ready = False
+    elif mode == "direct":
+        add(
+            "capability_host",
+            "ok",
+            "Direct mode requested; the Capability Host is intentionally bypassed.",
+        )
+        effective_route = "direct"
+        effective_ready = direct_database_ready
+    elif host_effective:
+        full_ready = bool(host_status.get("fullReady"))
+        error = host_status.get("error")
+        error_detail = error.get("message") if isinstance(error, dict) else error
+        add(
+            "capability_host",
+            "ok" if full_ready else "fail",
+            (
+                "Signed Capability Host is ready for full RemCTL execution."
+                if full_ready
+                else str(error_detail or "Capability Host is installed but is not fully ready.")
+            ),
+            None if full_ready else "Run `remctl onboard`, then rerun `remctl doctor --for-agent`.",
+        )
+        effective_route = "capabilityHost"
+        effective_ready = full_ready
+    else:
+        add(
+            "capability_host",
+            "warn",
+            "Capability Host is not installed; auto mode is using direct execution.",
+            "Run ./install.sh to install the signed RemCTL Capability Host.",
+        )
+        effective_route = "direct"
+        effective_ready = direct_database_ready
+
+    add(
+        "effective_access",
+        "ok" if effective_ready else "fail",
+        f"route={effective_route}; ready={'yes' if effective_ready else 'no'}",
+        None if effective_ready else "Run `remctl onboard` and resolve the failed checks above.",
+    )
+
     return checks
 
 
 def cmd_doctor(a):
-    checks = gather_doctor_checks()
+    capability_host = capability_host_status_snapshot()
+    checks = gather_doctor_checks(capability_host)
     context = doctor_execution_context()
     fail_count = sum(1 for check in checks if check["status"] == "fail")
     warn_count = sum(1 for check in checks if check["status"] == "warn")
@@ -11890,13 +12426,37 @@ def cmd_doctor(a):
         "warnings": warn_count,
         "failures": fail_count,
         "context": context,
+        "access": {
+            "requestedMode": capability_host_requested_mode(),
+            "direct": {
+                "ready": next(
+                    (check["status"] == "ok" for check in checks if check["name"] == "database"),
+                    False,
+                ),
+            },
+            "effective": {
+                "route": next(
+                    (
+                        check["detail"].split(";", 1)[0].removeprefix("route=")
+                        for check in checks
+                        if check["name"] == "effective_access"
+                    ),
+                    "unavailable",
+                ),
+                "ready": next(
+                    (check["status"] == "ok" for check in checks if check["name"] == "effective_access"),
+                    False,
+                ),
+            },
+        },
+        "capabilityHost": capability_host,
         "checks": checks,
     }
     if getattr(a, "for_agent", False):
         result["agent_note"] = (
-            "This report only applies to the process context shown in `context`. "
-            "`doctor` must pass in the same context that will run the write. "
-            "Terminal and Codex or other agent runners can have different Full Disk Access and Reminders/EventKit grants."
+            "Use `access.effective` as the authoritative readiness result. A caller such as "
+            "Hermes may show blocked direct access while the signed Capability Host provides "
+            "full effective access."
         )
     if getattr(a, "json", False):
         print(json.dumps(result, indent=2))
@@ -11911,10 +12471,39 @@ def cmd_doctor(a):
             print(f"Host app: {context.get('host_app')}")
         if context.get("terminal_app"):
             print(f"Terminal app: {context.get('terminal_app')}")
+        print(f"Requested route: {result['access']['requestedMode']}")
+        print(
+            f"Effective access: {result['access']['effective']['route']} "
+            f"({'ready' if result['access']['effective']['ready'] else 'not ready'})"
+        )
+        app = capability_host.get("app") if isinstance(capability_host.get("app"), dict) else {}
+        socket_status = capability_host.get("socket") if isinstance(capability_host.get("socket"), dict) else {}
+        print(
+            "Capability Host: "
+            f"{'full ready' if capability_host.get('fullReady') else 'not ready'}; "
+            f"protocol {capability_host.get('protocolVersion') or '?'}"
+            f"/{capability_host.get('expectedProtocolVersion') or '?'}"
+        )
+        if app.get("path"):
+            print(f"Capability Host app: {app.get('path')}")
+        if socket_status.get("path"):
+            print(f"Capability Host socket: {socket_status.get('path')}")
+        signature = capability_host.get("signature") or app.get("signature")
+        if signature:
+            print(f"Capability Host signature: {signature}")
+        permissions = capability_host.get("permissions")
+        if isinstance(permissions, dict):
+            permission_summary = ", ".join(
+                f"{key}={permissions.get(key)}"
+                for key in ("fullDiskAccess", "reminders", "automation")
+                if key in permissions
+            )
+            if permission_summary:
+                print(f"Capability Host permissions: {permission_summary}")
         if getattr(a, "for_agent", False):
             print(
-                "Agent note: `doctor` must pass in the same context that will run the write; "
-                "Terminal may be green while this runner is blocked for Full Disk Access or Reminders/EventKit."
+                "Agent note: effective access is authoritative. Direct caller access may remain "
+                "blocked when the signed Capability Host is ready."
             )
         print()
         print_check_report(None, checks)
@@ -11928,19 +12517,30 @@ def cmd_onboard(a):
         print(json.dumps(result, indent=2))
     else:
         print(C.bold("RemCTL onboard"))
-        print(C.dim("Approve any macOS prompts for Reminders or Automation access."))
+        if capability_host_requested_mode() == "direct":
+            print(C.dim("Direct mode is self-managed; approve prompts only for the deliberate direct caller."))
+        else:
+            print(C.dim("Approve Reminders and Automation prompts for the signed RemCTL Capability Host."))
         print()
         print_check_report(None, result["checks"])
         database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
-        needs_cli_access = needs_full_disk_access_guidance(database_check)
-        if needs_cli_access:
-            if launch_full_disk_access_helper(include_cli=True):
+        needs_host_access = needs_full_disk_access_guidance(database_check)
+        if needs_host_access:
+            host_status = result.get("capabilityHost") or capability_host_status_snapshot()
+            host_targets = capability_host_target_specs(host_status)
+            if capability_host_requested_mode() == "direct":
+                print()
+                for line in full_disk_access_fix_text(rerun_command="remctl doctor").splitlines():
+                    print(C.dim(f"  {line}"))
+            elif host_targets and launch_full_disk_access_helper(targets=host_targets):
                 print_permission_helper_opened()
-            else:
-                print_full_disk_access_guidance(
+            elif host_targets:
+                print_capability_host_full_disk_access_guidance(
+                    host_status,
                     settings_opened=open_full_disk_access_settings(),
-                    rerun_command="remctl doctor",
                 )
+            else:
+                print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
     if result["failures"]:
         sys.exit(1)
 
@@ -11949,21 +12549,60 @@ def cmd_permissions(a):
     if a.topic != "full-disk-access":
         print(f"Error: Unsupported permissions topic '{a.topic}'", file=sys.stderr)
         sys.exit(1)
-    targets = full_disk_access_target_specs(include_cli=True)
+    host_status = capability_host_status_snapshot()
+    host_targets = capability_host_target_specs(host_status)
+    mode = capability_host_requested_mode()
+    if mode == "direct":
+        result = {
+            "ok": False,
+            "available": permission_helper_available(),
+            "targets": [],
+            "capabilityHost": host_status,
+            "error": {
+                "code": "direct_mode_self_managed",
+                "message": "Direct mode is self-managed; the normal permission helper does not configure direct callers.",
+            },
+        }
+        if getattr(a, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Error: {result['error']['message']}", file=sys.stderr)
+        sys.exit(1)
+    if not host_targets:
+        result = {
+            "ok": False,
+            "available": permission_helper_available(),
+            "targets": [],
+            "capabilityHost": host_status,
+            "error": {
+                "code": "capability_host_not_installed",
+                "message": "Reinstall the signed RemCTL Capability Host before configuring Full Disk Access.",
+            },
+        }
+        if getattr(a, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
+        sys.exit(1)
     result = {
+        "ok": True,
         "helper": str(current_permissions_path()),
         "available": permission_helper_available(),
-        "targets": targets,
+        "targets": host_targets,
+        "capabilityHost": host_status,
     }
     if getattr(a, "json", False):
         print(json.dumps(result, indent=2))
         return
-    if launch_full_disk_access_helper(include_cli=True, wait=a.wait):
+    if launch_full_disk_access_helper(
+        wait=a.wait,
+        targets=host_targets,
+    ):
         print_permission_helper_opened()
         return
-    print_full_disk_access_guidance(
+    print_capability_host_full_disk_access_guidance(
+        host_status,
         settings_opened=open_full_disk_access_settings(),
-        rerun_command="remctl doctor",
     )
 
 
@@ -12011,10 +12650,16 @@ def cmd_setup(a):
             print(f"    fpath=({completion_path.parent} $fpath)")
             print("    autoload -Uz compinit && compinit")
         print()
-        print("Next:")
-        print("  1. remctl onboard   # trigger macOS Reminders and Automation prompts")
-        print("  2. remctl permissions full-disk-access   # visual Full Disk Access setup")
-        print("  3. remctl doctor    # verify the CLI")
+        print("First install:")
+        print("  1. remctl onboard   # request host access and open the FDA guide if needed")
+        print("  2. After any FDA change, restart the signed host")
+        print("  3. remctl doctor --for-agent   # verify after the restart")
+        print("Unchanged existing install:")
+        print("  1. remctl doctor --for-agent")
+        print("  2. Run remctl onboard only if doctor reports host permission trouble")
+        print("Upgrade or reinstall: run ./install.sh first, then follow the checks above")
+        print("  Official 1.7.1 transition: treat 1.8.0 as a first host install and run onboard")
+        print("  Repair: remctl permissions full-disk-access   # reopen the host-only FDA guide")
         if getattr(a, "doctor", False):
             print()
             cmd_doctor(SimpleNamespace(json=False))
@@ -12097,28 +12742,40 @@ def build_parser():
     """
     p = argparse.ArgumentParser(
         prog=CLI_NAME,
-        description="Power-user Reminders CLI — reads sections/subtasks/tags/attachments/colors, "
-                    "writes via remctl-bridge (EventKit) with AppleScript fallback.",
+        description=(
+            "Power-user Reminders CLI. Normal installed commands run through the signed "
+            "RemCTL Capability Host, which owns Full Disk Access, Reminders, and Automation."
+        ),
         epilog=(
-            "Normal setup flow:\n"
-            "  1. ./install.sh --bootstrap   # copy files, create config, install completions\n"
-            f"  2. {CLI_NAME} onboard             # trigger Reminders and Automation prompts\n"
-            f"  3. {CLI_NAME} permissions full-disk-access   # visual Full Disk Access setup\n"
-            f"  4. {CLI_NAME} doctor              # verify the CLI\n"
+            "First install:\n"
+            "  1. ./install.sh --bootstrap   # install the signed host and Python 3.10+ CLI\n"
+            f"  2. {CLI_NAME} onboard             # request host access; opens the FDA guide if needed\n"
+            "  3. After any Full Disk Access change, restart the signed host\n"
+            f"  4. {CLI_NAME} doctor --for-agent  # verify access.effective and protocol v2 after restart\n"
+            "Upgrade or reinstall:\n"
+            "  1. ./install.sh\n"
+            f"  2. {CLI_NAME} doctor --for-agent\n"
+            f"  3. Run {CLI_NAME} onboard only if doctor reports host permission trouble\n"
+            "     These steps are for an existing signed host. After official 1.7.1, run onboard\n"
+            "     because 1.8.0 installs the host for the first time.\n"
+            f"Repair: {CLI_NAME} permissions full-disk-access   # reopen the host-only FDA guide\n"
             "\n"
             "Examples:\n"
             f"  {CLI_NAME} onboard\n"
             f"  {CLI_NAME} today\n"
             f"  {CLI_NAME} add \"Buy milk\" -d tomorrow\n"
             f"  {CLI_NAME} info 847 --images\n"
-            f"  {CLI_NAME} setup --shell auto --doctor\n"
+            f"  {CLI_NAME} setup --shell auto\n"
             f"  {CLI_NAME} permissions full-disk-access\n"
             "\n"
             f"Use `{CLI_NAME} onboard --help`, `{CLI_NAME} permissions --help`, `{CLI_NAME} setup --help`, and `{CLI_NAME} doctor --help`\n"
             "for onboarding details.\n"
             "\n"
             "Private metadata writes are unsupported and opt-in: pass --private on "
-            "add/edit/list-create/list-edit/list-pin/list-unpin/group-*/smart-list-*/template-*."
+            "add/edit/reminder-move; list-create/list-edit/list-pin/list-unpin; "
+            "section-create/section-rename/section-delete; group-create/group-edit/group-delete; "
+            "smart-list-create/smart-list-edit/smart-list-delete; or "
+            "template-create/template-apply/template-delete."
         ),
         formatter_class=HelpFormatter,
     )
@@ -12157,7 +12814,7 @@ def build_parser():
             "--via-eventkit",
             action="store_true",
             help=(
-                "Limited read-only EventKit fallback for hosts without Full Disk Access; "
+                "Limited read-only EventKit fallback inside the signed host or explicit direct mode; "
                 "never the default, no RemCTL numeric ids, no sections/tags/private metadata; iCloud reminders only"
             ),
         )
@@ -12282,7 +12939,7 @@ def build_parser():
         "show",
         help="Show reminders in a list in Reminders display order",
         description=(
-            "Show reminders in a list, grouped by section. Direct database reads follow "
+            "Show reminders in a list, grouped by section. Signed-host database reads follow "
             "Reminders' stored manual display order when it is available."
         ),
     )
@@ -12293,9 +12950,9 @@ def build_parser():
 
     c = sub.add_parser(
         "add",
-        help="Add a reminder (syncs via bridge/AppleScript)",
+        help="Add a reminder through the signed host",
         description=(
-            "Add a reminder through the normal EventKit bridge. With --private, selected metadata "
+            "Add a reminder through the signed host's EventKit bridge. With --private, selected metadata "
             "is written afterward through the unsupported private ReminderKit helper."
         ),
         epilog=(
@@ -12323,7 +12980,7 @@ def build_parser():
             "If -d/--due is present and cannot be parsed, add fails before creating the reminder.\n"
             "Titles beginning with - require a separator: remctl add -- \"-title\".\n"
             "If a private-metadata step fails after creation, the reminder is kept; re-run edit to finish (do not re-run add).\n"
-            "Without --private, -f/--flag is a separate AppleScript step: if it fails the reminder is still created, stderr warns, and --json adds a warnings array.\n"
+            "Without --private, -f/--flag is a separate AppleScript step inside the signed host by default; if it fails the reminder is still created, stderr warns, and --json adds a warnings array.\n"
             "Private metadata is unsupported by Apple and never writes SQLite directly."
         ),
         formatter_class=HelpFormatter,
@@ -12332,7 +12989,7 @@ def build_parser():
     c.add_argument("--list-id", type=int, help="Create in a list by stable numeric ID")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders")
     c.add_argument("-p", "--priority", help="high, medium, low")
-    c.add_argument("-f", "--flag", action="store_true", help="Set the reminder's real flagged state; applied by a separate AppleScript step after creation (ReminderKit with --private)")
+    c.add_argument("-f", "--flag", action="store_true", help="Set the real flagged state by AppleScript inside the signed host (ReminderKit with --private)")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
@@ -12376,7 +13033,7 @@ def build_parser():
         "edit",
         help="Edit a reminder",
         description=(
-            "Edit a reminder through normal EventKit/AppleScript paths. With --private, selected "
+            "Edit a reminder through EventKit/AppleScript inside the signed host by default. With --private, selected "
             "metadata is written through the unsupported private ReminderKit helper."
         ),
         epilog=(
@@ -12522,8 +13179,22 @@ def build_parser():
     c.add_argument("id", type=int, nargs="?", default=None, help="Reminder ID (opens specific reminder via deep link)")
 
     # --- New commands ---
-    c = sub.add_parser("flag", help="Flag a reminder (AppleScript only; needs Reminders Automation access, no bridge fallback)"); c.add_argument("id", type=int); js(c)
-    c = sub.add_parser("unflag", help="Unflag a reminder (AppleScript only; needs Reminders Automation access, no bridge fallback)"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser(
+        "flag",
+        help="Flag by AppleScript inside the signed host; needs host Automation access",
+        description=(
+            "Set the real Reminders flagged state through AppleScript inside the signed host. "
+            "The host needs Automation access to control Reminders; EventKit has no flagged API."
+        ),
+    ); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser(
+        "unflag",
+        help="Unflag by AppleScript inside the signed host; needs host Automation access",
+        description=(
+            "Clear the real Reminders flagged state through AppleScript inside the signed host. "
+            "The host needs Automation access to control Reminders; EventKit has no flagged API."
+        ),
+    ); c.add_argument("id", type=int); js(c)
 
     c = sub.add_parser("upcoming", help="Show reminders due from today through N more days (default 7)")
     c.add_argument("days", type=int, nargs="?", default=7, help="Days to look ahead beyond today; the window always starts today (1 = today and tomorrow, 7 = today plus the next week)")
@@ -12780,34 +13451,57 @@ def build_parser():
     c.add_argument("--format", dest="export_format", choices=["json", "csv"], default="json", help="Export format")
     js(c)
 
-    c = sub.add_parser("import", help="Import reminders from JSON file")
-    c.add_argument("file", help="Path to JSON file"); js(c)
+    c = sub.add_parser(
+        "import",
+        help="Import reminders from JSON file or stdin",
+        description=(
+            "Import the supported ordinary reminder fields from a JSON array. The complete\n"
+            "document is validated before the first write, but runtime failures can leave a\n"
+            "successfully imported subset. This is not a lossless restore command."
+        ),
+        epilog=(
+            "With --json, each confirmed success is flushed to stderr as\n"
+            "`imported index=N id=ID`; the final summary is one JSON object on stdout. A\n"
+            "partial result keeps successful reminders and exits 1. Build a retry input from\n"
+            "the failed indexes; do not rerun the complete file blindly.\n"
+            "\n"
+            "Examples:\n"
+            "  remctl import reminders.json\n"
+            "  remctl import - --json < reminders.json"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("file", help="Path to JSON file, or - for stdin"); js(c)
 
     c = sub.add_parser(
         "onboard",
-        help="Prompt for macOS Reminders permissions and verify readiness",
+        help="Request signed-host Reminders and Automation access",
         description=(
-            "Open Reminders.app, trigger the native EventKit and AppleScript permission prompts,\n"
-            "then verify whether EventKit writes and direct database reads are ready.\n"
-            "If Full Disk Access is still missing, remctl opens the guided permission helper."
+            "Ask the signed RemCTL Capability Host to request Reminders and Automation access,\n"
+            "then verify the host permissions. Onboard cannot grant Full Disk Access. In human\n"
+            "output, it opens the guided helper when the exact installed host needs access.\n"
+            "JSON returns the onboarding result but suppresses the Full Disk Access helper UI."
         ),
         epilog=(
             "Examples:\n"
             "  remctl onboard\n"
             "  remctl onboard --json\n"
             "\n"
-            "macOS will not show a native Full Disk Access prompt. If onboarding reports that\n"
-            "direct CLI reads are blocked, use `remctl permissions full-disk-access` for a\n"
-            "guided drag-and-drop flow."
+            "macOS has no Full Disk Access prompt. Onboard opens the host-only guide when\n"
+            "needed. Use `remctl permissions full-disk-access` to reopen that guide for a\n"
+            "repair. After an FDA change, restart the signed host, then run\n"
+            "`remctl doctor --for-agent`. With `--json`, onboard still requests Reminders and\n"
+            "Automation and returns the result, but it does not open the FDA helper. Do not add\n"
+            "Hermes, Python, Codex, or Terminal."
         ),
         formatter_class=HelpFormatter,
     ); js(c)
 
     c = sub.add_parser(
         "doctor",
-        help="Diagnose setup and runtime issues",
+        help="Diagnose signed-host and effective access",
         description=(
-            "Run environment, direct database, helper, and EventKit write-access checks for the CLI.\n"
+            "Check the Python 3.10+ CLI, signed host, protocol v2, host permissions, and effective access.\n"
             "This is the first troubleshooting step after install or onboarding."
         ),
         epilog=(
@@ -12816,16 +13510,16 @@ def build_parser():
             "  remctl doctor --json\n"
             "  remctl doctor --for-agent --json\n"
             "\n"
-            "If this is your first run on a new Mac, use `remctl onboard` first so macOS can\n"
-            "show the Reminders and Automation permission prompts. Full Disk Access and\n"
-            "Reminders/EventKit grants are scoped to the app or runner shown in the execution\n"
-            "context; Terminal can pass while an agent runner still fails.\n"
+            "On a new Mac, use `remctl onboard` so the signed host can request Reminders and\n"
+            "Automation access. `access.effective` is authoritative; `capabilityHost.fullReady`\n"
+            "reports full host readiness. Caller access can remain blocked while hosted access\n"
+            "is fully ready. Do not grant access to callers.\n"
             "\n"
-            "doctor reports the remctl-private protocol version; re-run ./install.sh if it is outdated."
+            "doctor reports the remctl-private helper protocol version (required: v2); rerun ./install.sh if outdated."
         ),
         formatter_class=HelpFormatter,
     ); js(c)
-    c.add_argument("--for-agent", action="store_true", help="Print agent-focused context and TCC guidance")
+    c.add_argument("--for-agent", action="store_true", help="Explain authoritative access.effective readiness for agents")
 
     c = sub.add_parser(
         "setup",
@@ -12835,29 +13529,45 @@ def build_parser():
         ),
         epilog=(
             "Examples:\n"
-            "  remctl setup --shell auto --doctor\n"
+            "  remctl setup --shell auto\n"
             "\n"
             "`setup` creates config files and installs completions. It does not grant macOS\n"
-            "permissions. Run `remctl onboard` after setup on a new Mac."
+            "permissions. On a first install, run `remctl onboard`; it requests host access and\n"
+            "opens the host-only FDA guide if needed. On an unchanged existing install, start\n"
+            "with `remctl doctor --for-agent`, and onboard only if doctor reports host permission\n"
+            "trouble. For an upgrade or reinstall, run `./install.sh`, then doctor. That rule\n"
+            "assumes an existing signed host. After official 1.7.1, run onboard because 1.8.0\n"
+            "installs the host for the first time. After an FDA change, restart the host before\n"
+            "doctor. Use `remctl\n"
+            "permissions full-disk-access` only to reopen the guide for repair."
         ),
         formatter_class=HelpFormatter,
     )
     c.add_argument("--shell", choices=["auto", "bash", "zsh", "fish", "skip"], default="auto", help="Shell completion to install")
-    c.add_argument("--doctor", action="store_true", help="Run remctl doctor after setup")
+    c.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run doctor after setup; unchanged installs or completed upgrades/reinstalls only, after any FDA restart",
+    )
     js(c)
 
     c = sub.add_parser(
         "permissions",
-        help="Open guided macOS permission helper",
-        description="Open the RemCTL permission helper for Full Disk Access.",
+        help="Reopen the signed host's Full Disk Access guide",
+        description=(
+            "In human output, reopen the RemCTL helper with only the exact installed signed host\n"
+            "as the Full Disk Access target. JSON reports the validated target without opening UI."
+        ),
         epilog=(
             "Examples:\n"
             "  remctl permissions full-disk-access\n"
             "  remctl permissions full-disk-access --json\n"
             "\n"
-            "The helper opens System Settings, copies the first target path, and shows\n"
-            "draggable targets. In the file picker, press Command-Shift-G and paste if\n"
-            "macOS does not accept dragging."
+            "The helper opens System Settings and copies the signed host path. It never targets\n"
+            "Hermes, Python, Codex, Terminal, or another caller. If the host is absent, reinstall\n"
+            "RemCTL first. After an FDA change, restart the host, then run `remctl doctor\n"
+            "--for-agent`. With `--json`, this command reports state and targets but does not open\n"
+            "the helper. Explicit direct mode is self-managed and cannot use this helper."
         ),
         formatter_class=HelpFormatter,
     )
@@ -12884,6 +13594,7 @@ def build_parser():
 
 def main():
     p, sub = build_parser()
+    original_argv = list(sys.argv[1:])
     # --- Parse ---
     a = parse_cli_args(p, sub)
     command_format = getattr(a, "command_format", None)
@@ -12915,7 +13626,7 @@ def main():
         a.image_width = None
 
     # Set up color
-    if a.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+    if a.no_color or os.environ.get("NO_COLOR") or not stdout_is_interactive():
         C.enabled = False
 
     # Propagate global --format to json flag where needed
@@ -12924,12 +13635,21 @@ def main():
     elif a.format == "json" and hasattr(a, 'json'):
         a.json = True
 
-    maybe_run_first_launch_onboarding(a)
+    route_via_host = _should_route_capability_host(a)
+    onboarding_result = maybe_run_first_launch_onboarding(a)
+    if onboarding_result is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
 
     # No command: splash screen + today
     if not a.cmd:
         a.no_overdue = False
         a.verbose = False
+        if route_via_host:
+            if a.format != "json":
+                show_splash()
+            _dispatch_capability_host(_no_command_host_argv(a), a)
+            return
         if a.format == "json":
             a.json = True
             run_handler_with_fallback(a, cmd_today)
@@ -12937,6 +13657,10 @@ def main():
             a.json = False
             show_splash()
             run_handler_with_fallback(a, cmd_today)
+        return
+
+    if route_via_host:
+        _dispatch_capability_host(_normalized_host_argv(original_argv, a), a)
         return
 
     # Propagate --format table to subcommand

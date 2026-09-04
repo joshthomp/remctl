@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.0 — 2026-09-04
+
+### Signed Capability Host
+
+- Added a persistent, signed `RemCTL Capability Host.app` and per-user LaunchAgent. The host is the single macOS TCC identity for Full Disk Access, Reminders, and Automation, so Terminal, Hermes, Codex, and other callers no longer need separate grants.
+- Normal `auto` mode routes all 49 permission-bearing commands through the owner-only Capability Host socket and protocol 2. Six setup and display commands remain local: `completion`, `doctor`, `list-symbols`, `onboard`, `permissions`, and `setup`. `REMCTL_CAPABILITY_HOST=force` requires the host; `REMCTL_CAPABILITY_HOST=direct` bypasses it for diagnostics and development.
+- Hosted file inputs are opened by the caller and transferred as descriptor-backed capabilities. Interactive destructive confirmations, TTY behavior, stdout/stderr ordering, signals, and cancellation remain supported across the host boundary.
+- **Correction to the 1.5.0 attachment-path guidance:** in hosted output, `attachments[].path` is host-verified metadata, not a caller-readable file capability. The 1.5.0 note below records the earlier direct-execution behavior; with the signed host, callers must use supported RemCTL delivery or rendering and must not receive Full Disk Access merely to open a protected path.
+- The host runs the complete protected CLI from a sealed Python archive, verifies its signed parent and runtime before dispatch, and fixes the bridge, private helper, store, and scratch paths for each invocation. The public client remains compatible with Python 3.10+, while a live host install requires a protected Python 3.13+ runtime.
+- `install.sh` now publishes the app, sealed runtime, secure socket, and LaunchAgent as one verified transaction, with rollback to the previous generation on failure. `uninstall.sh` uses guarded, identity-checked removal and refuses foreign or unexpected paths. Live installs preserve a stable signed identity so upgrades keep the same TCC grants.
+- Installed bin files now have a hash-based ownership manifest. Upgrades and uninstall fail closed on modified, foreign, or unmanifested paths; `--adopt-existing-install` is a one-time, manually reviewed migration for exact official 1.7.1 files or an expected prerelease signed-host installation, not arbitrary older or custom files.
+- `import` now accepts bounded piped JSON with `import -`, validates the complete document before writing, reports each confirmed JSON-mode success on stderr, returns one final JSON summary on stdout, and exits nonzero with `status: "partial"` when runtime failures leave a subset imported.
+
 ## 1.7.1 — 2026-08-13
 
 - `show` now follows Reminders' persisted manual display order instead of always falling back to reminder creation order. The fix applies to JSON, plain, and table output, including each child list shown through a list group. Rows that have not merged into the ordering record yet remain visible after the positioned rows in their previous stable order.
@@ -69,7 +82,7 @@ Inline image attachments: reminders' images are now first-class data — as veri
 ### For agents
 
 - **Attachments in JSON, everywhere.** `info --json` and every list command's JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) now include an `attachments` array on any reminder that has attachments; the key is omitted when there are none. Subtask attachments remain `info`-only.
-- **Verified file paths.** Each entry is `{filename, type, path, resolved, uti, width, height}`. `path` points at the actual file inside Reminders' group container (`Files/Account-*/Attachments/`), verified by hashing the file and matching it against the attachment's stored SHA-512 before it is reported. Vision-capable agents can open the file directly. Legacy attachments that were never downloaded to this Mac report `path: null` and `resolved: false` — treat as unavailable, not as an error.
+- **Verified file paths.** Each entry is `{filename, type, path, resolved, uti, width, height}`. `path` points at the actual file inside Reminders' group container (`Files/Account-*/Attachments/`), verified by hashing the file and matching it against the attachment's stored SHA-512 before it is reported. At the time of 1.5.0, vision-capable agents using direct execution could open the file directly. **Current hosted-flow note:** a signed-host caller receives verified path metadata but may not be able to open the protected file; see the 1.8.0 correction above. Legacy attachments that were never downloaded to this Mac report `path: null` and `resolved: false` — treat as unavailable, not as an error.
 - **Batch-loaded.** List commands resolve attachments with constant-query batch preloads (no N+1), and path verification is memoized per process, so `show --json` on large lists stays fast.
 
 ### For people

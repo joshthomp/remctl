@@ -1,5 +1,8 @@
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
+import Security
 
 struct PermissionTarget {
     let title: String
@@ -14,15 +17,14 @@ struct AfterCommand {
 
 enum PermissionStatus {
     case checking
-    case verified
-    case helperStoreReadable
-    case needsAccess
+    case verifyAfterRestart
 }
 
 struct Options {
     var title = "RemCTL Permissions"
-    var subtitle = "Grant Full Disk Access to the processes RemCTL uses."
+    var subtitle = "Grant Full Disk Access only to the signed RemCTL Capability Host."
     var autoOpenSettings = true
+    var validateOnly = false
     var targets: [PermissionTarget] = []
     var afterCommands: [AfterCommand] = []
 }
@@ -53,16 +55,12 @@ func parseOptions() -> Options {
         case "--no-open":
             options.autoOpenSettings = false
             index += 1
+        case "--validate-only":
+            options.validateOnly = true
+            index += 1
         default:
             index += 1
         }
-    }
-    if options.targets.isEmpty {
-        options.targets.append(PermissionTarget(
-            title: "Current Python interpreter",
-            path: "/usr/bin/python3",
-            subtitle: "Fallback target for direct CLI reads."
-        ))
     }
     return options
 }
@@ -120,105 +118,182 @@ func applicationIconImage() -> NSImage? {
     return NSImage(contentsOf: iconURL)
 }
 
-func remindersStoreReadable() -> Bool {
-    let storesURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Group Containers/group.com.apple.reminders/Container_v1/Stores")
-    guard let contents = try? FileManager.default.contentsOfDirectory(
-        at: storesURL,
-        includingPropertiesForKeys: nil,
-        options: [.skipsHiddenFiles]
-    ) else {
-        return false
-    }
-    return contents.contains { url in
-        url.lastPathComponent.hasPrefix("Data-") &&
-            url.pathExtension == "sqlite" &&
-            FileManager.default.isReadableFile(atPath: url.path)
-    }
+func targetIcon(for target: PermissionTarget) -> NSImage {
+    return NSWorkspace.shared.icon(forFile: target.path)
 }
 
-func isPythonExecutable(_ path: String) -> Bool {
-    let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
-    return name.hasPrefix("python") && FileManager.default.isExecutableFile(atPath: path)
-}
-
-func pythonFrameworkRoot(for path: String) -> URL? {
-    let url = URL(fileURLWithPath: path).standardizedFileURL
-    let components = url.pathComponents
-    guard let frameworkIndex = components.firstIndex(of: "Python.framework"),
-          frameworkIndex + 2 < components.count,
-          components[frameworkIndex + 1] == "Versions" else {
+func codesignResult(arguments: [String]) -> (status: Int32, output: String)? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do {
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    } catch {
         return nil
     }
-    var root = URL(fileURLWithPath: "/")
-    for component in components[1...(frameworkIndex + 2)] {
-        root.appendPathComponent(component)
-    }
-    return root
 }
 
-func pythonIcon(for path: String) -> NSImage? {
-    let candidates: [URL]
-    if let frameworkRoot = pythonFrameworkRoot(for: path) {
-        candidates = [
-            frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/Resources/PythonInterpreter.icns"),
-            frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/Resources/PythonApplet.icns"),
-        ]
-    } else {
-        candidates = [
-            URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/Resources/PythonInterpreter.icns"),
-            URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/Resources/PythonApplet.icns"),
-        ]
+func canonicalCapabilityHostURL(_ path: String) -> URL? {
+    guard path.hasPrefix("/") else { return nil }
+    let standardized = URL(fileURLWithPath: path).standardizedFileURL
+    guard standardized.path == path,
+          standardized.lastPathComponent == "RemCTL Capability Host.app",
+          standardized.resolvingSymlinksInPath().path == path else {
+        return nil
     }
-    for candidate in candidates where FileManager.default.fileExists(atPath: candidate.path) {
-        if let image = NSImage(contentsOf: candidate) {
-            return image
+    return standardized
+}
+
+func installedCapabilityHostPath() -> String? {
+    guard let markerURL = siblingResourceURL(named: ".remctl-capability-host-app") else {
+        return nil
+    }
+    var metadata = stat()
+    guard lstat(markerURL.path, &metadata) == 0,
+          (metadata.st_mode & S_IFMT) == S_IFREG,
+          metadata.st_uid == getuid(),
+          (metadata.st_mode & 0o022) == 0,
+          metadata.st_size > 0,
+          metadata.st_size <= 4096,
+          let data = try? Data(contentsOf: markerURL),
+          let text = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    guard lines.count == 2,
+          lines[1].isEmpty,
+          !lines[0].isEmpty else {
+        return nil
+    }
+    let path = String(lines[0])
+    return canonicalCapabilityHostURL(path) == nil ? nil : path
+}
+
+func preservedSigningIdentity() -> Data? {
+    guard let markerURL = siblingResourceURL(named: ".remctl-capability-host-signing-identity") else {
+        return nil
+    }
+    var metadata = stat()
+    guard lstat(markerURL.path, &metadata) == 0,
+          (metadata.st_mode & S_IFMT) == S_IFREG,
+          metadata.st_uid == getuid(),
+          (metadata.st_mode & 0o022) == 0,
+          metadata.st_size == 41,
+          let data = try? Data(contentsOf: markerURL),
+          let text = String(data: data, encoding: .utf8),
+          text.last == "\n"
+    else { return nil }
+    let identity = String(text.dropLast())
+    guard identity.count == 40,
+          identity.allSatisfy({ $0.isHexDigit }),
+          let decoded = Data(hexadecimal: identity)
+    else { return nil }
+    return decoded
+}
+
+extension Data {
+    init?(hexadecimal: String) {
+        guard hexadecimal.count.isMultiple(of: 2) else { return nil }
+        var result = Data(capacity: hexadecimal.count / 2)
+        var index = hexadecimal.startIndex
+        while index < hexadecimal.endIndex {
+            let next = hexadecimal.index(index, offsetBy: 2)
+            guard let byte = UInt8(hexadecimal[index..<next], radix: 16) else { return nil }
+            result.append(byte)
+            index = next
         }
+        self = result
+    }
+}
+
+func signingIdentityError(for target: URL, expectedIdentifier: String) -> String? {
+    guard let expectedCertificateHash = preservedSigningIdentity() else {
+        return "the preserved signing identity is missing or unsafe"
+    }
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(target as CFURL, [], &staticCode) == errSecSuccess,
+          let staticCode else {
+        return "the target app signature cannot be inspected"
+    }
+    var information: CFDictionary?
+    let informationFlags = SecCSFlags(
+        rawValue: kSecCSSigningInformation | kSecCSRequirementInformation
+    )
+    guard SecCodeCopySigningInformation(
+        staticCode,
+        informationFlags,
+        &information
+    ) == errSecSuccess,
+          let values = information as NSDictionary?,
+          let identifier = values[kSecCodeInfoIdentifier] as? String,
+          identifier == expectedIdentifier,
+          let teamIdentifier = values[kSecCodeInfoTeamIdentifier] as? String,
+          !teamIdentifier.isEmpty,
+          teamIdentifier != "not set",
+          let certificates = values[kSecCodeInfoCertificates] as? [SecCertificate],
+          let leaf = certificates.first
+    else { return "the target app has no stable signing identity" }
+    var designatedRequirement: SecRequirement?
+    guard SecCodeCopyDesignatedRequirement(staticCode, [], &designatedRequirement) == errSecSuccess,
+          designatedRequirement != nil
+    else { return "the target app has no designated requirement" }
+    let leafData = SecCertificateCopyData(leaf) as Data
+    let leafHash = Data(Insecure.SHA1.hash(data: leafData))
+    guard leafHash == expectedCertificateHash else {
+        return "the target app does not match the preserved signing identity"
     }
     return nil
 }
 
-func targetIcon(for target: PermissionTarget) -> NSImage {
-    if isPythonExecutable(target.path), let image = pythonIcon(for: target.path) {
-        return image
+func capabilityHostTargetValidationError(_ target: PermissionTarget) -> String? {
+    let expectedIdentifier = "net.macstories.remctl.capability-host"
+    guard let installedPath = installedCapabilityHostPath() else {
+        return "the installed host marker is missing or unsafe"
     }
-    return NSWorkspace.shared.icon(forFile: target.path)
-}
-
-func pythonTargetCanReadRemindersStore(_ path: String) -> Bool {
-    let script = """
-import glob
-import os
-import sys
-
-base = os.path.expanduser("~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores")
-try:
-    paths = glob.glob(os.path.join(base, "Data-*.sqlite"))
-    ok = any(os.path.isfile(path) and os.access(path, os.R_OK) for path in paths)
-except Exception:
-    ok = False
-sys.exit(0 if ok else 2)
-"""
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: path)
-    process.arguments = ["-c", script]
-    process.standardInput = FileHandle.nullDevice
-    process.standardOutput = Pipe()
-    process.standardError = Pipe()
-    do {
-        try process.run()
-        process.waitUntilExit()
-        return process.terminationStatus == 0
-    } catch {
-        return false
+    guard installedPath == target.path else {
+        return "the target does not match the installed host marker"
     }
-}
-
-func verifyPermissionTarget(_ target: PermissionTarget) -> PermissionStatus {
-    if isPythonExecutable(target.path) {
-        return pythonTargetCanReadRemindersStore(target.path) ? .verified : .needsAccess
+    guard let standardized = canonicalCapabilityHostURL(target.path) else {
+        return "the target path is not canonical"
     }
-    return remindersStoreReadable() ? .helperStoreReadable : .needsAccess
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
+          isDirectory.boolValue else {
+        return "the target app does not exist"
+    }
+    let infoURL = standardized.appendingPathComponent("Contents/Info.plist")
+    guard let infoData = try? Data(contentsOf: infoURL),
+          let info = try? PropertyListSerialization.propertyList(from: infoData, format: nil) as? [String: Any],
+          info["CFBundleIdentifier"] as? String == expectedIdentifier,
+          let executableName = info["CFBundleExecutable"] as? String,
+          !executableName.isEmpty else {
+        return "the target app has invalid bundle metadata"
+    }
+    let executableURL = standardized.appendingPathComponent("Contents/MacOS").appendingPathComponent(executableName)
+    guard FileManager.default.isExecutableFile(atPath: executableURL.path),
+          executableURL.resolvingSymlinksInPath().path == executableURL.path,
+          let verification = codesignResult(arguments: ["--verify", "--deep", "--strict", target.path]),
+          verification.status == 0,
+          let description = codesignResult(arguments: ["-dvvv", "-r-", target.path]),
+          description.status == 0 else {
+        return "the target app signature is invalid"
+    }
+    let descriptionLines = description.output.components(separatedBy: .newlines)
+    guard descriptionLines.contains("Identifier=\(expectedIdentifier)") &&
+          descriptionLines.contains(where: { $0.contains("designated => ") }) else {
+        return "the target app signature identity is invalid"
+    }
+    if let error = signingIdentityError(for: standardized, expectedIdentifier: expectedIdentifier) {
+        return error
+    }
+    return nil
 }
 
 final class ActionButton: NSButton {
@@ -356,15 +431,9 @@ final class TargetRowView: NSView, NSDraggingSource {
         case .checking:
             statusField.stringValue = "Checking..."
             statusField.textColor = .secondaryLabelColor
-        case .verified:
-            statusField.stringValue = "✓ Access verified"
-            statusField.textColor = .systemGreen
-        case .helperStoreReadable:
-            statusField.stringValue = "Store readable (helper check — cannot verify \(target.title) directly)"
-            statusField.textColor = .systemGreen
-        case .needsAccess:
-            statusField.stringValue = "Needs access"
-            statusField.textColor = .systemOrange
+        case .verifyAfterRestart:
+            statusField.stringValue = "Verify after restarting the signed host"
+            statusField.textColor = .secondaryLabelColor
         }
     }
 }
@@ -373,8 +442,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let options: Options
     private var window: NSWindow?
     private var targetRows: [TargetRowView] = []
-    private var refreshTimer: Timer?
-    private var refreshInProgress = false
     private let outputView = NSTextView()
 
     init(options: Options) {
@@ -394,14 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log("Copied first target. In the file picker press Command-Shift-G, paste, press Return, then click Open.")
         }
         refreshTargetStatuses()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.refreshTargetStatuses()
-        }
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
     }
 
     private func buildWindow() {
@@ -425,7 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         openButton.keyEquivalent = "\r"
 
-        let checkButton = ActionButton(title: "Check Access") { _ in
+        let checkButton = ActionButton(title: "How to Verify") { _ in
             self.refreshTargetStatuses(logResult: true)
         }
 
@@ -531,29 +591,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshTargetStatuses(logResult: Bool = false) {
-        if refreshInProgress {
-            return
-        }
-        refreshInProgress = true
         targetRows.forEach { $0.updateStatus(.checking) }
-        let targets = options.targets
-        DispatchQueue.global(qos: .utility).async {
-            let statuses = targets.map { verifyPermissionTarget($0) }
-            DispatchQueue.main.async {
-                for (row, status) in zip(self.targetRows, statuses) {
-                    row.updateStatus(status)
-                }
-                self.refreshInProgress = false
-                if logResult {
-                    let accessible = statuses.filter {
-                        switch $0 {
-                        case .verified, .helperStoreReadable: return true
-                        default: return false
-                        }
-                    }.count
-                    self.log("Accessible \(accessible) of \(statuses.count) Full Disk Access targets.")
-                }
-            }
+        targetRows.forEach { $0.updateStatus(.verifyAfterRestart) }
+        if logResult {
+            self.log("After changing Full Disk Access, click Restart Host + Run Doctor to verify the signed host.")
         }
     }
 
@@ -615,7 +656,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+let options = parseOptions()
+guard options.targets.count == 1,
+      let target = options.targets.first else {
+    let message = "Error: remctl-permissions requires exactly one canonical, validly signed RemCTL Capability Host.app target. Run `remctl permissions full-disk-access` instead.\n"
+    FileHandle.standardError.write(Data(message.utf8))
+    exit(64)
+}
+if let validationError = capabilityHostTargetValidationError(target) {
+    let message = "Error: remctl-permissions refused the RemCTL Capability Host.app target because \(validationError). Run `remctl permissions full-disk-access` instead.\n"
+    FileHandle.standardError.write(Data(message.utf8))
+    exit(64)
+}
+if options.validateOnly {
+    print("valid")
+    exit(0)
+}
+
 let app = NSApplication.shared
-let delegate = AppDelegate(options: parseOptions())
+let delegate = AppDelegate(options: options)
 app.delegate = delegate
 app.run()

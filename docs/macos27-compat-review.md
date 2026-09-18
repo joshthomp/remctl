@@ -25,7 +25,7 @@ Apple's macOS 27 beta release notes were checked on 2026-06-12. The page mention
 Active store:
 
 ```text
-/Users/viticci/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/Data-26773582-F8E5-4444-A416-16E4FE11586A.sqlite
+~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/Data-<store-uuid>.sqlite
 ```
 
 Observed schema:
@@ -99,12 +99,12 @@ This keeps the existing blob path as primary and only uses the normalized table 
 
 ## Verification
 
-Commands run successfully after the patch:
+Commands run successfully after the patch. The two source-tree matrix lines are shown with the current explicit `direct` routing guard so a modern re-run cannot silently use the installed Capability Host; that environment prefix was not part of the original historical run.
 
 ```bash
 python3 -m unittest discover -s tests
-python3 scripts/live_edit_matrix.py --remctl ./remctl --prefix "macOS27 Patch Audit ..."
-python3 scripts/live_private_matrix.py --remctl ./remctl --prefix "macOS27 Patch Audit ..."
+REMCTL_CAPABILITY_HOST=direct python3 scripts/live_edit_matrix.py --remctl ./remctl --prefix "macOS27 Patch Audit ..."
+REMCTL_CAPABILITY_HOST=direct python3 scripts/live_private_matrix.py --remctl ./remctl --prefix "macOS27 Patch Audit ..."
 ./install.sh --doctor
 remctl today --json
 remctl lists --json

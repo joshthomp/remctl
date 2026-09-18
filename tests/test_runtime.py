@@ -11,6 +11,85 @@ import remctl_runtime
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_capability_host_mode_defaults_to_auto(self):
+        self.assertEqual(remctl_runtime.capability_host_mode({}), "auto")
+
+    def test_capability_host_mode_accepts_public_modes(self):
+        for mode in ("auto", "force", "direct"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    remctl_runtime.capability_host_mode(
+                        {"REMCTL_CAPABILITY_HOST": mode}
+                    ),
+                    mode,
+                )
+
+    def test_capability_host_mode_forces_direct_for_host_child(self):
+        self.assertEqual(
+            remctl_runtime.capability_host_mode(
+                {
+                    "REMCTL_CAPABILITY_HOST": "force",
+                    "REMCTL_CAPABILITY_HOST_ACTIVE": "1",
+                    "REMCTL_STORE_DIR": "/sealed/host/store",
+                }
+            ),
+            "direct",
+        )
+
+    def test_custom_store_is_direct_in_auto_and_direct_modes(self):
+        for mode in ("auto", "direct"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    remctl_runtime.capability_host_mode(
+                        {
+                            "REMCTL_CAPABILITY_HOST": mode,
+                            "REMCTL_STORE_DIR": "/tmp/test-store",
+                        }
+                    ),
+                    "direct",
+                )
+
+    def test_force_mode_rejects_custom_store_conflict(self):
+        with self.assertRaisesRegex(ValueError, "conflicts with REMCTL_STORE_DIR"):
+            remctl_runtime.capability_host_mode(
+                {
+                    "REMCTL_CAPABILITY_HOST": "force",
+                    "REMCTL_STORE_DIR": "/does/not/exist",
+                }
+            )
+
+    def test_capability_host_mode_rejects_unknown_values(self):
+        with self.assertRaisesRegex(ValueError, "REMCTL_CAPABILITY_HOST"):
+            remctl_runtime.capability_host_mode(
+                {"REMCTL_CAPABILITY_HOST": "sometimes"}
+            )
+
+    def test_capability_host_command_scope_is_explicit(self):
+        expected_local = {
+            "completion",
+            "doctor",
+            "list-symbols",
+            "onboard",
+            "permissions",
+            "setup",
+        }
+        self.assertEqual(remctl_runtime.LOCAL_COMMANDS, expected_local)
+        for command in expected_local:
+            self.assertEqual(
+                remctl_runtime.capability_host_command_scope(command),
+                "local",
+            )
+        self.assertEqual(
+            remctl_runtime.capability_host_command_scope("today"),
+            "hosted",
+        )
+        self.assertEqual(
+            remctl_runtime.capability_host_command_scope(None),
+            "hosted",
+        )
+        with self.assertRaisesRegex(ValueError, "unclassified"):
+            remctl_runtime.capability_host_command_scope("future-command")
+
     def test_resolve_store_dir_honors_override(self):
         with mock.patch.dict("os.environ", {"REMCTL_STORE_DIR": "/tmp/reminders-store"}, clear=False):
             self.assertEqual(remctl_runtime.resolve_store_dir(), Path("/tmp/reminders-store"))

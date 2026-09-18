@@ -306,21 +306,27 @@ Moving a reminder to another list is not private metadata: use `remctl edit ID -
 
 ## Installation and Doctor
 
-`./install.sh` compiles `remctl-private` when `clang` is available:
+`./install.sh` compiles `remctl-private` and publishes it as part of the signed Capability Host generation. Normal `auto` execution uses the exact helper path fixed by that sealed generation; a caller-side helper override cannot redirect hosted execution.
+
+For an isolated direct helper build:
 
 ```bash
 clang -fobjc-arc -O -F/System/Library/PrivateFrameworks \
   -framework Foundation -framework AppKit -framework ReminderKit \
-  -o ~/bin/remctl-private remctl-private.m
+  -o /tmp/remctl-private remctl-private.m
 ```
 
-`remctl doctor` reports `private_helper` and, when the helper responds, its protocol version. A missing helper is a warning, not a failure, because normal RemCTL usage still works. An outdated helper (protocol older than RemCTL requires) is also flagged, with a "re-run ./install.sh to rebuild remctl-private" hint. In both cases `--private` writes fail with a direct error, so rebuild `remctl-private` after every RemCTL update.
+For normal hosted `auto` execution, `remctl doctor --for-agent --json` reports authoritative private-helper readiness under `capabilityHost.privateProtocol.compatible`; use it with `capabilityHost.fullReady`. The direct `private_helper` check and path apply only to explicit direct diagnostics. An incompatible hosted protocol or outdated deliberate direct helper blocks `--private` writes while normal non-private commands can keep working. Rebuild and republish the signed generation with `install.sh` after every RemCTL update.
 
 Override the helper path for testing:
 
 ```bash
-REMCTL_PRIVATE_PATH=/tmp/remctl-private remctl edit 23880 --private --url https://example.com
+REMCTL_CAPABILITY_HOST=direct \
+REMCTL_PRIVATE_PATH=/tmp/remctl-private \
+remctl edit 23880 --private --url https://example.com
 ```
+
+Helper overrides are supported only in direct mode for development and diagnostics.
 
 ## Agent Notes
 

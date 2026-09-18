@@ -412,11 +412,11 @@ The original read-only audit deferred implementation until disposable writes wer
 ## Reproduction commands
 
 ```bash
-cd /Users/viticci/Projects/remctl
+cd /path/to/remctl
 AUDIT_DIR="$(mktemp -d /tmp/remctl-private-api-audit.XXXXXX)"
 
 git status --short --branch
-/Users/viticci/.local/bin/swift-section --version
+swift-section --version
 sw_vers
 uname -m
 xcrun simctl list runtimes
@@ -446,34 +446,34 @@ otool -L "$AUDIT_DIR/remctl-private"
 /usr/bin/dyld_info -uuid -platform \
   /System/Library/PrivateFrameworks/ReminderKitInternal.framework/ReminderKitInternal
 
-/Users/viticci/.local/bin/swift-section interface \
+swift-section interface \
   --uses-system-dyld-shared-cache --architecture arm64e \
   --cache-image-name ReminderKit \
   -o "$AUDIT_DIR/ReminderKit.swiftinterface"
 
-/Users/viticci/.local/bin/swift-section interface \
+swift-section interface \
   --uses-system-dyld-shared-cache --architecture arm64e \
   --cache-image-name ReminderKitInternal \
   -o "$AUDIT_DIR/ReminderKitInternal.swiftinterface"
 
 xcrun swiftc -frontend -parse "$AUDIT_DIR/ReminderKitInternal.swiftinterface"
 
-python3 /Users/viticci/.codex/skills/inspect-swift-binaries/scripts/inspect_framework.py \
+python3 /path/to/inspect-swift-binaries/scripts/inspect_framework.py \
   ReminderKitInternal --runtime-build 24A5390f --mode interface \
   --architecture arm64 --layout --force \
   --output "$AUDIT_DIR/ReminderKitInternal-iOS27-layout.swiftinterface"
 
-/Users/viticci/.local/bin/swift-section snapshot -a arm64 \
+swift-section snapshot -a arm64 \
   --label "iOS Simulator 26.4 23E254a" \
   -o "$AUDIT_DIR/iOS26.4.snapshot.json" \
   "/Library/Developer/CoreSimulator/Volumes/iOS_23E254a/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.4.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/ReminderKitInternal.framework/ReminderKitInternal"
 
-/Users/viticci/.local/bin/swift-section snapshot -a arm64 \
+swift-section snapshot -a arm64 \
   --label "iOS Simulator 27.0 24A5390f" \
   -o "$AUDIT_DIR/iOS27.snapshot.json" \
   "/Library/Developer/CoreSimulator/Volumes/iOS_24A5390f/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/ReminderKitInternal.framework/ReminderKitInternal"
 
-/Users/viticci/.local/bin/swift-section diff \
+swift-section diff \
   "$AUDIT_DIR/iOS26.4.snapshot.json" "$AUDIT_DIR/iOS27.snapshot.json" \
   --summary-only
 

@@ -1,22 +1,60 @@
 ---
 name: remctl
-description: Use when an agent needs to read, create, edit, complete, inspect, or troubleshoot Apple Reminders through the RemCTL CLI on macOS.
+description: Use when an agent needs to operate Apple Reminders through RemCTL or diagnose its installation, signed Capability Host, permissions, or agent-runner access on macOS.
 ---
 
 # RemCTL
 
-RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreData database for fast, detailed output and writes normally through `remctl-bridge` using EventKit; the real flagged state is the one exception and is written through AppleScript. Unsupported private metadata writes are available only when explicitly requested with `--private`; those go through `remctl-private` and Apple's private ReminderKit APIs. It is CLI-only: there is no local API server, token, launch agent, or service command.
+RemCTL is a power-user Apple Reminders CLI. In a normal installation, protected data commands run through the dedicated, signed `RemCTL Capability Host.app`, which a LaunchAgent keeps available. Terminal, Hermes, Codex, and other same-user callers connect through an owner-only Unix socket using protocol version 2. The host is the single macOS permission target for Full Disk Access, Reminders, and Automation. Public writes use EventKit, non-private flag operations use AppleScript, and explicit `--private` writes use unsupported ReminderKit APIs inside the host. Local administration commands such as `onboard`, `permissions`, `doctor`, `setup`, `completion`, and `list-symbols` stay in the caller.
 
 The installed command can be invoked as `remctl`, `rctl`, or `reminders`; all three names behave identically and produce the same output.
 
 ## Default Workflow
 
-- Use the installed command for user tasks: `remctl ...` (or `rctl ...` / `reminders ...`).
+- In Hermes, Codex, and other agent runners, resolve the installed command with `command -v remctl` and invoke that absolute path. If it is not on `PATH`, check the installer's default `~/bin/remctl` and any custom prefix chosen by the user. Examples below use `remctl` as a human-readable abbreviation.
+- Leave `REMCTL_CAPABILITY_HOST` unset. In a normal installed setup, its default `auto` mode routes protected commands through the signed host. If no usable host is installed, `auto` falls back to direct caller execution, so the caller becomes responsible for its own permissions. `force` requires the host. `direct` always bypasses it; a custom `REMCTL_STORE_DIR` also uses direct execution.
+- Invoke the installed CLI only. Do not call the host socket, EventKit bridge, or private helper directly for normal tasks.
 - Prefer JSON for automation and verification: `remctl today --json`, `remctl show Work --json`, `remctl info <id> --json`.
 - Never write directly to the Reminders SQLite database.
-- Do not use `--via-eventkit` by default. It is a limited read-only fallback for `show`, `search`, `today`, and `upcoming` when Full Disk Access blocks a basic read and the task can tolerate missing Reminders metadata.
+- Never use `--via-eventkit` merely because the caller lacks direct database access. Check effective host readiness first; EventKit mode is deliberately limited and cannot replace full RemCTL semantics.
 - For private reminder metadata, use regular `add` or `edit` with `--private`; use `reminder-move --private` for display ordering; use `edit --private --set-tags`, `--clear-tags`, or `--remove-tag` for synced tag replacement/removal; use `section-create`, `section-rename`, or `section-delete` with `--private` for section management; for private list appearance, Groceries mode, regular-list pinning, or custom-smart-list pinning, use `list-create --private`, `list-edit --private`, `list-pin --private`, or `list-unpin --private`; built-in smart-list pinning is host-capability-dependent. For list groups, use `group-create`, `group-edit`, `list-create --private --group`, or `group-delete` with `--private`; for custom smart lists, use `smart-list-create`, `smart-list-edit`, or `smart-list-delete` with `--private`; for Reminders templates, use `template-create`, `template-apply`, or `template-delete` with `--private`. Do not use raw database mutation.
 - For every destructive command, pass `--force` in agent or `--json` workflows. Without it, RemCTL returns `confirmation_required` on stderr and performs no write.
+- Treat `import` as a limited ordinary-field importer, not a lossless restore. It accepts only `title`, `list`, `notes`, `due`/`dueDate`, `priority`, `url`, `recurrence`, `alarm`, and Boolean `flagged`. It validates the entire array before writing, but a runtime failure after writes begin returns a nonzero `partial` summary and keeps successful reminders. Use `createdIds` and failed indexes to build a retry subset; never rerun the whole file blindly.
+
+## First Install or Upgrade
+
+The CLI requires Python 3.10 or later. The signed-host installer also requires a canonical protected Python 3.13 or later; set `REMCTL_CAPABILITY_PYTHON` only when automatic selection cannot find one.
+
+For a first install, bootstrap the signed host, then run onboarding:
+
+```bash
+cd /path/to/remctl
+./install.sh --bootstrap
+remctl onboard
+```
+
+`onboard` requests the host's Reminders and Automation grants and opens the Full Disk Access pane when that grant is missing. Pause for the manual Full Disk Access step: add only the exact `capabilityHost.app.path` reported by `remctl doctor --for-agent --json`. If the pane was closed or must be reopened, run `remctl permissions full-disk-access`; the helper is not a separate mandatory onboarding step. Restart the LaunchAgent only after a Full Disk Access change. Then, whether or not a change was needed, verify effective host readiness:
+
+```bash
+# Only after changing Full Disk Access:
+launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
+# Always after onboarding:
+remctl doctor --for-agent --json
+```
+
+For a reinstall or upgrade from an existing signed-host installation, use the normal installer. It preserves the existing signed host identity, so macOS can retain its grants:
+
+```bash
+cd /path/to/remctl
+./install.sh
+remctl doctor --for-agent --json
+```
+
+The legacy migration recognizes only the exact public files from official RemCTL 1.7.1, its expected aliases, and expected native-helper types. Start with a normal upgrade. If generated helpers are present, manually review every reported path and rerun once with the same prefix plus `./install.sh --adopt-existing-install`. That release predates the signed host. After installing 1.8.0 over 1.7.1, run `remctl onboard`, complete any Full Disk Access step and restart, then verify `remctl doctor --for-agent --json`; there are no earlier host grants to preserve.
+
+If an expected prerelease signed-host upgrade refuses an unmanifested installation, do not immediately bypass the refusal. Inspect every reported RemCTL-owned path and confirm the scripts, helpers, aliases, signed host app, and LaunchAgent belong to that reviewed prerelease installation. Move any foreign, unknown, or modified collision out of the install destinations. Only after that manual review, rerun once with the same prefix and `./install.sh --adopt-existing-install`, then verify `remctl --version` and `remctl doctor --for-agent --json`. Run onboarding if this exact host identity has not already received its grants. Never use adoption for routine upgrades or arbitrary older versions.
+
+Do not run `onboard` during a routine reinstall or upgrade of an existing signed-host installation. Use it as a repair step only when `doctor --for-agent --json` reports a Reminders, Automation, or Full Disk Access problem. This does not apply to the official 1.7.1-to-1.8.0 first-host transition above. Reinstall through `install.sh`; do not copy, move, or re-sign the host app manually. Do not reset macOS permission records as a routine repair.
 
 ## Agent Routing
 
@@ -38,9 +76,9 @@ Start by deciding the write path. Public EventKit writes are stable and do not n
 | Custom smart list create/edit/delete | `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Yes | `smart-lists --json` |
 | Saved Reminders templates | `templates`, `template-info`, `template-create`, `template-apply`, `template-delete` | Reads no; writes yes | `templates --json`, `template-info`, then `show <new list> --json` after apply |
 
-## Limited EventKit Read Fallback
+## Limited EventKit Read Mode
 
-`--via-eventkit` is not normal RemCTL output. Use it only when a supported basic read command is blocked by Full Disk Access and the user request does not need full Reminders fidelity.
+`--via-eventkit` explicitly requests a deliberately degraded read result; it does not change capability-host routing and RemCTL never selects it automatically. In normal installed `auto` mode, the limited read runs inside the signed host. In `direct` mode, in `auto` mode when no usable host is installed, or with a custom `REMCTL_STORE_DIR`, it runs in the caller. Use it only when the command is supported and the task explicitly tolerates missing numeric IDs and private metadata.
 
 Supported commands:
 
@@ -173,7 +211,7 @@ remctl add "Ship release" -l Work --flag --json
 
 - Success under `--json` is `{"status": "flagged", "id": 23880, "title": "…"}` (or `"unflagged"`) on stdout, exit 0. Verify with `info <id> --json` under `flagged`.
 - Failure is terminal: exit 1 with the underlying osascript error. Under `--json` the payload is `{"status": "error", "code": "applescript_flag_failed", "id": 23880, "message": "…"}` on **stderr**, stdout is empty, and the flag is unchanged. Never report a flag as set without a `flagged`/`unflagged` payload.
-- Typical causes are missing Automation access for Reminders (`-1743`) and an unresponsive Reminders.app (120s timeout). Grant Automation access, or fall back to `edit <id> --private --flagged` / `edit <id> --private --no-flagged`, which writes the same state through ReminderKit.
+- Typical causes are missing Automation access for the signed RemCTL Capability Host (`-1743`) and an unresponsive Reminders.app (120s timeout). Run `remctl doctor --for-agent --json`; use `remctl onboard` to repair the host grant only when doctor reports permission trouble. When appropriate, `edit <id> --private --flagged` or `edit <id> --private --no-flagged` avoids AppleScript and writes the same state through ReminderKit.
 - `add -f/--flag` never fails the create. On flag failure the reminder still exists and `--json` returns `status: "created"` plus `"warnings": ["flag_not_set: <error>"]`; check `warnings` before telling the user the new reminder is flagged. With `--private`, `add --flag` goes through ReminderKit instead and its failures surface on the `partial` path, not in `warnings`.
 
 ## Private Metadata
@@ -307,11 +345,12 @@ remctl template-delete "Packing Template" --private --force --json
 
 ## Verification Rules
 
-- Treat `remctl doctor --json` as the first setup check.
+- For agents, start with the resolved installed command: `remctl doctor --for-agent --json`.
+- Treat `access.effective` as authoritative. Normal readiness requires `route: "capabilityHost"`, `ready: true`, `capabilityHost.fullReady: true`, `capabilityHost.protocolVersion: 2`, `capabilityHost.privateProtocol.compatible: true`, and `fullDiskAccess`, `reminders`, and `automation` all `authorized` under `capabilityHost.permissions`.
+- `access.direct.ready` describes only the caller. It may be false while Hermes or another agent has full effective access through the host. `capabilityHost.ready` means the host has Full Disk Access; it is not the full-readiness result.
 - For private-API drift audits, send `{"action":"capabilities"}` to the installed `remctl-private`. It is read-only: it reports the host OS, watched smart-list/grocery selectors and encodings, and `saveCalled: false`. Do not infer write safety from capability presence alone; run the disposable write/readback/cleanup matrix on each supported macOS version.
-- For agents, prefer `remctl doctor --for-agent --json`; `doctor` must pass in the same execution context that will run the write and checks both database access and EventKit Reminders write authorization.
-- Check `private_helper` in `remctl doctor --json` before using `--private`; it reports the helper protocol version. An outdated `remctl-private` refuses `--private` writes (`remctl-private is outdated … re-run install.sh to rebuild`); tell the user to re-run `install.sh` after updating.
-- Do not run `doctor` before every ordinary task once the current context is known-good; it is a setup/TCC diagnostic, not a per-write verification step.
+- Reinstall when the capability-host protocol is not version 2 or `capabilityHost.privateProtocol.compatible` is false. Do not infer installed-host compatibility from the direct `private_helper` check.
+- Do not run `doctor` before every ordinary task once effective access is known-good; it is a setup and permission diagnostic, not a per-write verification step.
 - For writes, verify against live Reminders data after the command succeeds.
 - `remctl search QUERY --completed --json` includes completed reminders and searches both titles and notes.
 - `remctl add --json` returns `numericId` when direct DB reads can resolve the new reminder. Use that for `remctl info <numericId> --json`. If `numericId` is absent, resolve the UUID-like `id` with `remctl show <list> --json` by matching the created title.
@@ -333,20 +372,29 @@ remctl info <numericId> --json
 
 `add --private` validates section/assignee/URL inputs before creating the reminder. If a private step still fails after creation, JSON output is `{"status": "partial", "id", "numericId", "failed", "error"}` (text mode: `Created reminder #N but failed to apply <action>; re-run edit to finish. Do NOT re-run add (would duplicate).`). On `partial`, re-run `edit` to finish the metadata; never re-run `add`.
 
-`info --json` includes section, actual due date, optional display/alert date, tags, subtasks, parent and subtask attachments, EventKit alarms, location alarms, Early Reminders, deep link, and private rich-link `url` when present. List-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) also includes `attachments` for parent reminders; the key is omitted when a reminder has none. Each attachment entry is `{filename, type, path, resolved, uti, width, height}`. Consume `path` directly: it is the sha512-verified local file, so read the file from disk — vision-capable agents can open the image. `path: null` with `resolved: false` means a legacy attachment that is not downloaded on this Mac; treat it as unavailable, not as an error. Avoid raw SQLite checks unless the CLI output lacks a field you need.
+`info --json` includes section, actual due date, optional display/alert date, tags, subtasks, parent and subtask attachments, EventKit alarms, location alarms, Early Reminders, deep link, and private rich-link `url` when present. List-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) also includes `attachments` for parent reminders; the key is omitted when a reminder has none. Each attachment entry is `{filename, type, path, resolved, uti, width, height}`. In hosted output, `resolved: true` and `path` mean the signed host resolved and sha512-verified the file; they do not prove the caller can open that protected group-container path. Do not grant Hermes, Codex, Python, or another caller Full Disk Access to compensate. Treat the entry as verified metadata unless RemCTL delivers or renders its contents through a supported command. `path: null` with `resolved: false` means a legacy attachment that is not downloaded on this Mac; treat it as unavailable, not as an error. Avoid raw SQLite checks unless the CLI output lacks a field you need.
 
 ## Permissions
 
-First-run setup:
+Run onboarding after a first install. For an existing installation, run it only when `doctor --for-agent --json` reports a host permission problem:
 
 ```bash
 remctl onboard
-remctl permissions full-disk-access
-remctl doctor
 ```
 
-RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript operations, and Full Disk Access for direct database reads. `flag`, `unflag`, and `add --flag` are AppleScript-only, not a fallback: without Automation access they fail instead of degrading. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
+The signed RemCTL Capability Host owns Reminders, Automation, and Full Disk Access for normal `auto` execution. `onboard` checks and requests the host's Reminders and Automation grants. macOS has no Full Disk Access prompt, so onboarding opens System Settings and presents the exact host app path when that grant is missing. If that pane must be reopened, run `remctl permissions full-disk-access`. Do not run the helper unconditionally.
 
-macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`; if the `eventkit` check fails, run `remctl onboard` from the same context to trigger Reminders access. For a one-off unblock, run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
+Pause while the user adds only the exact `capabilityHost.app.path` reported by doctor in Full Disk Access. Do not add Hermes, Codex, Terminal, Python, or every caller. `flag`, `unflag`, and non-private `add --flag` require the host's Automation grant; they do not silently degrade.
 
-`doctor` reports `completion_fpath` when an installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files. Full Disk Access targets come from the current process context; when terminal engines are embedded, trust `host_app` and `host_app_path` from `doctor --for-agent --json` over inherited `TERM_PROGRAM` labels.
+Restart the LaunchAgent only after changing Full Disk Access. Whether or not a change was needed, run doctor after onboarding to read back effective readiness:
+
+```bash
+# Only after changing Full Disk Access:
+launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
+# Always after onboarding:
+remctl doctor --for-agent --json
+```
+
+If doctor reports that Reminders or Automation was denied, enable RemCTL Capability Host in the matching System Settings privacy pane and rerun `onboard`. After the running persistent host has observed a definitive Automation state (`authorized`, `denied`, or `notDetermined`), transient status outages retain that last state. A cold or restarted host without a definitive cached state may report `targetNotRunning` or `unknown`, with `fullReady: false`, until verification succeeds. Do not require Reminders.app to remain open between commands.
+
+Per-caller macOS permission scope matters only during explicit `REMCTL_CAPABILITY_HOST=direct` diagnostics or custom-store work. A blocked direct result is not a reason to route through Terminal or AppleScript when effective host access is ready. `doctor` also reports `completion_fpath` when an installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files.

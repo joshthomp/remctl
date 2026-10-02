@@ -9,7 +9,8 @@ from datetime import datetime
 
 
 CUSTOM_SMART_LIST_TYPE = "com.apple.reminders.smartlist.custom"
-SUPPORTED_PRIORITIES = {"low", "medium", "high"}
+# Reminders.app stores its No Priority filter as "none".
+SUPPORTED_PRIORITIES = {"none", "low", "medium", "high"}
 SUPPORTED_MATCH_OPERATIONS = {"all": "and", "any": "or", "and": "and", "or": "or"}
 SUPPORTED_TIME_FILTERS = {"morning", "afternoon", "evening", "night", "no-time", "noTime"}
 SUPPORTED_RELATIVE_DIRECTIONS = {
@@ -381,7 +382,7 @@ def normalize_priorities(priorities):
         value = str(priority).strip().lower()
         if value not in SUPPORTED_PRIORITIES:
             raise SmartListFilterError(
-                "Unsupported smart list priority. Use low, medium, or high."
+                "Unsupported smart list priority. Use high, medium, low, or none."
             )
         if value not in normalized:
             normalized.append(value)

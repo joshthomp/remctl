@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.2.0 — 2026-10-02
+
+### Fixes
+
+- Smart lists that filter on No Priority work in RemCTL ([#55](https://github.com/viticci/remctl/issues/55)). Reminders stores No Priority as `none`, which RemCTL didn't know, so the workspace refused the whole smart list with "This smart list uses filters RemCTL cannot decode," and `smart-lists` called the filter unsupported. RemCTL now reads it everywhere, `smart-list-create` and `smart-list-edit` take `--priority none`, and the workspace's smart list editor has a No Priority option. Thanks to @john-catalano for the report.
+- A custom smart list with no saved color is blue in the workspace, as in Reminders, instead of green. `smart-lists --json` now reports that blue as its `color`.
+- The workspace's Today, Overdue, and Scheduled views and Claude Code's Today panel use the date Reminders displays, matching the CLI and MCP tools when an alarm differs from the due date.
+- An absolute alert exactly one local UTC offset away from a zoned due time no longer makes RemCTL misread the due time as floating. For example, a 17:00 due time with a 15:00 alert in Rome stays 17:00, and another reschedule preserves the custom alert.
+- Claude Code's Today panel no longer offers Undo for a repeating reminder. Uncompleting it cannot restore the occurrence that just advanced.
+- Installing with an existing protected Python runtime includes the plugin packages and marketplace, so Codex can still install or refresh RemCTL from the signed host.
+
+### Performance
+
+- Smart-list pages and previews load full reminder details only for the returned page. Counts and filtering share lightweight fields and read tags and location alarms only when the filters need them.
+- Statistics count reminders in one database scan instead of five.
+
 ## 2.1.0 — 2026-10-02
 
 ### New

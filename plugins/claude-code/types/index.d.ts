@@ -3,11 +3,12 @@ export type TodayTask = {
   id: number
   title: string
   list: string
-  // Local time without a zone, as RemCTL writes it: `2026-10-01T22:00:00`.
+  // Reminders' display date, falling back to the due date, in local time.
   due: string | null
   allDay: boolean
   flagged: boolean
   priority: string
+  recurring: boolean
 }
 
 // A Reminders list's look, from RemCTL's `lists` tool.

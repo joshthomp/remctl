@@ -23,13 +23,13 @@ const result = (structuredContent: object) => ({
 // fixtures; every call lands in `calls`.
 const SERVER = 'plugin:remctl:remctl'
 
-function remctl(on: On, calls: { tool: string; args: Record<string, unknown> }[]) {
+function remctl(on: On, calls: { tool: string; args: Record<string, unknown> }[], tasks: object[] = TODAY) {
   const clock = mock.clock(on, { now: NOW })
   on('mcp.connect', () => ({ value: { isConnected: true, server: SERVER } }))
   on('mcp.call', ($, e) => {
     if (e.server !== SERVER) throw new Error(`no server ${e.server}`)
     calls.push({ tool: e.tool, args: e.args })
-    if (e.tool === 'today') return result({ items: TODAY, count: TODAY.length })
+    if (e.tool === 'today') return result({ items: tasks, count: tasks.length })
     if (e.tool === 'lists') return result({ items: LISTS, count: LISTS.length })
     return result({ ok: true })
   })
@@ -87,5 +87,28 @@ describe('remctl today', () => {
 
     expect(calls).toContainEqual({ tool: 'set_completion', args: { reminder_id: 2, completed: true } })
     expect(await ui.find({ key: 'undo' })).toBeDefined()
+  })
+
+  test('the band uses the display date for both labels and overdue counts', async ($, on) => {
+    const clock = remctl(on, [], [{ ...TODAY[1], displayDate: '2026-09-30T18:00:00' }])
+    await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'remctl', surface: 'terminal', ...BAND })
+    expect(await ui.find({ type: 'Text', text: /^ · 1 overdue$/ })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /^Yesterday$/ }))?.props).toMatchObject({ color: '#FF453A' })
+  })
+
+  test('completing a repeating task does not offer an undo that cannot restore its occurrence', async ($, on) => {
+    const calls: { tool: string; args: Record<string, unknown> }[] = []
+    const clock = remctl(on, calls, [{ ...TODAY[1], recurrence: { frequency: 'daily', interval: 1 } }])
+    await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'remctl', surface: 'terminal', component: 'Pane',
+      requestId: 'remctl-today', props: { title: 'Today', isFocused: true, bodyColumns: 48, placement: 'dock' } })
+    await ui.press({ key: 'done-2' })
+    expect(calls).toContainEqual({ tool: 'set_completion', args: { reminder_id: 2, completed: true } })
+    expect(await ui.find({ key: 'undo' })).toBeUndefined()
   })
 })

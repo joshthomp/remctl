@@ -194,6 +194,12 @@ class LiveEditMatrix:
             lambda p: p.get("dueDate") == self.iso(17) and self.alarm_dates(p) == [self.iso(15)],
             "custom absolute alarm was rewritten during reschedule",
         )
+        self.edit(rid, "-d", self.stamp(18))
+        self.wait_info(
+            rid,
+            lambda p: p.get("dueDate") == self.iso(18) and self.alarm_dates(p) == [self.iso(15)],
+            "a second reschedule moved the custom absolute alarm",
+        )
         self.record("custom absolute alarm survives reschedule", str(rid))
 
     def noop_reschedule_preserves_custom_alarm(self, list_name: str):

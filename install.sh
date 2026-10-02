@@ -164,6 +164,7 @@ REQUIRED_SOURCES=(
     remctl-bridge.swift remctl-permissions.swift remctl-private.m remctl-capability-host.swift
     remctl-capability-host-Info.plist remctl-capability-host-launchagent.plist
     scripts/build_capability_archive.py scripts/render_list_badges.swift assets/remctl.icns
+    .agents/plugins/marketplace.json plugins/remctl/plugin.json plugins/remctl/mcp.json
 )
 for source_name in "${REQUIRED_SOURCES[@]}"; do
     [[ -f "$SCRIPT_DIR/$source_name" && ! -L "$SCRIPT_DIR/$source_name" ]] || fail "Missing required source: $source_name"
@@ -556,6 +557,9 @@ STAGED_RESOURCES="$STAGED_APP/Contents/Resources"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_RESOURCES/CapabilityRuntime/bin"
 cp "$SCRIPT_DIR/remctl-capability-host-Info.plist" "$STAGED_APP/Contents/Info.plist"
 cp "$SCRIPT_DIR/assets/remctl.icns" "$STAGED_RESOURCES/remctl.icns"
+mkdir -p "$STAGED_RESOURCES/.agents"
+cp -R "$SCRIPT_DIR/.agents/plugins" "$STAGED_RESOURCES/.agents/plugins"
+cp -R "$SCRIPT_DIR/plugins" "$STAGED_RESOURCES/plugins"
 swiftc "$SCRIPT_DIR/scripts/render_list_badges.swift" -o "$BIN_STAGE/remctl-list-artwork"
 "$BIN_STAGE/remctl-list-artwork" "$SCRIPT_DIR/remctl" "$BIN_STAGE/remctl-list-symbols.json"
 cp "$BIN_STAGE/remctl-bridge" "$STAGED_RESOURCES/CapabilityRuntime/bin/remctl-bridge"

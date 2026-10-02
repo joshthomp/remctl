@@ -68,6 +68,17 @@ class SmartListFilterTests(unittest.TestCase):
         self.assertEqual(single["summary"]["priorities"], ["high"])
         self.assertEqual(multiple["summary"]["priorities"], ["low", "medium", "high"])
 
+    def test_decode_no_priority_filter(self):
+        # Reminders.app's "No Priority" plus "Exclude Selected List" (#55).
+        decoded = decode_smart_list_filter_blob(
+            b'{"operation":"and","priorities":["none"],'
+            b'"lists":{"include":[],"exclude":["46EBCB36-C7CB-4983-937A-A5137895473F"],"operation":"and"}}'
+        )
+
+        self.assertTrue(decoded["summary"]["supported"])
+        self.assertEqual(decoded["summary"]["filters"][0]["priorities"], ["none"])
+        self.assertEqual(build_supported_filter_payload(priorities=["none"]), {"priorities": ["none"]})
+
     def test_decode_reminders_app_official_filter_samples(self):
         samples = [
             {"hashtags": {"hashtags": {"operation": "or", "include": ["remctl", "codex"], "exclude": []}}},
@@ -153,7 +164,7 @@ class SmartListFilterTests(unittest.TestCase):
         with self.assertRaises(SmartListFilterError):
             build_supported_filter_payload()
         with self.assertRaises(SmartListFilterError):
-            build_supported_filter_payload(priorities=["none"])
+            build_supported_filter_payload(priorities=["urgent"])
         with self.assertRaises(SmartListFilterError):
             build_supported_filter_payload(date_any=True, date_on="2026-05-15")
 

@@ -160,13 +160,13 @@ class DueDateTests(unittest.TestCase):
         self.assertEqual(payload["displayDate"], "2026-09-30T09:15:00")
         self.assertFalse(payload["allDay"])
 
-    def serialize_in_local_zone(self, zone, **fields):
+    def serialize_in_local_zone(self, zone, *, db=None, **fields):
         """Serialize with the process time zone set, as the CLI's own ts() reads it."""
         previous = os.environ.get("TZ")
         os.environ["TZ"] = zone
         time.tzset()
         try:
-            return self.serialize_local(**fields)
+            return self.serialize_local(db=db, **fields)
         finally:
             if previous is None:
                 os.environ.pop("TZ", None)
@@ -174,10 +174,10 @@ class DueDateTests(unittest.TestCase):
                 os.environ["TZ"] = previous
             time.tzset()
 
-    def serialize_local(self, **fields):
+    def serialize_local(self, *, db=None, **fields):
         row = dict(reminder_rows(1)[0], ZALLDAY=0, **fields)
         ts = lambda value: datetime.fromtimestamp(value + APPLE_EPOCH) if value else None
-        return serialize_reminder(row, ts=ts, priority_names={})
+        return serialize_reminder(row, ts=ts, priority_names={}, db=db)
 
     def test_floating_timed_due_date_reads_as_wall_clock_time(self):
         # Rows from issue #49, in New York on September 30 (UTC-4). Reminders.app
@@ -207,3 +207,44 @@ class DueDateTests(unittest.TestCase):
         )
         self.assertEqual(payload["dueDate"], "2026-09-30T17:00:00")
         self.assertEqual(payload["displayDate"], "2026-09-30T16:45:00")
+
+    def test_absolute_alarm_at_utc_offset_does_not_change_zoned_due_time(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.executescript(
+            "CREATE TABLE ZREMCDOBJECT (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, "
+            "ZREMINDER INTEGER, ZTRIGGER INTEGER, ZMARKEDFORDELETION INTEGER, "
+            "ZDATECOMPONENTSDATA BLOB);"
+            "CREATE INDEX alarm_reminder ON ZREMCDOBJECT (ZREMINDER);"
+            "INSERT INTO ZREMCDOBJECT VALUES (1,15,1,2,0,NULL), (2,17,NULL,NULL,0,'{}');"
+        )
+        utc = lambda hour: apple_seconds(datetime(2026, 9, 30, hour, tzinfo=timezone.utc))
+        for zone, due, display, expected_due, expected_display in (
+            ("Europe/Rome", utc(15), utc(13), "17:00:00", "15:00:00"),
+            ("America/New_York", utc(17), utc(21), "13:00:00", "17:00:00"),
+        ):
+            with self.subTest(zone=zone):
+                payload = self.serialize_in_local_zone(
+                    zone, db=db, ZDUEDATE=due, ZDISPLAYDATEDATE=display, ZTIMEZONE=zone,
+                )
+                self.assertEqual(payload["dueDate"], f"2026-09-30T{expected_due}")
+                self.assertEqual(payload["displayDate"], f"2026-09-30T{expected_display}")
+        # A genuinely floating reminder stays floating even when it has an alarm.
+        payload = self.serialize_in_local_zone(
+            "America/New_York", db=db, ZDUEDATE=utc(17), ZDISPLAYDATEDATE=utc(21), ZTIMEZONE=None,
+        )
+        self.assertEqual(payload["dueDate"], "2026-09-30T17:00:00")
+        self.assertNotIn("displayDate", payload)
+        # Deleted alarms must not override the legacy wall-clock fallback.
+        db.execute("UPDATE ZREMCDOBJECT SET ZMARKEDFORDELETION = 1 WHERE Z_PK = 1")
+        payload = self.serialize_in_local_zone(
+            "America/New_York", db=db, ZDUEDATE=utc(12), ZDISPLAYDATEDATE=utc(16), ZTIMEZONE="America/New_York",
+        )
+        self.assertEqual(payload["dueDate"], "2026-09-30T12:00:00")
+        # At UTC the two interpretations agree, so no alarm lookup is needed.
+        no_queries = mock.Mock()
+        no_queries.execute.side_effect = AssertionError("Unexpected alarm query")
+        payload = self.serialize_in_local_zone(
+            "UTC", db=no_queries, ZDUEDATE=utc(17), ZDISPLAYDATEDATE=utc(17), ZTIMEZONE="UTC",
+        )
+        self.assertEqual(payload["dueDate"], "2026-09-30T17:00:00")

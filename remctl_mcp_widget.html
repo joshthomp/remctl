@@ -1022,7 +1022,7 @@ const canOpenLinks = () => isPlainObject(state.hostCapabilities.openLinks);
     reject: () => { /* standalone preview: no host */ }
   });
   post({ jsonrpc: "2.0", id: 0, method: "ui/initialize",
-    params: { appInfo: { name: "RemCTL Reminders", version: "2.1.0" }, appCapabilities: {}, protocolVersion: PROTOCOL_VERSION } });
+    params: { appInfo: { name: "RemCTL Reminders", version: "2.2.0" }, appCapabilities: {}, protocolVersion: PROTOCOL_VERSION } });
 })();
 
 function reportSize() {

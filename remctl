@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v2.1.0
+"""remctl — Power-user Reminders CLI v2.2.0
 
 Normal installed commands run through the signed RemCTL Capability Host, which
 owns database, Reminders, and Automation access. The client supports Python
@@ -70,7 +70,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 PRIVATE_PROTOCOL_VERSION = 2
 RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 _private_protocol_probe = None
@@ -2789,14 +2789,14 @@ def should_carry_absolute_alarm_to_new_due(db, reminder, new_due, explicit_alarm
     alarm_dates = _absolute_alarm_datetimes(db, reminder)
     if not alarm_dates:
         return False
-    old_due = ts(timed_due_raw(reminder))
+    old_due = ts(timed_due_raw(reminder, db=db))
     return all(_same_datetime_second(alarm_dt, old_due) for alarm_dt in alarm_dates)
 
 def should_clear_matching_absolute_alarm(db, reminder):
     alarm_dates = _absolute_alarm_datetimes(db, reminder)
     if not alarm_dates:
         return False
-    old_due = ts(timed_due_raw(reminder))
+    old_due = ts(timed_due_raw(reminder, db=db))
     old_display = ts(_row_get(reminder, "ZDISPLAYDATEDATE"))
     return all(
         any(_same_datetime_second(alarm_dt, candidate) for candidate in (old_due, old_display))
@@ -2996,10 +2996,10 @@ def _item_is_all_day(item):
     return bool(_item_get(item, "allDay", False))
 
 
-def row_effective_due(item):
+def row_effective_due(item, db=None):
     """Raw due timestamp, with the local day for an all-day item."""
     if _item_has(item, "ZDUEDATE"):
-        due = timed_due_raw(item)
+        due = timed_due_raw(item, db=db)
     else:
         due = _item_get(item, "dueDate")
     if _item_is_all_day(item):
@@ -7597,6 +7597,9 @@ def smart_list_to_dict(row):
     }
     if _row_has_key(row, "ZCOLOR") and row["ZCOLOR"]:
         payload["color"] = parse_list_color(row["ZCOLOR"])
+    elif payload["kind"] == "custom":
+        # Reminders shows a custom smart list saved without a color in its default blue.
+        payload["color"] = parse_list_color(None)
     if _row_has_key(row, "ZBADGEEMBLEM") and row["ZBADGEEMBLEM"]:
         payload["badge"] = parse_badge_emblem(row["ZBADGEEMBLEM"])
         payload["badgeEmblem"] = row["ZBADGEEMBLEM"]
@@ -10050,7 +10053,7 @@ def cmd_edit(a):
     # date first (bumped 1 hour), then the real target.
     dt_nudge = None
     if dt is not None and r["ZDUEDATE"] is not None:
-        current = ts(timed_due_raw(r))
+        current = ts(timed_due_raw(r, db=db))
         if current and int(current.timestamp()) == int(dt.timestamp()):
             dt_nudge = dt + (timedelta(days=1) if due_all_day else timedelta(hours=1))
     carry_absolute_alarm = should_carry_absolute_alarm_to_new_due(
@@ -10762,7 +10765,7 @@ def cmd_info(a):
         if originator:
             print(f"  By:        {safe_display(originator)}")
     if r["ZDUEDATE"]:
-        effective_due = ts(row_effective_due(r))
+        effective_due = ts(row_effective_due(r, db=db))
         if _item_is_all_day(r):
             print(f"  Due:       {effective_due.strftime('%b %d, %Y')} (all-day)")
         else:
@@ -10947,17 +10950,15 @@ def cmd_stats(a):
     due_column = due_filter_expr(db)
     sod = start_of_day()
 
-    def count(where=""):
-        return db.execute(
-            "SELECT COUNT(*) FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-            f"WHERE {LIVE_REMINDER_SQL}{where}"
-        ).fetchone()[0]
-
-    total = count()
-    active = count(" AND r.ZCOMPLETED = 0")
-    flagged = count(" AND r.ZCOMPLETED = 0 AND r.ZFLAGGED = 1")
-    urgent = count(f" AND r.ZCOMPLETED = 0 AND {urgent_where_clause(db)}")
-    overdue = count(f" AND r.ZCOMPLETED = 0 AND {due_column} IS NOT NULL AND {due_column} < {to_ts(sod)}")
+    total, active, flagged, urgent, overdue = db.execute(
+        "SELECT COUNT(*), "
+        "COUNT(CASE WHEN r.ZCOMPLETED = 0 THEN 1 END), "
+        "COUNT(CASE WHEN r.ZCOMPLETED = 0 AND r.ZFLAGGED = 1 THEN 1 END), "
+        f"COUNT(CASE WHEN r.ZCOMPLETED = 0 AND {urgent_where_clause(db)} THEN 1 END), "
+        f"COUNT(CASE WHEN r.ZCOMPLETED = 0 AND {due_column} < ? THEN 1 END) "
+        "FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE {LIVE_REMINDER_SQL}", (to_ts(sod),)
+    ).fetchone()
     lists_count = len(q_lists(db))
     sections_count = len(q_sections(db))
     if a.json:
@@ -11770,7 +11771,7 @@ def add_smart_list_filter_arguments(parser, *, match_default="all", tag_match_de
     parser.add_argument("--match", choices=["all", "any"], default=match_default, help="Match all or any supplied filters")
     parser.add_argument("--filter-json", help="Advanced: raw official smart-list filter JSON or @path")
     parser.add_argument("--flagged", action="store_true", help="Filter to flagged reminders")
-    parser.add_argument("--priority", help="Priority filter: high, medium, low, or comma-separated values")
+    parser.add_argument("--priority", help="Priority filter: high, medium, low, none, or comma-separated values")
     parser.add_argument("--tags", help="Selected tag filter, comma-separated; # prefix optional")
     parser.add_argument("--tag-match", choices=["all", "any"], default=tag_match_default, help="Selected tag matching mode")
     parser.add_argument("--any-tag", action="store_true", help="Filter to reminders with any tag")
@@ -12141,7 +12142,7 @@ _remctl() {
                 '--symbol[Official Reminders list symbol]:symbol:' \
                 '--emoji[Private Reminders emoji badge]:emoji:' \
                 '--flagged[Filter to flagged reminders]' \
-                '--priority[Priority filter]:priority:(high medium low)' \
+                '--priority[Priority filter]:priority:(high medium low none)' \
                 '--match[Match all or any filters]:match:(all any)' \
                 '--tags[Selected tag filter, comma-separated; # prefix optional]:tags:' \
                 '--tag-match[Selected tag matching mode]:match:(all any)' \
@@ -12172,7 +12173,7 @@ _remctl() {
                 '--symbol[Official Reminders list symbol]:symbol:' \
                 '--emoji[Private Reminders emoji badge]:emoji:' \
                 '--flagged[Filter to flagged reminders]' \
-                '--priority[Priority filter]:priority:(high medium low)' \
+                '--priority[Priority filter]:priority:(high medium low none)' \
                 '--match[Match all or any filters]:match:(all any)' \
                 '--tags[Selected tag filter, comma-separated; # prefix optional]:tags:' \
                 '--tag-match[Selected tag matching mode]:match:(all any)' \

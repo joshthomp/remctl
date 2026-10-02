@@ -14,7 +14,7 @@ This maps every RemCTL command to where it lives in the [Codex workspace](deskto
 | `sections`, `section-create`, `section-rename`, `section-delete` | Section headings, columns, section menus, drag and drop, and forms. |
 | `sharees` | The assignment picker, filled with the shared list's real members. |
 | `location-lookup` | Location search, plus address, coordinates, radius, and arriving/leaving in the inspector. |
-| `smart-lists`, `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Sidebar and a visual editor with preview: flags, priorities, tags (including exclusions and untagged), absolute, relative, and no-date rules, times, lists, locations, and car rules. The raw filter JSON is still editable. |
+| `smart-lists`, `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Sidebar and a visual editor with preview: flags, priorities (including No Priority), tags (including exclusions and untagged), absolute, relative, and no-date rules, times, lists, locations, and car rules. The raw filter JSON is still editable. |
 | `templates`, `template-info`, `template-create`, `template-apply`, `template-delete` | Template browser, list menus, and forms. |
 | Groceries options on `add`, `edit`, `list-create`, `list-edit` | List type and language controls, item categories, and forms. |
 | `--image` and rich links on `add` and `edit` | Drag and drop, the file picker, the inspector gallery and preview, and saving attachments to Downloads (up to 50 MB). New images can be PNG, JPEG, WebP, or HEIC, up to 8 MB each. |

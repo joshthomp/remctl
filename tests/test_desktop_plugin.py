@@ -96,6 +96,15 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertFalse(matches_smart({**item,"dueDate":None},spec,date(2026,9,30)))
         self.assertTrue(matches_smart({"tags":[]},summarize_smart_list_filter({"hashtags":{"untagged":""}},strict=True),date.today()))
 
+    def test_smart_no_priority_matches_unprioritized_reminders(self):
+        from remctl_smart_lists import summarize_smart_list_filter
+        payload={"operation":"and","priorities":["none"],"lists":{"include":[],"exclude":["errands"],"operation":"and"}}
+        spec=summarize_smart_list_filter(payload,strict=True)
+        item={"priority":"none","listUUID":"work"}
+        self.assertTrue(matches_smart(item,spec,date.today()))
+        self.assertFalse(matches_smart({**item,"priority":"low"},spec,date.today()))
+        self.assertFalse(matches_smart({**item,"listUUID":"errands"},spec,date.today()))
+
     def test_pinned_smart_count_excludes_completed_and_uses_tags_without_artwork(self):
         rows = [{"Z_PK": i, "ZLIST": 1, "ZCOMPLETED": completed, "ZFLAGGED": 1} for i, completed in [(1, False), (2, False), (3, True)]]
         api = {
@@ -104,7 +113,7 @@ class DesktopPluginTests(unittest.TestCase):
             "q_section_memberships": lambda db, identifier: {}, "search_fold": lambda value: value,
             "q_smart_lists": lambda db: [{"id": 9, "kind": "custom", "pinned": True, "filter": {"supported": True, "kind": "tags", "tags": ["demo"]}}],
             "smart_list_to_dict": lambda row: row, "q_reminders": lambda db, **kwargs: rows,
-            "row_effective_due": lambda row: None, "ts": lambda value: None,
+            "row_shown_date": lambda row: None, "ts": lambda value: None,
             "to_dict": lambda row: {"id": row["Z_PK"], "flagged": True},
             "q_hashtags": lambda db, identifier: [{"ZNAME": "demo"}] if identifier in {1, 3} else [],
             "deleted_reminders": lambda db, **kwargs: [],
@@ -113,10 +122,86 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertEqual(value["smartLists"][0]["count"], 1)
         self.assertEqual(value["counts"]["all"], 2)
 
+    def test_smart_filters_load_details_only_for_the_page_and_reuse_filter_fields(self):
+        from unittest.mock import Mock
+        rows = [{"Z_PK": i, "ZCKIDENTIFIER": f"rem-{i}", "ZLIST": 1,
+                 "ZCOMPLETED": i == 6, "ZFLAGGED": 0} for i in range(1, 7)]
+        spec = {"supported": True, "kind": "tags", "tags": ["demo"]}
+        tags = Mock(side_effect=lambda db, pk: [{"ZNAME": "demo"}] if pk % 2 == 0 else [])
+        hydrate = Mock()
+        serialize = Mock(side_effect=lambda rows, db, memberships: [
+            {"id": r["Z_PK"], "notes": "Preserved", "tags": ["demo"] if r["Z_PK"] % 2 == 0 else [],
+             "attachments": [{"filename": "photo.png", "path": "/private/photo.png"}]}
+            for r in rows])
+        api = {
+            "q_all_lists": lambda db: [{"id": 1, "title": "Demo", "objectUUID": "list-id"}],
+            "list_to_dict": lambda row: row, "q_sections": lambda db: [],
+            "q_section_memberships": lambda db, identifier: {}, "search_fold": lambda value: value,
+            "q_smart_lists": lambda db: [{"id": 9, "kind": "custom", "pinned": True, "filter": spec}],
+            "smart_list_to_dict": lambda row: row, "q_reminders": lambda db, **kwargs: rows,
+            "row_shown_date": lambda row: None, "ts": lambda value: None,
+            "to_dict": lambda row: {"id": row["Z_PK"], "priority": "none"},
+            "q_hashtags": tags, "reminders_to_dicts": serialize, "hydrate_reminder_detail": hydrate,
+        }
+        with patch("remctl_workspace.rich_link_rows", return_value=[]) as links:
+            value = _read(None, {"view": "smart", "smartId": 9, "offset": 1, "limit": 1}, api, "query")
+        self.assertEqual(value["total"], 2)
+        self.assertEqual(value["smartLists"][0]["count"], 2)
+        self.assertEqual([i["id"] for i in value["items"]], [4])
+        self.assertEqual(value["items"][0]["notes"], "Preserved")
+        self.assertEqual(value["items"][0]["attachments"], [{
+            "filename": "photo.png", "resourceUri": "remctl://reminder/rem-4/attachment/0"}])
+        self.assertEqual(tags.call_count, 5)
+        self.assertEqual(serialize.call_count, 1)
+        self.assertEqual(hydrate.call_count, 1)
+        self.assertEqual(links.call_count, 1)
+
+        # A priority-only preview needs neither tags nor location alarms.
+        spec.clear()
+        spec.update(supported=True, kind="priority", priorities=["none"])
+        tags.reset_mock()
+        with patch("remctl_workspace.rich_link_rows", return_value=[]):
+            value = _read(None, {"view": "smart", "smartId": 9, "limit": 1}, api, "query")
+        self.assertEqual(value["total"], 5)
+        tags.assert_not_called()
+
+        spec.clear()
+        spec.update(supported=True, kind="location", location={"latitude": 42, "longitude": 12})
+        alarms = Mock(side_effect=lambda db, pk: [{"location": {
+            "latitude": 42, "longitude": 12, "proximity": "arriving"}}] if pk % 2 == 0 else [])
+        api.update(q_alarms=alarms, alarm_rows_to_json=lambda rows: rows)
+        with patch("remctl_workspace.rich_link_rows", return_value=[]):
+            value = _read(None, {"view": "smart", "smartId": 9, "includeCompleted": True, "limit": 1}, api, "query")
+        self.assertEqual(value["total"], 3)
+        self.assertEqual(value["smartLists"][0]["count"], 2)
+        self.assertEqual(alarms.call_count, 6)
+        tags.assert_not_called()
+
     def test_worker_retains_ui_that_matches_its_contract_after_install(self):
         with patch.object(Path,"read_text",side_effect=AssertionError("Do not load another build's UI")):
             resource=self.server.plugin.resource(p.UI_URI,None)
         self.assertEqual(resource["contents"][0]["text"],p._UI_HTML)
+
+    def test_workspace_today_uses_the_same_display_date_as_cli_reads(self):
+        from datetime import datetime, timedelta
+        today = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+        rows = [{"Z_PK": i, "ZCKIDENTIFIER": f"rem-{i}", "ZLIST": 1,
+                 "ZCOMPLETED": False, "ZFLAGGED": 0, "due": today + timedelta(days=delta),
+                 "display": today - timedelta(days=delta)} for i, delta in [(1, 1), (2, -1)]]
+        api = {
+            "q_all_lists": lambda db: [{"id": 1, "title": "Demo", "objectUUID": "list-id"}],
+            "list_to_dict": lambda row: row, "q_sections": lambda db: [],
+            "q_section_memberships": lambda db, identifier: {}, "search_fold": lambda value: value,
+            "q_smart_lists": lambda db: [], "q_reminders": lambda db, **kwargs: rows,
+            "row_effective_due": lambda row: row["due"], "row_shown_date": lambda row: row["display"],
+            "ts": lambda value: value,
+            "reminders_to_dicts": lambda rows, *args: [{"id": r["Z_PK"]} for r in rows],
+            "hydrate_reminder_detail": lambda *args: None,
+        }
+        with patch("remctl_workspace.rich_link_rows", return_value=[]):
+            value = _read(None, {"view": "today"}, api, "query")
+        self.assertEqual([item["id"] for item in value["items"]], [1])
+        self.assertEqual(value["counts"]["today"], 1)
 
     def test_saved_link_resource_resolves_only_the_selected_reminder_link(self):
         self.executor.stdout = json.dumps({"url":"https://example.com", "title":"Saved title", "image":{"mimeType":"image/png", "data":"eA=="}})

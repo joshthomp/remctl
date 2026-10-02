@@ -1086,7 +1086,7 @@ ADVANCED = {'manage_groups': {'title': 'Groups',
                                                                     'description': 'Filter to flagged reminders'},
                                                         'priority': {'type': 'string',
                                                                      'description': 'Priority filter: high, '
-                                                                                    'medium, low, or '
+                                                                                    'medium, low, none, or '
                                                                                     'comma-separated values',
                                                                      'maxLength': 4096},
                                                         'tags': {'type': 'string',
@@ -1317,7 +1317,7 @@ ADVANCED = {'manage_groups': {'title': 'Groups',
                                                                   'description': 'Filter to flagged reminders'},
                                                       'priority': {'type': 'string',
                                                                    'description': 'Priority filter: high, medium, '
-                                                                                  'low, or comma-separated values',
+                                                                                  'low, none, or comma-separated values',
                                                                    'maxLength': 4096},
                                                       'tags': {'type': 'string',
                                                                'description': 'Selected tag filter, '

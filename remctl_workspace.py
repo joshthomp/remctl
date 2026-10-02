@@ -69,7 +69,7 @@ def _read(db, request, api, operation):
         if not item.get("isGroup"):
             memberships.update(api["q_section_memberships"](db, item["id"]))
 
-    def payloads(rows, detail=False):
+    def payloads(rows):
         values = api["reminders_to_dicts"](rows, db, memberships)
         for row, item in zip(rows, values):
             item.update(objectUUID=row["ZCKIDENTIFIER"], listId=row["ZLIST"])
@@ -94,7 +94,7 @@ def _read(db, request, api, operation):
                else api["q_reminder_by_identifier"](db, str(identifier)))
         if row is None:
             raise ValueError("This reminder no longer exists")
-        item = payloads([row], detail=True)[0]
+        item = payloads([row])[0]
         if operation == "link_preview":
             links = rich_link_rows(db, row["Z_PK"])
             index = _integer(request.get("index"), 0, 500)
@@ -116,7 +116,7 @@ def _read(db, request, api, operation):
             if not mime.startswith("image/") or path.stat().st_size > 8 * 1024 * 1024:
                 raise ValueError("Preview requires an image smaller than 8 MiB")
             return {"mimeType": mime, "blob": base64.b64encode(path.read_bytes()).decode()}
-        item["subtasks"] = payloads(api["q_subtasks_for_parent"](db, row["Z_PK"]), detail=True)
+        item["subtasks"] = payloads(api["q_subtasks_for_parent"](db, row["Z_PK"]))
         item["sharees"] = [api["sharee_to_dict"](s, current_user_ckid=api["q_list_shared_owner_ckid"](db, row["ZLIST"]))
                            for s in api["q_sharees"](db, row["ZLIST"])]
         return item
@@ -153,7 +153,7 @@ def _read(db, request, api, operation):
     today = now.date()
 
     def due(row):
-        value = api["ts"](api["row_effective_due"](row))
+        value = api["ts"](api["row_shown_date"](row))
         return value.date() if isinstance(value, datetime) else None
 
     counts = {key: 0 for key in ("today", "scheduled", "flagged", "all", "completed")}
@@ -169,24 +169,33 @@ def _read(db, request, api, operation):
             counts["scheduled"] += int(due(row) is not None)
             counts["today"] += int(due(row) is not None and due(row) <= today)
 
-    # Count pinned smart lists from the same predicates as their destination. Read
-    # only filtering fields here; artwork and attachment payloads stay lazy.
+    # Counts, previews and smart-list pages use the same filtering fields. Keep
+    # them within this read so shared predicates never requery tags or alarms.
+    filter_items = {}
+
+    def candidates(rows, spec):
+        needs_tags = _filter_uses(spec, "tags")
+        needs_location = _filter_uses(spec, "location")
+        for row in rows:
+            pk = row["Z_PK"]
+            if pk not in filter_items:
+                item = api["to_dict"](row)
+                item.update(listId=row["ZLIST"], listUUID=by_id.get(row["ZLIST"], {}).get("objectUUID"))
+                filter_items[pk] = item
+            item = filter_items[pk]
+            if needs_tags and "tags" not in item:
+                item["tags"] = [tag["ZNAME"] for tag in api["q_hashtags"](db, pk)]
+            if needs_location and "alarms" not in item:
+                item["alarms"] = api["alarm_rows_to_json"](api["q_alarms"](db, pk))
+            yield item
+
     pinned_smart = [item for item in smart if item.get("kind") == "custom" and item.get("pinned") and item.get("filter", {}).get("supported")]
     if pinned_smart:
-        candidates = []
-        needs_location = any(_filter_uses(item["filter"], "location") for item in pinned_smart)
-        for row in rows:
-            if row["ZCOMPLETED"]:
-                continue
-            item = api["to_dict"](row)
-            item.update(listId=row["ZLIST"], listUUID=by_id.get(row["ZLIST"], {}).get("objectUUID"),
-                        tags=[tag["ZNAME"] for tag in api["q_hashtags"](db, row["Z_PK"])])
-            if needs_location:
-                item["alarms"] = api["alarm_rows_to_json"](api["q_alarms"](db, row["Z_PK"]))
-            candidates.append(item)
+        active_rows = [row for row in rows if not row["ZCOMPLETED"]]
         for smart_list in pinned_smart:
             try:
-                smart_list["count"] = sum(matches_smart(item, smart_list["filter"], today) for item in candidates)
+                smart_list["count"] = sum(matches_smart(item, smart_list["filter"], today)
+                                          for item in candidates(active_rows, smart_list["filter"]))
             except ValueError:
                 # An unsupported predicate must never masquerade as an empty list.
                 smart_list["count"] = None
@@ -234,8 +243,8 @@ def _read(db, request, api, operation):
                 target = next((item for item in smart if item["id"] == request.get("smartId")), None)
             if not target or not target.get("filter", {}).get("supported"):
                 raise ValueError("This smart list uses filters RemCTL cannot decode")
-            hydrated = payloads(selected, detail=True)
-            selected = [row for row, item in zip(selected, hydrated) if matches_smart(item, target["filter"], today)]
+            selected = [row for row, item in zip(selected, candidates(selected, target["filter"]))
+                        if matches_smart(item, target["filter"], today)]
         order = request.get("sort", "manual")
         if order == "manual" and list_id is not None:
             selected = api["sort_reminder_rows_by_identifier_order"](selected, api["q_list_reminder_order"](db, list_id))
@@ -244,7 +253,7 @@ def _read(db, request, api, operation):
         elif order == "priority":
             selected.sort(key=lambda row: (row["ZPRIORITY"] or 99, row["Z_PK"]))
         elif order == "due" or view in {"today", "scheduled"}:
-            selected.sort(key=lambda row: (due(row) is None, api["row_effective_due"](row) or 0, row["Z_PK"]))
+            selected.sort(key=lambda row: (due(row) is None, api["row_shown_date"](row) or 0, row["Z_PK"]))
         items = payloads(selected[offset:offset + limit])
 
     return {"items": items, "total": len(selected), "offset": offset, "limit": limit,
@@ -356,9 +365,6 @@ def matches_smart(item, spec, today):
         keys = {str(item.get("listId")), str(item.get("listUUID")), item.get("list")}
         include, exclude = set(map(str, spec.get("include", []))), set(map(str, spec.get("exclude", [])))
         return not keys.intersection(exclude) and (not include or bool(keys & include))
-    if "filters" in spec:
-        outcomes = [matches_smart(item, child, today) for child in spec["filters"]]
-        return any(outcomes) if spec.get("match") == "any" else all(outcomes)
     raise ValueError("Smart filter is not yet executable: " + str(kind))
 
 

@@ -326,6 +326,9 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertTrue(os.access(host, os.X_OK))
         self.assertTrue((resources / "CapabilityRuntime" / "bin" / "remctl-bridge").is_file())
         self.assertTrue((resources / "CapabilityRuntime" / "bin" / "remctl-private").is_file())
+        for path in (".agents/plugins/marketplace.json", "plugins/remctl/plugin.json",
+                     "plugins/remctl/mcp.json", "plugins/claude-code/hooks/register.tsx"):
+            self.assertEqual((resources / path).read_bytes(), (ROOT / path).read_bytes())
         self.assertEqual(
             (resources / "remctl-capability-python-path").read_text().strip(),
             str(self.capability_python),

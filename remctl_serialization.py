@@ -306,7 +306,7 @@ def all_day_due_iso(raw, *, ts):
 _MISSING = object()
 
 
-def timed_due_raw(row):
+def timed_due_raw(row, db=None):
     """A timed reminder's due date as a real instant, in Apple-epoch seconds.
 
     Reminders stores a timed due date either as an instant, with ZTIMEZONE
@@ -314,8 +314,10 @@ def timed_due_raw(row):
     and older versions of Reminders do: a 5 PM reminder is stored as 17:00Z.
     A row is floating when it has no time zone, or when its display date is
     exactly the wall-clock reading. The match has to be exact, because the
-    display date can also be an alarm near the due time. All-day rows and
-    instants come back unchanged.
+    display date can also be an alarm near the due time. When a zoned row's
+    display date matches that conversion, an absolute alarm is evidence that
+    the display date belongs to the alarm instead. All-day rows and instants
+    come back unchanged.
     """
     raw = _row_get(row, "ZDUEDATE")
     if raw is None or _row_get(row, "ZALLDAY"):
@@ -324,7 +326,20 @@ def timed_due_raw(row):
     floating = wall.timestamp() - APPLE_EPOCH_UNIX
     time_zone = _row_get(row, "ZTIMEZONE", _MISSING)
     display = _row_get(row, "ZDISPLAYDATEDATE")
-    if time_zone in (None, "") or (display is not None and round(float(display)) == round(floating)):
+    if time_zone in (None, ""):
+        return floating
+    if display is not None and round(float(display)) == round(floating):
+        if round(float(raw)) == round(floating):
+            return raw
+        # Only ambiguous dates need this indexed lookup; ordinary rows do no
+        # extra work. Ignore deleted alarms and triggers, as q_alarms does.
+        if db is not None and time_zone is not _MISSING and db.execute(
+            "SELECT 1 FROM ZREMCDOBJECT a JOIN ZREMCDOBJECT t ON a.ZTRIGGER = t.Z_PK "
+            "WHERE a.ZREMINDER = ? AND +a.Z_ENT = 15 AND +a.ZMARKEDFORDELETION = 0 "
+            "AND t.ZMARKEDFORDELETION = 0 AND t.ZDATECOMPONENTSDATA IS NOT NULL LIMIT 1",
+            (_row_get(row, "Z_PK"),),
+        ).fetchone():
+            return raw
         return floating
     return raw
 
@@ -386,7 +401,7 @@ def serialize_reminder(
         reminder["url"] = url
 
     due_date = None
-    due_raw = timed_due_raw(row)
+    due_raw = timed_due_raw(row, db=db)
     if row["ZDUEDATE"]:
         if _row_get(row, "ZALLDAY"):
             due_date = all_day_due_iso(row["ZDUEDATE"], ts=ts)

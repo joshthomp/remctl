@@ -285,7 +285,8 @@ async function complete($: EngineInterface, settings: Settings, name: string, ro
     $.ui.toast(`Couldn't complete “${row.title}”: ${messageOf(cause)}`)
     return
   }
-  await update($, lastDone, () => ({ id: row.id, title: row.title }))
+  // Uncompleting a repeating reminder does not rewind its advanced due date.
+  await update($, lastDone, () => row.recurring ? null : ({ id: row.id, title: row.title }))
   // Leave the ticked row up for a moment, as Reminders does.
   $.clock.after(1_500, () => void refresh($, settings))
 }
@@ -452,10 +453,11 @@ function toTask(item: Record<string, unknown>): TodayTask {
     id: Number(item.id),
     title: typeof item.title === 'string' && item.title !== '' ? item.title : 'Untitled',
     list: typeof item.list === 'string' ? item.list : '',
-    due: typeof item.dueDate === 'string' ? item.dueDate : null,
+    due: typeof item.displayDate === 'string' ? item.displayDate : typeof item.dueDate === 'string' ? item.dueDate : null,
     allDay: item.allDay === true,
     flagged: item.flagged === true,
     priority: typeof item.priority === 'string' ? item.priority : 'none',
+    recurring: !!item.recurrence,
   }
 }
 

@@ -3239,6 +3239,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[1]["effectiveMinimumSupportedVersion"], 20220430)
         self.assertEqual(payload[1]["filter"]["kind"], "priority")
         self.assertEqual(payload[1]["filterJSON"], {"priorities": ["high"]})
+        # A custom smart list saved without a color is Reminders' default blue.
+        self.assertEqual(payload[1]["color"], {"name": "blue", "hex": "#007AFF"})
+        self.assertNotIn("color", payload[0])
 
     def test_list_pin_supports_smart_list_by_name_and_id(self):
         db = self._smart_list_db()
@@ -3392,7 +3395,7 @@ class CliTests(unittest.TestCase):
 
     def test_smart_list_create_rejects_unsupported_filter_before_helper(self):
         db = self._smart_list_db()
-        args = SimpleNamespace(name="Nope", private=True, flagged=False, priority="none", json=True)
+        args = SimpleNamespace(name="Nope", private=True, flagged=False, priority="urgent", json=True)
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
@@ -8778,6 +8781,38 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["overdue"], len(overdue_rows))
         finally:
             db.close()
+
+    def test_stats_counts_live_reminders_in_one_scan_including_an_empty_store(self):
+        db = self._due_window_db()
+        self.addCleanup(db.close)
+        for pk in range(1, 7):
+            self._insert_lookup_reminder(db, pk, f"Stats {pk}")
+        db.execute("UPDATE ZREMCDREMINDER SET ZCOMPLETED = 1 WHERE Z_PK = 2")
+        db.execute("UPDATE ZREMCDREMINDER SET ZFLAGGED = 1, ZISURGENTSTATEENABLEDFORCURRENTUSER = 1 WHERE Z_PK IN (1, 2)")
+        db.execute("UPDATE ZREMCDREMINDER SET ZCOMPLETED = NULL WHERE Z_PK = 3")
+        db.execute("UPDATE ZREMCDREMINDER SET ZMARKEDFORDELETION = 1 WHERE Z_PK = 4")
+        db.execute("UPDATE ZREMCDREMINDER SET ZLIST = 2 WHERE Z_PK = 5")
+        db.execute("UPDATE ZREMCDREMINDER SET ZLIST = 3 WHERE Z_PK = 6")
+        db.execute("INSERT INTO ZREMCDBASELIST VALUES (2, 'Deleted', 1)")
+        for empty in (False, True):
+            if empty:
+                db.execute("DELETE FROM ZREMCDREMINDER")
+            queries = []
+            db.set_trace_callback(queries.append)
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "q_lists", return_value=[]),
+                mock.patch.object(self.remctl, "q_sections", return_value=[]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_stats(SimpleNamespace(json=True))
+            db.set_trace_callback(None)
+            self.assertEqual(json.loads(stdout.getvalue()), {
+                "total": 0 if empty else 3, "active": 0 if empty else 1,
+                "completed": 0 if empty else 2, "flagged": 0 if empty else 1,
+                "urgent": 0 if empty else 1, "overdue": 0, "lists": 0, "sections": 0,
+            })
+            self.assertEqual(len([q for q in queries if "FROM ZREMCDREMINDER" in q]), 1)
 
     def test_timed_reminders_bucket_by_the_date_reminders_shows(self):
         from datetime import datetime, timedelta

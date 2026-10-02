@@ -363,7 +363,7 @@ The write commands are private. They support the filters that Reminders reliably
 | Selected tags | `--tags a,b`, optional `--tag-match all|any` |
 | Date | `--date any|today`, `--date-today-include-past-due`, `--date-on`, `--date-before`, `--date-after`, `--date-range START,END` |
 | Time of day | `--time morning|afternoon|evening|night` |
-| Priority | `--priority high`, or a comma list for "any of" |
+| Priority | `--priority high`, or a comma list for "any of". `--priority none` is No Priority |
 | Flag | `--flagged` |
 | Vehicle | `--vehicle connected` |
 | Location | `--location-title`, `--latitude`, `--longitude`, `--radius`, `--proximity enter|leave` |

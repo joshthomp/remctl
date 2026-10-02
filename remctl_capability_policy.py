@@ -10,11 +10,8 @@ import argparse
 from collections.abc import Iterable
 from typing import Any
 
-from remctl_runtime import (
-    HOSTED_COMMANDS,
-    LOCAL_COMMANDS,
-    capability_host_command_scope,
-)
+import remctl_runtime
+from remctl_runtime import capability_host_command_scope
 
 
 PROTOCOL_VERSION = 2
@@ -33,7 +30,24 @@ DESTRUCTIVE_COMMANDS = frozenset(
 
 IMAGE_COMMANDS = frozenset({"add", "edit"})
 FILTER_FILE_COMMANDS = frozenset({"smart-list-create", "smart-list-edit"})
-INPUT_FILE_COMMANDS = frozenset({"import"})
+
+_REQUEST_SCHEMAS = {
+    "ping": frozenset({"protocolVersion", "operation"}),
+    "status": frozenset({"protocolVersion", "operation"}),
+    "permissionStatus": frozenset({"protocolVersion", "operation"}),
+    "requestPermission": frozenset({"protocolVersion", "operation", "permission"}),
+    "run": frozenset(
+        {
+            "protocolVersion",
+            "operation",
+            "argv",
+            "capabilities",
+            "deadlineEpoch",
+            "stdinBase64",
+            "mergeOutput",
+        }
+    ),
+}
 
 
 class CapabilityPolicyError(ValueError):
@@ -52,6 +66,10 @@ def validate_command_scope(parser: argparse.ArgumentParser) -> dict[str, list[st
     """Require every real parser command to be classified exactly once."""
 
     parser_commands = _parser_commands(parser)
+    # Read the sets at call time: optional extensions register their commands
+    # with remctl_runtime.register_extension_commands() after import.
+    LOCAL_COMMANDS = remctl_runtime.LOCAL_COMMANDS
+    HOSTED_COMMANDS = remctl_runtime.HOSTED_COMMANDS
     overlap = LOCAL_COMMANDS & HOSTED_COMMANDS
     missing = parser_commands - LOCAL_COMMANDS - HOSTED_COMMANDS
     stale = (LOCAL_COMMANDS | HOSTED_COMMANDS) - parser_commands
@@ -114,26 +132,7 @@ def validate_argv(
 def request_schema(operation: str) -> frozenset[str]:
     """Return the exact allowed request fields for an IPC operation."""
 
-    schemas = {
-        "ping": frozenset({"protocolVersion", "operation"}),
-        "status": frozenset({"protocolVersion", "operation"}),
-        "permissionStatus": frozenset({"protocolVersion", "operation"}),
-        "requestPermission": frozenset(
-            {"protocolVersion", "operation", "permission"}
-        ),
-        "run": frozenset(
-            {
-                "protocolVersion",
-                "operation",
-                "argv",
-                "capabilities",
-                "deadlineEpoch",
-                "stdinBase64",
-                "mergeOutput",
-            }
-        ),
-    }
     try:
-        return schemas[operation]
+        return _REQUEST_SCHEMAS[operation]
     except KeyError as exc:
         raise CapabilityPolicyError(f"unknown broker operation: {operation!r}") from exc

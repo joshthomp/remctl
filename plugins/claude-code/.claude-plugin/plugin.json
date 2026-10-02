@@ -1,0 +1,61 @@
+{
+  "name": "remctl",
+  "displayName": "RemCTL",
+  "version": "2.1.0",
+  "description": "Apple Reminders in Claude Code: RemCTL's tools, plus today's tasks above the prompt in your lists' colors.",
+  "author": { "name": "Federico Viticci", "url": "https://macstories.net" },
+  "homepage": "https://github.com/viticci/remctl#use-it-in-claude-code",
+  "repository": "https://github.com/viticci/remctl",
+  "license": "MIT",
+  "keywords": ["reminders", "tasks", "macos", "productivity", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "display": {
+      "type": "string",
+      "title": "Today: show tasks as",
+      "description": "band: a summary and the next tasks above the prompt. compact: one line above the prompt. status: the status line. pane only: just /reminders.",
+      "default": "band",
+      "options": ["band", "compact", "status", "pane only"]
+    },
+    "rows": {
+      "type": "number",
+      "title": "Today: tasks in the band",
+      "description": "How many tasks the band lists under its summary.",
+      "default": 3,
+      "min": 0,
+      "max": 8
+    },
+    "includeOverdue": {
+      "type": "boolean",
+      "title": "Today: include overdue tasks",
+      "description": "Count and list reminders that were due before today.",
+      "default": true
+    },
+    "lists": {
+      "type": "string",
+      "title": "Today: only these lists",
+      "description": "Comma-separated Reminders list names. Leave empty for every list.",
+      "default": ""
+    },
+    "checkboxes": {
+      "type": "boolean",
+      "title": "Today: complete from the pane",
+      "description": "Show a check button beside each task in /reminders that marks it done in Reminders.",
+      "default": true
+    },
+    "refreshMinutes": {
+      "type": "number",
+      "title": "Today: refresh every (minutes)",
+      "description": "How often to read Reminders again. Changes Claude makes through RemCTL show right away.",
+      "default": 5,
+      "min": 1,
+      "max": 60
+    },
+    "openOnStart": {
+      "type": "boolean",
+      "title": "Today: open the pane at start",
+      "description": "Dock the /reminders pane beside the conversation when a session starts in a wide window.",
+      "default": false
+    }
+  }
+}

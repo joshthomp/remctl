@@ -1,0 +1,33 @@
+{
+  "environment": "isolated fixture; no ChatGPT activation or live Reminders access",
+  "transport": "authenticated MCP HTTP and signed HTTPS webhook delivery",
+  "automations": [
+    {
+      "automation": "Completion receipt",
+      "event": "reminder.completed",
+      "title": "Ship the demo",
+      "signatureVerified": true
+    },
+    {
+      "automation": "Flagged change digest",
+      "event": "reminder.updated",
+      "title": "Review the draft",
+      "signatureVerified": true
+    },
+    {
+      "automation": "Due-time nudge",
+      "event": "reminder.due",
+      "title": "Join the rehearsal",
+      "signatureVerified": true
+    }
+  ],
+  "checks": [
+    "endpoint challenge",
+    "no historical replay",
+    "tag filtering",
+    "one run per change",
+    "due boundary",
+    "unsubscribe stops runs"
+  ],
+  "remainingSubscriptions": 0
+}

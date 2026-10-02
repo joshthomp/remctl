@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 
 RECURRENCE_FREQUENCIES = {
@@ -11,6 +12,10 @@ RECURRENCE_FREQUENCIES = {
     2: "monthly",
     3: "yearly",
 }
+
+# Reminders timestamps count seconds from 2001-01-01T00:00:00Z, itself a UTC midnight.
+APPLE_EPOCH_UNIX = 978307200
+SECONDS_PER_DAY = 86400
 
 DUE_DATE_DELTA_UNITS = {
     0: ("minute", "minutes"),
@@ -143,8 +148,9 @@ def due_date_delta_alerts_from_row(row, *, ts=None):
 def preload_extras(db, pks):
     """Batch-load subtask counts and hashtags to avoid N+1 queries.
 
-    Each table is queried under its own try/except so a minimal fixture
-    missing one table still gets the other extra.
+    Successful queries include zero/empty entries so callers do not requery
+    reminders without extras. Failed queries leave their map empty, preserving
+    per-reminder fallback independently for each table.
     """
     if not pks:
         return {}, {}
@@ -154,11 +160,12 @@ def preload_extras(db, pks):
     try:
         subtask_rows = db.execute(
             f"SELECT ZPARENTREMINDER, COUNT(*) FROM ZREMCDREMINDER "
-            f"WHERE ZPARENTREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0 "
+            f"WHERE ZPARENTREMINDER IN ({placeholders}) AND +ZMARKEDFORDELETION = 0 "
             f"AND ZCOMPLETED = 0 GROUP BY ZPARENTREMINDER",
             pks,
         ).fetchall()
-        subtask_counts = {row[0]: row[1] for row in subtask_rows}
+        subtask_counts = dict.fromkeys(pks, 0)
+        subtask_counts.update({row[0]: row[1] for row in subtask_rows})
     except Exception:
         # Minimal test fixtures omit this table; extras are best-effort.
         pass
@@ -166,9 +173,10 @@ def preload_extras(db, pks):
         hashtag_rows = db.execute(
             f"SELECT o.ZREMINDER3, h.ZNAME FROM ZREMCDOBJECT o "
             f"JOIN ZREMCDHASHTAGLABEL h ON o.ZHASHTAGLABEL = h.Z_PK "
-            f"WHERE o.ZREMINDER3 IN ({placeholders}) AND o.ZMARKEDFORDELETION = 0",
+            f"WHERE o.ZREMINDER3 IN ({placeholders}) AND +o.ZMARKEDFORDELETION = 0",
             pks,
         ).fetchall()
+        hashtags = {pk: [] for pk in pks}
         for row in hashtag_rows:
             hashtags.setdefault(row[0], []).append(row[1])
     except Exception:
@@ -203,7 +211,7 @@ def preload_attachments(db, pks):
             f"SELECT ZREMINDER, ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE, {saved_sha}, "
             "NULL AS ZWIDTH, NULL AS ZHEIGHT "
             f"FROM ZREMCDSAVEDATTACHMENT "
-            f"WHERE ZREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0",
+            f"WHERE ZREMINDER IN ({placeholders}) AND +ZMARKEDFORDELETION = 0",
             pks,
         ).fetchall()
         object_rows = db.execute(
@@ -212,7 +220,7 @@ def preload_attachments(db, pks):
             f"{object_sha}, ZWIDTH, ZHEIGHT "
             f"FROM ZREMCDOBJECT "
             f"WHERE ZREMINDER2 IN ({placeholders}) AND ZFILENAME IS NOT NULL AND ZFILENAME != '' "
-            "AND ZMARKEDFORDELETION = 0",
+            "AND +ZMARKEDFORDELETION = 0",
             pks,
         ).fetchall()
     except Exception:
@@ -244,7 +252,7 @@ def preload_indicators(db, pks):
     try:
         saved_rows = db.execute(
             f"SELECT ZREMINDER, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
-            f"WHERE ZREMINDER IN ({placeholders}) AND ZMARKEDFORDELETION = 0",
+            f"WHERE ZREMINDER IN ({placeholders}) AND +ZMARKEDFORDELETION = 0",
             pks,
         ).fetchall()
         for row in saved_rows:
@@ -258,7 +266,7 @@ def preload_indicators(db, pks):
     try:
         object_rows = db.execute(
             f"SELECT ZREMINDER2, ZWIDTH, ZHEIGHT, ZURL, ZFILENAME FROM ZREMCDOBJECT "
-            f"WHERE ZREMINDER2 IN ({placeholders}) AND ZMARKEDFORDELETION = 0 "
+            f"WHERE ZREMINDER2 IN ({placeholders}) AND +ZMARKEDFORDELETION = 0 "
             f"AND ((ZURL IS NOT NULL AND ZURL != '') OR (ZFILENAME IS NOT NULL AND ZFILENAME != ''))",
             pks,
         ).fetchall()
@@ -278,6 +286,47 @@ def preload_indicators(db, pks):
         pk: {"image": pk in image_pks, "link": pk in link_pks}
         for pk in image_pks | link_pks
     }
+
+
+def all_day_due_iso(raw, *, ts):
+    """The day of an all-day due date, as local midnight in ISO form.
+
+    Reminders stores an all-day due date as midnight UTC of that day. Read as
+    local time, that instant is 02:00 in Rome and the evening before in New
+    York, so the day comes from UTC. A value that is not a UTC midnight keeps
+    its local day.
+    """
+    if float(raw) % SECONDS_PER_DAY == 0:
+        day = datetime.fromtimestamp(float(raw) + APPLE_EPOCH_UNIX, tz=timezone.utc).date()
+    else:
+        day = ts(raw).date()
+    return datetime(day.year, day.month, day.day).isoformat()
+
+
+_MISSING = object()
+
+
+def timed_due_raw(row):
+    """A timed reminder's due date as a real instant, in Apple-epoch seconds.
+
+    Reminders stores a timed due date either as an instant, with ZTIMEZONE
+    set, or as floating wall-clock time encoded as if it were UTC, as GoodTask
+    and older versions of Reminders do: a 5 PM reminder is stored as 17:00Z.
+    A row is floating when it has no time zone, or when its display date is
+    exactly the wall-clock reading. The match has to be exact, because the
+    display date can also be an alarm near the due time. All-day rows and
+    instants come back unchanged.
+    """
+    raw = _row_get(row, "ZDUEDATE")
+    if raw is None or _row_get(row, "ZALLDAY"):
+        return raw
+    wall = datetime.fromtimestamp(float(raw) + APPLE_EPOCH_UNIX, tz=timezone.utc).replace(tzinfo=None)
+    floating = wall.timestamp() - APPLE_EPOCH_UNIX
+    time_zone = _row_get(row, "ZTIMEZONE", _MISSING)
+    display = _row_get(row, "ZDISPLAYDATEDATE")
+    if time_zone in (None, "") or (display is not None and round(float(display)) == round(floating)):
+        return floating
+    return raw
 
 
 def serialize_reminder(
@@ -336,11 +385,19 @@ def serialize_reminder(
     if url:
         reminder["url"] = url
 
+    due_date = None
+    due_raw = timed_due_raw(row)
     if row["ZDUEDATE"]:
-        reminder["dueDate"] = ts(row["ZDUEDATE"]).isoformat()
+        if _row_get(row, "ZALLDAY"):
+            due_date = all_day_due_iso(row["ZDUEDATE"], ts=ts)
+        else:
+            due_date = ts(due_raw).isoformat()
+        reminder["dueDate"] = due_date
     display_date = _row_get(row, "ZDISPLAYDATEDATE")
-    if display_date and display_date != row["ZDUEDATE"]:
-        reminder["displayDate"] = ts(display_date).isoformat()
+    if display_date and display_date != due_raw:
+        display_iso = ts(display_date).isoformat()
+        if display_iso != due_date:
+            reminder["displayDate"] = display_iso
     if _row_get(row, "ZALLDAY") is not None:
         reminder["allDay"] = bool(_row_get(row, "ZALLDAY"))
     if row["ZCREATIONDATE"]:

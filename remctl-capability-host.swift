@@ -1,5 +1,6 @@
 import AppKit
 import CoreServices
+import CryptoKit
 import Darwin
 import EventKit
 import Foundation
@@ -115,6 +116,98 @@ private func resourceText(_ name: String) -> String? {
     else { return nil }
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     return trimmed.isEmpty ? nil : trimmed
+}
+
+// A portable release carries its interpreter and an exact manifest. Installation
+// copies it to a content-addressed root-owned directory before the host uses it.
+private func installPackagedPython(host: VerifiedHost) throws {
+    func requireAdministrator() throws {
+        guard geteuid() == 0 else {
+            throw NSError(domain: "RemCTL", code: 77, userInfo: [NSLocalizedDescriptionKey: "Installing the protected Python runtime requires administrator authorization."])
+        }
+    }
+    let fm = FileManager.default
+    let app = URL(fileURLWithPath: host.appPath)
+    let manifestURL = app.appendingPathComponent("Contents/Resources/python-manifest.json")
+    let manifestData = try Data(contentsOf: manifestURL)
+    let digest = SHA256.hash(data: manifestData).map { String(format: "%02x", $0) }.joined()
+    guard let entries = try JSONSerialization.jsonObject(with: manifestData) as? [String: [String: Any]],
+          !entries.isEmpty,
+          resourceText("remctl-capability-python-path") == "/Library/RemCTL/Python/\(digest)/bin/python3.13"
+    else { throw NSError(domain: "RemCTL", code: 65) }
+    let source = app.appendingPathComponent("Contents/Resources/Python", isDirectory: true)
+    func checkTree(_ root: URL, requireRoot: Bool) throws {
+        var rootMetadata = stat()
+        guard canonicalPath(root) == root.path,
+              lstat(root.path, &rootMetadata) == 0, rootMetadata.st_mode & S_IFMT == S_IFDIR,
+              !requireRoot || (rootMetadata.st_uid == 0 && rootMetadata.st_mode & 0o022 == 0 && hasNoExtendedACL(root.path)),
+              let walker = fm.enumerator(at: root, includingPropertiesForKeys: nil)
+        else { throw NSError(domain: "RemCTL", code: 65) }
+        var found = Set<String>()
+        for case let path as URL in walker {
+            let name = String(path.path.dropFirst(root.path.count + 1))
+            guard let entry = entries[name],
+                  !name.isEmpty, !name.split(separator: "/").contains("..")
+            else { throw NSError(domain: "RemCTL", code: 65) }
+            var metadata = stat()
+            guard lstat(path.path, &metadata) == 0,
+                  !requireRoot || (metadata.st_uid == 0 && (metadata.st_mode & S_IFMT == S_IFLNK || metadata.st_mode & 0o022 == 0) && hasNoExtendedACL(path.path))
+            else { throw NSError(domain: "RemCTL", code: 65) }
+            switch entry["type"] as? String {
+            case "file":
+                guard metadata.st_mode & S_IFMT == S_IFREG,
+                      (metadata.st_mode & 0o111 != 0) == (entry["executable"] as? Bool == true),
+                      SHA256.hash(data: try Data(contentsOf: path)).map({ String(format: "%02x", $0) }).joined() == entry["sha256"] as? String
+                else { throw NSError(domain: "RemCTL", code: 65) }
+            case "directory":
+                guard metadata.st_mode & S_IFMT == S_IFDIR else { throw NSError(domain: "RemCTL", code: 65) }
+            case "symlink":
+                guard metadata.st_mode & S_IFMT == S_IFLNK,
+                      try fm.destinationOfSymbolicLink(atPath: path.path) == entry["target"] as? String,
+                      let resolved = canonicalPath(path), resolved.hasPrefix(root.path + "/")
+                else { throw NSError(domain: "RemCTL", code: 65) }
+            default: throw NSError(domain: "RemCTL", code: 65)
+            }
+            found.insert(name)
+        }
+        guard found == Set(entries.keys) else { throw NSError(domain: "RemCTL", code: 65) }
+    }
+    try checkTree(source, requireRoot: false)
+    // Every ancestor is fixed, root-owned and unwritable by ordinary users.
+    for path in ["/Library", "/Library/RemCTL", "/Library/RemCTL/Python"] {
+        if !fm.fileExists(atPath: path) {
+            try requireAdministrator()
+            try fm.createDirectory(atPath: path, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+        }
+        var metadata = stat()
+        guard lstat(path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == 0, metadata.st_mode & 0o022 == 0,
+              canonicalPath(URL(fileURLWithPath: path)) == path, hasNoExtendedACL(path)
+        else { throw NSError(domain: "RemCTL", code: 65) }
+    }
+    let destination = URL(fileURLWithPath: "/Library/RemCTL/Python/\(digest)", isDirectory: true)
+    if fm.fileExists(atPath: destination.path) {
+        try checkTree(destination, requireRoot: true)
+        print("Protected Python runtime already installed.")
+        return
+    }
+    try requireAdministrator()
+    let staging = destination.deletingLastPathComponent().appendingPathComponent(".stage-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: staging) }
+    try fm.copyItem(at: source, to: staging)
+    try fm.setAttributes([.ownerAccountID: 0, .groupOwnerAccountID: 0, .posixPermissions: 0o755], ofItemAtPath: staging.path)
+    for (name, entry) in entries {
+        let path = staging.appendingPathComponent(name).path
+        guard lchown(path, 0, 0) == 0 else { throw NSError(domain: "RemCTL", code: 65) }
+        if entry["type"] as? String != "symlink" {
+            let permissions = entry["type"] as? String == "directory" ? 0o755 : ((entry["executable"] as? Bool == true) ? 0o755 : 0o644)
+            guard chmod(path, mode_t(permissions)) == 0 else { throw NSError(domain: "RemCTL", code: 65) }
+        }
+    }
+    // Verify the copied bytes, including symlink containment, before publication.
+    try checkTree(staging, requireRoot: true)
+    try fm.moveItem(at: staging, to: destination)
+    print("Installed protected Python runtime: \(destination.path)")
 }
 
 private func rootOnlyWheelIsSafe() -> Bool {
@@ -1977,12 +2070,7 @@ private func spawnArchivedPython(
         posix_spawn_file_actions_destroy(&actions)
         posix_spawnattr_destroy(&attributes)
     }
-    let chdirResult: Int32
-    if #available(macOS 26.0, *) {
-        chdirResult = posix_spawn_file_actions_addchdir(&actions, host.runtimePath)
-    } else {
-        chdirResult = posix_spawn_file_actions_addchdir_np(&actions, host.runtimePath)
-    }
+    let chdirResult = posix_spawn_file_actions_addchdir_np(&actions, host.runtimePath)
     let nativeChannelActionsReady: Bool
     if let nativeChannel {
         nativeChannelActionsReady = posix_spawn_file_actions_adddup2(
@@ -2244,6 +2332,15 @@ private func runService(
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let verifiedHost = verifiedRunningHost() else { exit(65) }
 
+if arguments == ["--install-python-runtime"] {
+    do { try installPackagedPython(host: verifiedHost); exit(0) }
+    catch {
+        fputs("RemCTL runtime installation failed: \(error.localizedDescription)\n", stderr)
+        let failure = error as NSError
+        exit(failure.domain == "RemCTL" && failure.code == 77 ? 77 : 65)
+    }
+}
+
 #if REMCTL_TESTING
 if arguments == ["--test-native-protocol-version"] {
     let payload: [String: Any] = [
@@ -2298,7 +2395,7 @@ if arguments.count == 3, arguments[0] == "--test-verify-running-host" {
 guard arguments.count == 3,
       arguments[0] == "--run-capability-host",
       arguments[1] == "--socket",
-      let socketPath = resourceText("remctl-capability-host-socket-path"),
-      arguments[2] == socketPath
+      let socketContract = resourceText("remctl-capability-host-socket-path"),
+      (arguments[2] == socketContract || (socketContract == "portable-user" && arguments[2].hasPrefix("/") && arguments[2].hasSuffix("/capability-host.sock")))
 else { exit(64) }
-runService(host: verifiedHost, socketPath: socketPath)
+runService(host: verifiedHost, socketPath: arguments[2])

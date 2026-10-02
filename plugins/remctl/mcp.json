@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "remctl": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-c",
+        "exec \"$HOME/bin/remctl\" mcp"
+      ],
+      "env": {
+        "REMCTL_PLUGIN": "1",
+        "REMCTL_PLUGIN_BUILD": "281775cea2a0d84c"
+      }
+    }
+  }
+}

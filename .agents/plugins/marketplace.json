@@ -1,0 +1,1 @@
+{"name":"remctl-local","interface":{"displayName":"RemCTL Desktop"},"plugins":[{"name":"remctl","source":{"source":"local","path":"./plugins/remctl"},"policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},"category":"Productivity"}]}

@@ -69,11 +69,15 @@ class RuntimeTests(unittest.TestCase):
             "completion",
             "doctor",
             "list-symbols",
+            "mcp",
             "onboard",
             "permissions",
             "setup",
         }
-        self.assertEqual(remctl_runtime.LOCAL_COMMANDS, expected_local)
+        # Optional extensions (remctl_accounts) may register their own commands.
+        self.assertEqual(
+            remctl_runtime.LOCAL_COMMANDS - remctl_runtime.EXTENSION_COMMANDS, expected_local
+        )
         for command in expected_local:
             self.assertEqual(
                 remctl_runtime.capability_host_command_scope(command),

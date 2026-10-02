@@ -1,581 +1,236 @@
-# RemCTL: The Power-User Reminders CLI
+# RemCTL
 
-![RemCTL](https://cdn.macstories.net/images/uploads/2026/05/26/cleanshot-2026-05-26-at-1629152x-1779805785287-9271e938c2.png)
+![RemCTL's splash screen and today's reminders in Terminal](https://cdn.macstories.net/images/uploads/2026/09/30/15-cli-today-1790776847710-fed98e698d.png)
 
-RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users and AI agents.
+RemCTL gives you full control of Apple Reminders from the terminal, from AI apps, from a Reminders workspace inside Codex, and from a Today band in Claude Code. It covers the basics (reminders, lists, due dates, flags, and search) as well as features Apple doesn't expose to other apps, such as sections, tags, subtasks, smart lists, and templates.
 
-Normal installations route permission-bearing commands through one persistent, signed `RemCTL Capability Host.app`. The host reads the user's local iCloud Reminders database for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
+Everything goes through **RemCTL Capability Host**, a small signed app that holds the macOS permissions. You grant access to that one app, and the terminal, scripts, and AI apps use it. None of them need their own permissions.
 
-RemCTL also offers an optional integration with Reminders' private API on macOS. This allows RemCTL to write proprietary metadata such as sections, shared-list assignments, subtasks, tags, image attachments, urgent state, Early Reminders, display ordering, list appearance metadata, Groceries list metadata, list groups, custom smart lists, and Reminders templates by using the native ReminderKit framework. Location-based alarms are guarded by the same `--private` command surface, but are saved through the public EventKit bridge because that path materializes reliably on current macOS.
+## Install
 
-This gives scripts and agents access to the modern Reminders data model without writing directly to the sync database. RemCTL installs on macOS 14 or later. The 1.8.0 signed-host release is verified on the current early macOS 27 Golden Gate build. The underlying command and private-API paths also have historical test coverage on macOS 26 Tahoe, but this exact host release has not been rerun there. Private ReminderKit behavior can change between macOS releases.
+You need macOS 14 or later with iCloud Reminders turned on. You don't need an Apple developer account, Xcode, or your own copy of Python.
 
-## How It Works
+**Download (recommended).** On a Mac with Apple silicon, download `RemCTL-arm64.dmg` from [Releases](https://github.com/viticci/remctl/releases), open it, and double-click 'Install RemCTL'. macOS asks whether to open an app downloaded from the internet; click Open. Terminal then checks that RemCTL is signed by MacStories and notarized by Apple, installs it, and walks you through permissions. The installer puts RemCTL Capability Host in `~/Applications` and keeps it running in the background, so you never open it yourself.
 
-```text
-Terminal / Hermes / Codex / other callers
-  -> remctl client (Python 3.10+)
-     -> 6 setup and display commands stay in the caller
-     -> auto: owner-only Unix socket, broker protocol v2
-        -> signed persistent RemCTL Capability Host.app (protected Python 3.13+)
-           reads:   SQLite with Full Disk Access
-           writes:  sealed remctl-bridge -> EventKit with Reminders access
-           flags:   AppleScript with Automation access
-           private: sealed remctl-private -> ReminderKit (--private only)
-```
-
-Why this architecture exists:
-
-- **Direct SQLite reads** expose sections, subtasks, tags, attachments (with sha512-verified local file paths), deep links, list colors and badges, recurrence metadata, normal alarms, location alarms, and Early Reminder metadata in tens of milliseconds.
-- **One permission target** keeps Reminders, Automation, and Full Disk Access grants on the signed capability host. Terminal, Hermes, Codex, Python, and other callers do not need separate RemCTL grants in normal hosted use.
-- **Complete protected execution** routes 49 permission-bearing commands through the protocol-v2 broker. Six setup and display commands stay local: `completion`, `doctor`, `list-symbols`, `onboard`, `permissions`, and `setup`.
-- **Explicit execution modes** use `REMCTL_CAPABILITY_HOST=auto|force|direct`. `auto` is the default and uses the host when installed. `force` requires it. `direct` bypasses it for diagnostics and degraded recovery, so the caller must have its own access. Setting `REMCTL_STORE_DIR` forces direct execution in `auto` or `direct` mode and is an error with `force`. `REMCTL_BRIDGE_PATH` and `REMCTL_PRIVATE_PATH` affect direct execution only; hosted commands use the sealed helpers fixed by the signed generation.
-- **Limited EventKit reads** are available only with `--via-eventkit` on `show`, `search`, `today`, and `upcoming`. The flag never changes the execution route: the signed host performs the EventKit read in normal `auto` mode, while the caller performs it in `direct` mode or with a custom store. It is never selected automatically and does not return RemCTL numeric IDs.
-- **EventKit writes** keep Reminders and iCloud in charge of mutations. RemCTL does not write directly to the database.
-- **Private metadata writes** are unsupported and explicitly opt-in with `--private`. They use Apple's private ReminderKit APIs, not direct SQLite mutation, and should be treated as experimental power-user functionality.
-
-## Quick Start
-
-The easiest experience is to ask your agent (Claude Code or Codex) to set up RemCTL for you by pointing it at this repo. Alternatively:
+**Build it yourself (free).** This is also the route for Intel Macs. Install Apple's Command Line Tools once, then build from this repo:
 
 ```bash
+xcode-select --install
 git clone https://github.com/viticci/remctl.git
 cd remctl
-./install.sh --bootstrap
-~/bin/remctl onboard
+./install.sh --from-source --bootstrap
 ```
 
-Pause here if onboarding opens the Full Disk Access helper. Add only the exact signed `RemCTL Capability Host.app` shown there. If you changed its Full Disk Access authorization, restart the host:
+This builds everything on your Mac and signs it with a certificate RemCTL creates for you. It never signs in to Apple. The certificate lives in `~/Library/Application Support/RemCTL Signing`: keep it, because future updates need the same certificate to keep your permissions.
 
-```bash
-launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
-```
+Both routes ask for your Mac password once. RemCTL installs its own Python under `/Library/RemCTL`, owned by root, so other apps can't tamper with it.
 
-After any required restart, verify the installation and try a normal command:
+### Permissions
 
-```bash
-~/bin/remctl doctor
-~/bin/remctl today
-```
-
-`install.sh` builds, signs, and strictly verifies a complete capability-host generation before it transactionally replaces and starts the LaunchAgent service. The command-line client supports Python 3.10 or newer. The signed host uses a separate protected Python 3.13+ selected by the installer. Xcode Command Line Tools, an official python.org Framework installation of Python 3.13 or newer, and an Apple Development signing identity with a TeamIdentifier are the supported tester setup. The installer preserves an existing identity, accepts a valid explicit `REMCTL_CODESIGN_IDENTITY`, or auto-detects an Apple Development identity. A Mac without that identity is not currently eligible for a live Capability Host install; RemCTL does not fall back to ad-hoc signing. `--bootstrap` also creates RemCTL's config directory; shell completion is installed when supported. For zsh, `setup` prints the `fpath` lines to add to `~/.zshrc` when your config does not already load the completion directory.
-
-`remctl onboard` asks the signed host to present the native Reminders and Automation consent flows. macOS has no native Full Disk Access prompt, so onboarding opens the guided helper only when that grant is missing. If it does, add only the exact signed host shown by the helper, then restart it with `launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"` before running `doctor`. Run `remctl permissions full-disk-access` only when you need to reopen that guide or repair the grant.
-
-When no onboarding state exists, the first interactive, non-JSON permission-bearing invocation runs onboarding before the requested command. RemCTL skips this automatic flow for local setup/display commands, non-TTY or JSON calls, host-internal execution, and `REMCTL_SKIP_ONBOARD=1`. It prints the checks and then continues with the original command; warnings do not block that command, and any unresolved permission failure surfaces from the command itself.
-
-The installer also creates two aliases in your bin directory — `rctl` and `reminders` — that behave identically to `remctl`. Any command in this README works with any of the three names.
-
-If the installer says `PATH action required`, add the printed PATH line and open a new Terminal window before typing `remctl`, `rctl`, or `reminders`.
-
-For a first install to `~/.local/bin`, use:
-
-```bash
-PREFIX="$HOME/.local" ./install.sh --bootstrap
-```
-
-Keep using the same prefix for upgrades, but omit `--bootstrap`: `PREFIX="$HOME/.local" ./install.sh`.
-
-The supported legacy migration recognizes the exact public files from the official 1.7.1 release, the expected aliases, and the types of its compiler-generated native helpers. Start with a normal upgrade. When those generated helpers are present, the installer still requires a manual review before the one-time `--adopt-existing-install` run. Because 1.7.1 predates the signed Capability Host, the first 1.8.0 install is also a first host install: after installation, run `remctl onboard`, complete any Full Disk Access step and host restart, then run `remctl doctor --for-agent --json`. It cannot preserve host grants that did not exist in 1.7.1.
-
-For either an exact official 1.7.1 install with generated helpers or an expected prerelease host install, first review every existing RemCTL path named by the refusal. Confirm it belongs to that expected installation. For a prerelease host, also confirm the signed app and LaunchAgent. Then rerun once with the same prefix and `--adopt-existing-install`, for example `./install.sh --adopt-existing-install`. Move modified, unknown, or foreign paths aside; never adopt them. After a prerelease-host adoption, run onboarding only if this Mac has not already granted access to that exact signed host identity. Normal later upgrades use `./install.sh` and verify exact hashes from `.remctl-install-manifest.json`.
-
-Full setup details live in [docs/installation.md](docs/installation.md). Release notes live in [CHANGELOG.md](CHANGELOG.md).
-
-## Uninstalling
-
-To remove RemCTL files installed by `install.sh`, run:
-
-```bash
-./uninstall.sh
-```
-
-The guarded, identity-checked uninstaller checks `~/bin` and `~/.local/bin` by default, or the destinations selected by `PREFIX`, `REMCTL_BIN_DIR`, `REMCTL_APP_DIR`, and `REMCTL_LAUNCH_AGENT_DIR`. It stops the exact RemCTL LaunchAgent, unregisters and removes the exact signed host app, removes its private socket and known CLI files, removes `completions` only when empty, and supports `--dry-run` and `--keep-config`. It does not edit shell config or revoke macOS privacy permissions.
-
-## Command Map
-
-| Task | Commands |
-| --- | --- |
-| See what is due | `today`, `upcoming`, `overdue` |
-| Browse reminders | `lists`, `groups`, `group-info`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks`, `sharees` |
-| Create and edit | `add`, `edit`, `reminder-move`, `done`, `undone`, `delete`, `flag`, `unflag` |
-| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `section-create`, `section-rename`, `section-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
-| Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
-| Work across accounts | `accounts`, `config`, `--all-accounts` and `--account NAME` on read and write commands |
-| Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
-
-Common examples:
-
-```bash
-remctl today
-remctl groups
-remctl show Work --format table
-remctl show --list-id 153 --json
-remctl today --via-eventkit --json
-remctl show Work --via-eventkit
-remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
-remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
-remctl add "Team sync" -l Work -d "2026-08-28 10:00" --recurrence "monthly x2 4th-fri"
-remctl done 23880 --date "2026-05-27 09:30"
-remctl edit 23880 -d clear
-remctl edit 23880 -l Work
-remctl reminder-move 23880 --before 23881 --private
-remctl reminder-move 23880 --last --smart-list "Focus" --private
-remctl edit 23880 --private --set-tags remctl,work
-remctl section-create "Research" -l Projects --private
-remctl section-rename "Research" --new-name "Reading" -l Projects --private
-remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
-remctl sharees Shopping --json
-remctl add "Pick up groceries" -l Shopping --private --assign Alex
-remctl add "Leave early" -l Work -d "today 14:00" --private --early-reminder 15m
-remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
-remctl list-symbols
-remctl list-symbols --preview
-remctl list-create "Research" --color orange --private --symbol education3
-remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
-remctl list-create "Groceries" --private --groceries --grocery-locale en_US
-remctl list-create "Ideas" --private --group Writing
-remctl group-info "Writing" --json
-remctl group-create "Writing" --private --add-list Editorial
-remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas
-remctl group-edit "Writing" --private --move-list Ideas --before-list Editorial
-remctl group-delete "Drafts" --private --force
-remctl add "Milk" -l Groceries --private --grocery
-remctl smart-lists --json
-remctl smart-list-create "Flagged Review" --private --flagged
-remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
-remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
-remctl smart-list-edit "Priority or Today" --private --priority high
-remctl smart-list-delete "Flagged Review" --private --force
-remctl templates --json
-remctl template-info "Rome: Things To See" --json
-remctl template-create "Packing Template" --from-list Packing --private --json
-remctl template-apply "Packing Template" --private --json
-remctl template-delete "Packing Template" --private --force
-remctl list-edit Projects --private --color orange --symbol education3
-remctl list-pin "Project X" --private
-remctl list-rename --list-id 123 --new-name "Project X Archive"
-remctl info 23880 --json
-remctl accounts
-remctl today --all-accounts
-remctl add "Send invoice" -l Projects --account Exchange
-```
-
-RemCTL works across every Reminders account on the Mac — iCloud, Exchange, Google, other CalDAV, and on-device local. See [Multiple Accounts](#multiple-accounts) below.
-
-The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes. Template commands are covered in [docs/commands.md#templates](docs/commands.md#templates) and [docs/private-metadata.md#template-examples](docs/private-metadata.md#template-examples).
-
-`import` is a convenience importer for ordinary reminder fields, not a lossless restore operation. It accepts a JSON array from a file or `-` for standard input and supports `title`, `list`, `notes`, `due`/`dueDate`, `priority`, `url`, `recurrence`, `alarm`, and Boolean `flagged`. It validates the entire document before writing. Runtime failures can still produce a partial import: successful reminders remain, the command exits nonzero, and the final JSON summary reports created IDs and failed indexes. See [Import and Export](docs/commands.md#import-and-export) before using an export as import input.
-
-`--via-eventkit` is a limited read-only fallback, not an alternate primary mode. It works only for `show`, `search`, `today`, and `upcoming` during explicit diagnostics or degraded recovery. It does not change routing and is never selected automatically: normal `auto` execution sends the command to the signed host, which performs the EventKit read; `direct` mode and `REMCTL_STORE_DIR` run it in the caller. JSON output is a wrapper object with `source: "eventkit"`, `fidelity: "limited"`, and `items`; each item has `eventKitId`, not RemCTL's numeric `id`. Never pass `eventKitId` to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any command that expects a numeric RemCTL ID. This mode also cannot show sections, synced tags, private rich links, urgent state, template internals, smart-list internals, numeric list IDs, or table output.
-
-Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`. In create mode, date-only forms such as `today`, `tomorrow`, `YYYY-MM-DD`, `+3d`, and `next friday` create all-day reminders; forms with explicit times create timed reminders.
-
-Recurrence, normal alarm, and priority inputs are also validated before writes. Supported recurrence forms are `daily`, `weekly`, `monthly`, `yearly`, `weekly mon,wed,fri`, and `monthly 1,15`. An optional `xN` interval token (1–999) follows the frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. Monthly rules can also pin a weekday to a week of the month: `monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri` (alias of `-1-fri`), down to `-5-fri`. Ordinal suffixes are checked, so `4st-fri` is rejected; week-pinned days cannot be mixed with plain day-of-month numbers, and they are monthly-only. Use `last-fri` rather than `5th-fri` for "the last Friday": EventKit skips months that have no fifth Friday. `upcoming DAYS` requires a positive range from 1 to 3650 days.
-
-## Multiple Accounts
-
-Reminders keeps a **separate database per connected account**, and RemCTL's core reads the single live one — so an Exchange, Google, or other CalDAV account is invisible to it, and writes go to iCloud. The optional `remctl_accounts.py` extension makes every account Reminders knows about a first-class target.
-
-```bash
-remctl accounts                          # what's connected, and which is default
-remctl lists --all-accounts              # every account, grouped by account
-remctl today --account Exchange          # scope one command to one account
-remctl --account Exchange lists          # the flag works before the command too
-remctl add "Send invoice" -l Projects --account "work@example.com"
-remctl done 42 --account Exchange
-```
-
-**Nothing changes until you ask for it.** With no `--account`, no `--all-accounts`, no `REMCTL_ACCOUNT_SCOPE`, and no stored `accountScope`, every command behaves exactly as it does without the extension installed — same output, same code path. Delete `remctl_accounts.py` and RemCTL is stock.
-
-Set a persistent default when you'd rather not pass a flag each time:
-
-```bash
-remctl config accountScope all            # default to every account
-remctl config accountScope Exchange       # default to one account
-remctl config accountScope ""             # back to the single default account
-export REMCTL_ACCOUNT_SCOPE=all           # or just for this shell
-```
-
-`remctl config` also exposes `storeDir` (point RemCTL at a different Reminders Stores directory) and `dbPath` (pin one specific store file).
-
-### What you get across accounts
-
-Read commands — `lists`, `groups`, `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `sections`, `sharees`, `tags`, `smart-lists`, `templates`, `stats` — run against each account in scope and merge the results. Human output groups items under bold per-account headers; JSON adds `account` and `accountType` to every item so agents can tell sources apart; `stats` reports per-account figures plus a combined total.
-
-Because these are reads, a list name that exists in more than one account is not an error — you get each match in turn:
-
-```text
-$ remctl show Projects --all-accounts
-  work@example.com
-Projects:
-[ ] #44 Draft the Q3 summary
-
-  personal@example.com
-Projects:
-[ ] #12 Renew passport
-```
-
-Accounts that don't have the list are skipped silently rather than reporting "not found"; if *no* account has it, the command errors and exits non-zero as usual.
-
-Commands that **act** on a single thing — `add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `info`, `subtasks`, `open`, `link`, `list-edit`, `list-delete`, `section-create` — resolve the account themselves, so `remctl done 42` works wherever reminder 42 lives. Here an ambiguous target *is* refused, because acting on the wrong account's copy is not recoverable:
-
-```text
-$ remctl done 42 --all-accounts
-Error: reminder id 42 exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
-```
-
-On these commands `--all-accounts` means "search every account to resolve this target".
-
-`export` and `import` stay single-account by design, since IDs collide across accounts.
-
-### Account types
-
-`remctl accounts` reports each account's type. Types come from EventKit where it names a concrete kind (Exchange and friends), falling back to a local heuristic otherwise — EventKit reports both iCloud and Google as plain `CalDAV`, so the more specific label wins. Account *discovery* is type-agnostic: it enumerates every account store, so any account type Reminders supports is found.
-
-### Reminders outside iCloud
-
-Only iCloud reminders carry a CloudKit identifier, and core refuses to modify a reminder without one rather than risk matching by title — which would otherwise make every Exchange and Google reminder read-only. When you target an account explicitly, RemCTL resolves the reminder's real EventKit identifier so ordinary writes work. One caveat: that lookup matches on list plus title, so a list holding two identically-titled reminders resolves to the first.
-
-Multi-account writes need the current bridge, so recompile with `./install.sh` after updating. Details and the maintainer-facing integration contract are in [docs/multi-account.md](docs/multi-account.md); command syntax is in [Multi-Account in the command guide](docs/commands.md#multi-account).
-
-## Assignees
-
-Assignment is for shared Reminders lists only and requires `--private`. You do not need a person's email if their name is unique in the shared list, but email/phone address or ID is safer for scripts and agents.
-
-```bash
-remctl sharees Shopping
-remctl sharees Shopping --json
-remctl add "Pick up groceries" -l Shopping --private --assign Alex
-remctl edit 23880 --private --assign alex@example.com
-remctl edit 23880 --private --assign me
-remctl edit 23880 --private --unassign
-```
-
-`--assign USER` resolves `USER` against the target list's sharees by display name, first/last name, email or phone address, numeric sharee ID, object UUID, or `me`. Names are convenient for humans; agents should call `remctl sharees LIST --json` first and prefer the returned `address`, numeric `id`, or `objectUUID` when duplicate names are possible. `--unassign` clears the current assignment. Verify the result with `remctl info ID --json`; assignment data appears under `assignment`.
-
-## List Groups
-
-Reminders stores list groups as list rows with `listType: "group"` and child lists linked by parent-list columns. `remctl groups` shows only groups with active/completed/total reminder counts, while `remctl lists --json` includes group rows with `children` and child list rows with `group` metadata. `remctl group-info <group>` prints the group ID, object UUID, child lists, counts, and suggested follow-up commands. `remctl show <group>` reads reminders from the group's child lists. In table mode, group output is split by child list and section; with `--completed`, the date column shows completion timestamps instead of due status.
-
-Group writes use private ReminderKit and require `--private`. `group-create` creates a group and can immediately move existing lists into it. `list-create --private --group <group>` creates a new list and assigns it to the group. `group-edit` renames a group, adds/removes child lists, and can reorder a child list with `--move-list` plus `--before-list`, `--after-list`, `--first`, or `--last`. `group-delete` first moves child lists back to the top level before deleting the empty group. These operations change list containers only; reminders stay in their lists.
-
-## Groceries Lists
-
-Reminders stores Groceries lists as normal lists with private grocery metadata. RemCTL reads those fields directly: `lists --json` reports `listType`, `isGroceries`, and the grocery locale flags, while human `lists` and `show` output mark detected Groceries lists with `🥕`. When `show` prints Groceries sections, known Reminders grocery categories get matching leading emoji such as `🥛 Dairy, Eggs & Cheese`, `🥬 Produce`, and `🧻 Household Items`; `show --json` includes `sectionEmoji` for the same categories.
-
-```bash
-remctl lists --json
-remctl show Groceries
-remctl list-create "Groceries" --private --groceries --grocery-locale en_US
-remctl list-edit "Shopping" --private --groceries --grocery-locale it_IT
-remctl list-edit "Shopping" --private --standard
-remctl add "Milk" -l Groceries --private --grocery
-remctl edit 23880 --private --grocery
-```
-
-Groceries writes require `--private` because Apple exposes the list type, locale, and item categorization through ReminderKit, not EventKit. `add --private --grocery` creates the reminder normally, waits for Reminders' automatic grocery sorter, verifies the resulting section membership from the local database, and only falls back to ReminderKit's explicit categorizer if the item is not sorted yet.
-
-## Smart Lists
-
-RemCTL can inspect built-in and custom smart lists with `smart-lists`. It can also create, edit, and delete custom smart lists with the Reminders.app filters that currently materialize reliably through the private ReminderKit write path: any tag, selected tags, date, time, priority, flag, vehicle-connected, specific location, one included list, and `--match all|any` across those reliable families.
-
-```bash
-remctl smart-lists --json
-remctl smart-list-create "Any Tag" --private --any-tag
-remctl smart-list-create "#remctl Today" --private --tags remctl --date today
-remctl smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due
-remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
-remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
-remctl smart-list-edit --smart-list-id 170 --private --priority high
-remctl smart-list-delete "Priority or Today" --private --force
-```
-
-Smart-list writes are private ReminderKit writes and always require `--private`; RemCTL rejects unknown filter shapes and known zero-filter shapes before saving. Smart lists support the same private appearance flags as lists: `--color`, `--symbol`, and `--emoji`. Reminders.app currently materializes only one included-list filter at a time. Do not create multi-list aggregate smart lists through a list filter; use one included list, or a different reliable filter family. Use:
-
-- [docs/commands.md#smart-lists](docs/commands.md#smart-lists) for command syntax and supported filters.
-- [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples) for private API behavior, safety notes, and reverse-engineered filter storage details.
-- [SKILL.md](SKILL.md) for the concise agent contract.
-
-## Templates
-
-Reminders templates are saved lists with saved reminders inside them. RemCTL reads them from the local template tables and can create, apply, and delete templates through private ReminderKit APIs. Template support is intentionally list-level: RemCTL can save an entire source list as a template and apply a template to create a new list. It does not append individual reminders to existing templates or strip subtasks/due dates while saving. Existing public template links are reported as read-only metadata; RemCTL does not create iCloud sharing links.
-
-```bash
-remctl templates --json
-remctl template-info "Rome: Things To See" --json
-remctl template-create "Packing Template" --from-list Packing --private --json
-remctl template-create "Archive Template" --from-list-id 144 --include-completed --private
-remctl template-apply "Packing Template" --private --json
-remctl template-delete "Packing Template" --private --force
-```
-
-`template-create`, `template-apply`, and `template-delete` require `--private`. `template-create` takes one source list; `--include-completed` is the only content-selection flag. Verify template writes with `templates --json` and `template-info`; verify applied templates with `lists --json` and `show <new list> --json`.
-
-## Private API Features
-
-RemCTL's default writes use EventKit. For metadata Apple does not expose publicly, RemCTL has an explicit `--private` mode backed by `remctl-private`, an Objective-C helper that uses Apple's private ReminderKit framework and saves through the Reminders stack. In normal installed execution, the signed host runs sealed copies of both helpers. RemCTL *never* writes directly to SQLite (which would break iCloud sync and cause database corruption issues).
-
-Private writes are opt-in and power-user only:
-
-```bash
-remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --section "Research"
-remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
-remctl edit 23880 --private --assign Alex
-remctl edit 23880 --private --unassign
-remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
-remctl add "Leave now" -l Work --private --urgent
-remctl add "Leave early" -l Work -d "today 14:00" --private --early-reminder 15m
-remctl reminder-move 23880 --before 23881 --private
-remctl reminder-move 23880 --last --smart-list "Focus" --private
-remctl edit 23880 --private --early-reminder 1h
-remctl edit 23880 --private --early-reminder clear
-remctl edit 23880 --private --image ~/Desktop/mockup.png --flagged --urgent
-remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
-remctl list-edit Projects --private --color '#FF8D28' --symbol education3
-remctl list-edit Projects --private --emoji 📌
-remctl list-create "Groceries" --private --groceries --grocery-locale en_US
-remctl add "Milk" -l Groceries --private --grocery
-remctl list-pin "Project X" --private
-remctl list-pin "Flagged" --private
-remctl list-unpin --list-id 144 --private
-remctl list-unpin --smart-list-id 4 --private
-remctl group-create "Writing" --private --add-list Editorial
-remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas --remove-list Socials
-remctl group-edit "Writing" --private --move-list Ideas --last
-remctl group-delete "Drafts" --private --force
-remctl smart-list-create "Flagged Review" --private --flagged
-remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
-remctl smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due
-remctl smart-list-create "Near Home" --private --location-title Home --latitude 41.9 --longitude 12.5 --proximity enter
-remctl smart-list-edit "Priority or Today" --private --priority high --color red --emoji 📆
-remctl smart-list-delete "Flagged Review" --private --force
-remctl template-create "Packing Template" --from-list Packing --private --json
-remctl template-apply "Packing Template" --private --json
-remctl template-delete "Packing Template" --private --force
-```
-
-Private mode covers the parts of Reminders that EventKit does not expose:
-
-- Reminder metadata: synced web rich links, synced tags, sections, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, and location alarms.
-- Reminder ordering: move within an ordinary list or an unsectioned, manually ordered custom smart list with `reminder-move --private`.
-- List metadata: exact `#RRGGBB` colors, official list symbols, emoji badges, Groceries list conversion/locale metadata, regular-list and custom-smart-list pin state, and list group create/edit/delete. Built-in smart-list pinning is available only when the host macOS exposes the required generic ReminderKit fetch; unsupported systems fail before a save.
-- Smart lists: custom smart-list create/edit/delete for the Reminders filters that RemCTL has verified to materialize correctly.
-- Templates: whole-list template create/apply/delete. Existing public template links can be read, but RemCTL does not create iCloud sharing links.
-
-A few rules keep this safe and predictable:
-
-- `edit -l/--list` and `edit --list-id` use EventKit first. If a pure move is rejected by a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback and returns `oldId` plus the new `id`; move first, then apply unrelated edits to the returned ID.
-- `reminder-move` changes display order without changing the reminder's base list. Use `--smart-list` or `--smart-list-id` for an unsectioned custom smart list; sectioned smart-list ordering is refused before saving.
-- `show <list>` follows the stored Reminders manual display order in JSON, plain, and table output. `show <group>` applies the same ordering within each child list. A reminder that has not merged into the ordering record yet remains visible after positioned reminders.
-- Every delete command requires `--force` under `--json` or when stdin is not interactive. Without it, RemCTL emits `confirmation_required` on stderr and performs no write.
-- Shared-list assignment uses `--private --assign USER`; `USER` may be a unique name, email/phone address, numeric sharee ID, object UUID, or `me`. Use `remctl sharees LIST --json` before assigning when scripting.
-- Location alarms still require the `--private` guardrail, but RemCTL saves them through `remctl-bridge` because EventKit structured-location alarms persist correctly on current macOS.
-- `--private --url` and rich subtask URLs must be public `http` or `https` hosts. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
-- Rich-link and image edit operations are additive. RemCTL can add them, but it does not remove or replace existing rich links/images.
-- `--early-reminder` accepts values such as `15m`, `1h`, `2d`, `1w`, `1mo`, or `clear`. Non-clear values require a due date.
-- `list-create --color` uses public EventKit for normal color names. Add `--private` for exact colors, official symbols, or emoji badges.
-- `list-symbols` prints the 71 official Reminders emblem names. Use `list-symbols --preview` for the native badge contact sheet. Use `--emoji` for custom emoji badges.
-- Groceries writes verify Reminders' automatic sorter first, then use the private categorizer only if needed.
-- Group writes move list containers, not reminders. `group-delete` detaches child lists before deleting the group so their reminders are preserved.
-- If a section name is duplicated in the same list, RemCTL uses the single non-empty match when possible. Otherwise, pass `--section-id`.
-
-Verify with:
-
-- `remctl info ID --json` for reminder metadata.
-- `remctl sharees LIST --json` before assignment, then `remctl info ID --json` for the resulting `assignment`.
-- `lists --json` for list `color`, `badge`, `badgeEmblem`, and Groceries metadata.
-- `smart-lists --json` for smart-list filters and pin state.
-- `templates --json` or `template-info` for templates.
-
-This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple:
-
-- Private-only flags fail before writing unless `--private` is present.
-- Generic file/PDF attachments are intentionally rejected.
-- Smart-list and template writes should get a UI/device check when sync behavior matters.
-
-## Output
-
-RemCTL output is designed for both humans and agents:
-
-- reminder IDs are shown as `#ID`
-- normal JSON read commands return RemCTL numeric `id` values that can be used with `info`, `edit`, `done`, `delete`, `link`, `open`, and `subtasks`
-- `--via-eventkit` JSON returns `eventKitId` values instead; they are EventKit calendar item identifiers and cannot be chained into numeric-ID commands
-- `--via-eventkit` JSON includes `source: "eventkit"`, `fidelity: "limited"`, and `idWarning` so automation can reject accidental ID chaining
-- `#ID` is colored with the reminder list color when RemCTL can read list colors
-- flagged reminders show `⚑`
-- macOS 26 urgent reminders show `⏰`
-- `info --json` reports the actual due date as `dueDate`; if Reminders stores a separate display/alert date, it appears as `displayDate`
-- `add -d` creates all-day reminders when the input names a date without a time, such as `today`, `tomorrow`, `2026-06-01`, `+3d`, or `next friday`
-- `edit -d` carries a single absolute alarm forward when it matches the old due/display time, keeping Reminders.app's visible time aligned for ordinary reschedules
-- `edit -d clear` removes a single matching absolute alarm/display time; `edit --alarm clear` removes normal alarms explicitly
-- normal EventKit alarms and location alarms appear in `info --json` as `alarms`
-- image attachments appear in `info --json` and list-command JSON as `attachments` entries with `filename`, `type`, `path`, `resolved`, `uti`, `width`, and `height`; `path` is the sha512-verified local file as resolved by the executing process, or `null` with `resolved: false` when the attachment is not downloaded on this Mac
-- shared-list assignments appear in human output as `@Name` and in `info --json` as `assignment`
-- Early Reminders appear in `info` output (text and JSON) as labels such as `15 minutes before`
-- recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`, `↻ monthly 4th Fri`, or `↻ every 2 months 4th Tue`
-- Groceries lists show `🥕` in list headings and list summaries
-- table output keeps a dedicated `Repeat` column when any row is recurring
-- human output strips terminal control characters from Reminders text before printing
-- every read command supports JSON output
-
-```bash
-remctl today --json
-remctl --format table upcoming 14
-NO_COLOR=1 remctl today
-```
-
-## Inline Images
-
-Reminders with image attachments can render them right in the terminal:
-
-```bash
-remctl info 847 --images
-remctl show Projects --images --verbose
-remctl today --images --verbose --image-mode halfblock --image-width 48
-```
-
-`info --images` renders every image attachment inline. List commands (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) render attachments too, but only with `--verbose` so ordinary list output stays compact. Rendering happens only on a real TTY — never in pipes, `--json`, or table mode — so scripts are never surprised by escape sequences.
-
-RemCTL picks the best protocol for the current terminal automatically: the Kitty graphics protocol on Ghostty, Kitty, WezTerm, and Konsole; iTerm2's inline image protocol on iTerm2 (and Blink on iOS over SSH); a truecolor half-block renderer elsewhere. Terminals with no usable protocol simply skip inline rendering — the plain attachment filename lines always remain. Override detection with `--image-mode kitty|iterm2|halfblock|none` and set the render width in cells with `--image-width N` (default: ~40% of the terminal width, capped 24–100; half-block caps at 64). The matching environment variables are `REMCTL_IMAGES=1`, `REMCTL_IMAGE_MODE`, and `REMCTL_IMAGE_WIDTH`; flags win over env.
-
-There is nothing new to install. Rendering uses Pillow if it is importable, otherwise macOS `sips` plus a small stdlib BMP decoder — either path works on a stock Mac.
-
-For agents, the same attachments are machine-readable instead: `info --json` and list-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) include an `attachments` array on any reminder that has them. Each entry carries `filename`, `type`, `path`, `resolved`, `uti`, `width`, and `height`. `path` is the sha512-verified on-disk file under Reminders' group container as seen by the signed host. It is not a guarantee that a caller without Full Disk Access can open that protected path itself. A legacy attachment that was never downloaded to this Mac reports `path: null` with `resolved: false`.
-
-## List Badges
-
-Plain human list output ends each reminder line with one or two trailing emoji badges when they apply: `🔗` means the reminder has at least one rich link, `🌄` means at least one image attachment. When both apply they print in that order, space-separated, after tags and any `[N subtasks]` count. Completed reminders keep their badges. The badges appear in `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `group show`, and on subtask lines in `subtasks`/`info` — plain human output only. They are never in `--json`, CSV export, `--format table`, or `--via-eventkit` payloads; agents should read the `attachments` and `url` JSON fields instead.
-
-```text
-[ ] #30165 Try Halo app on iOS again 🌄
-[ ] #30174 Read the new MacStories piece 🔗
-[ ] #30180 Review layout mockups 🔗 🌄
-```
-
-## macOS Permissions
-
-The installed `RemCTL Capability Host.app` is the single macOS privacy target for three grants:
-
-- Reminders access for EventKit writes
-- Automation access for AppleScript operations, including `flag`, `unflag`, and `add --flag`, which have no EventKit path
-- Full Disk Access for database and attachment reads
-
-Run:
-
-```bash
-remctl onboard
-```
-
-Pause here if onboarding opens the Full Disk Access helper. Add only the signed `RemCTL Capability Host.app`. Do not add Hermes, Python, Codex, Terminal, or another caller for normal hosted access. If you changed the host's Full Disk Access authorization, restart it:
-
-```bash
-launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
-```
-
-After any required restart, verify the host:
+Setup asks for three permissions, all for 'RemCTL Capability Host': Reminders, Automation for the Reminders app, and Full Disk Access. The first two are standard macOS prompts. Full Disk Access has no prompt, so RemCTL opens a helper that shows you exactly which app to add. When it's done, check everything with:
 
 ```bash
 remctl doctor
 ```
 
-`remctl onboard` asks the signed host to present the native Reminders and Automation consent flows. It opens the visual Full Disk Access helper only when that grant is missing. If the helper opens, it copies the exact host app path and shows that app as the draggable target. Use `remctl permissions full-disk-access` only to reopen the guide or repair that grant.
+If you quit setup early, pick it up again with `remctl onboard`. If `remctl` isn't found, the installer tells you which folder to add to your PATH (usually `~/bin`). [Installation](docs/installation.md) covers custom paths, permissions by hand, and troubleshooting.
 
-For agent setup, run `remctl doctor --for-agent --json`. The `access.effective` object is authoritative. Direct caller access can remain blocked while `access.effective.route` is `capabilityHost` and `access.effective.ready` is true.
+## Upgrade
 
-Automation status is retained by the running persistent host, not stored as a new macOS grant. After that host has observed a definitive `authorized`, `denied`, or `notDetermined` result, a transient `targetNotRunning` result keeps the last verified state while the host retries. A cold or restarted host with no definitive in-memory result is conservative: if Reminders cannot run, Automation can report `targetNotRunning` or `unknown` and `fullReady` remains false until the host verifies the state. Reminders.app does not need to stay open between commands after a warm verification.
+Find your current setup below. `remctl --version` tells you which version you have.
 
-Manual fallback: run `remctl doctor --for-agent`, then add the printed `RemCTL Capability Host.app` path in System Settings > Privacy & Security > Full Disk Access. In the file picker, press `Command-Shift-G`, paste the path, press Return, then click Open. Restart the host with `launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"`, then rerun `remctl doctor --for-agent`. If Reminders or Automation access is missing, rerun `remctl onboard`; the signed host presents those prompts.
+| You have | Do this |
+| --- | --- |
+| RemCTL 2.0 from the download | Download the new release and open 'Install RemCTL' again. |
+| RemCTL 2.0 you built yourself | `git pull`, then `./install.sh --from-source`. |
+| A 2.0 prerelease installed from `main` with your own Apple Development certificate | `git pull`, then `./install.sh --from-source`. It reuses your certificate, so permissions carry over. |
+| RemCTL 1.7.1 | Download the release and open 'Install RemCTL', or `git pull` and run `./install.sh --from-source --bootstrap`. The installer recognizes 1.7.1 and asks before replacing it. |
+| RemCTL 1.7.0 or older | From your old checkout, run `./uninstall.sh --keep-config`. Then install as new. |
 
-If Full Disk Access cannot yet be granted to the signed host, `show`, `search`, `today`, and `upcoming` support `--via-eventkit` as a limited read-only recovery path through EventKit. It stays hosted in normal `auto` mode and runs in the caller only in `direct` mode or with `REMCTL_STORE_DIR`; RemCTL never selects it automatically. This does not replace normal setup: it omits RemCTL numeric IDs, sections, synced tags, private metadata, smart-list/template internals, numeric list targeting, and table output.
+Updates that keep the same signature keep your permissions. RemCTL 1.x had no Capability Host, so coming from 1.x means granting permissions once to the new app. (You can remove the old grants for Terminal afterwards; RemCTL doesn't need them anymore.)
 
-## For Agents
+Switching between the download and your own build changes the app's signature. The installer refuses unless you add `--migrate-signing`, and you'll need to grant Full Disk Access again. [Switching signatures](docs/installation.md#switching-between-the-download-and-your-own-build) explains how.
 
-Use JSON when scripting:
-
-```bash
-remctl today --json
-remctl show Work --json
-remctl search "query" --completed --json
-remctl info 23880 --json
-remctl doctor --for-agent --json
-```
-
-Use the absolute installed path in agent sessions because their `PATH` may not include `~/bin`. Normal `auto` mode routes every permission-bearing command through the signed host. `REMCTL_CAPABILITY_HOST=force` requires hosted execution and fails if the host is unavailable. `REMCTL_CAPABILITY_HOST=direct` deliberately bypasses the host for diagnostics or degraded recovery; in that mode the caller needs its own access. A custom `REMCTL_STORE_DIR` also forces direct execution and conflicts with `force`. Caller-side `REMCTL_BRIDGE_PATH` and `REMCTL_PRIVATE_PATH` overrides apply only to direct execution; the host always uses its sealed helpers.
-
-`search` matches reminder titles and notes. By default it searches active reminders; pass `--completed` to include completed reminders too.
-
-Do not use `--via-eventkit` by default. It never changes the execution route and RemCTL never chooses it automatically: `auto` uses the signed host, while `direct` or a custom store uses the caller. Use it only when a supported basic read explicitly needs degraded EventKit fidelity. JSON returns a wrapper with `source: "eventkit"`, `fidelity: "limited"`, and `items`; item identifiers are `eventKitId`, not RemCTL numeric `id`. Never pass `eventKitId` to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any other numeric-ID command. If the task needs sections, tags, rich links, urgent state, templates, smart-list internals, or chainable IDs, grant Full Disk Access to the exact signed host instead.
-
-For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `add --private` validates section/assignee/URL inputs before creating the reminder; if a private step still fails after creation, output is `{"status": "partial", "id", "numericId", "failed", "error"}` in JSON (text mode: `Created reminder #N but failed to apply <action>; re-run edit to finish. Do NOT re-run add (would duplicate).`). On `partial`, re-run `edit` to finish the metadata; never re-run `add`. For list moves, use the `id` returned by `remctl edit ... -l ... --json`; a verified clone-delete fallback can replace the original reminder and return `oldId` plus a new `id`. `info` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so agents should not need raw SQLite checks for ordinary reminder metadata verification. Parent reminder attachments also appear in list-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`); each `attachments` entry includes a sha512-verified `path` as resolved by the signed host, or `path: null` with `resolved: false` when the attachment is a legacy row that was never downloaded on this Mac. The path does not grant a blocked caller access to the protected file.
-
-Use JSON for automation when exact raw text matters. Human output is terminal-safe and strips control characters; JSON preserves the underlying Reminders values.
-
-For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. `smart-lists --json` also reports smart-list pin state; on macOS 26, a successful smart-list pin can be verified from `pinnedDate` because the regular-list boolean can stay empty. Custom smart-list pinning uses the custom-list fetch on both Tahoe and Golden Gate. Verify a pin and its reversal from `smart-lists --json`, checking the same `objectUUID` and filter plus `pinned: true` with a positive `pinnedDate`, then `pinned: false` with no positive pin date. Built-in smart-list pinning is capability-gated: hosts that expose the generic fetch keep the existing behavior, while tested Tahoe 26.2 and Golden Gate 27.0 builds fail with a precise unsupported message before creating a save request. Reminders.app currently materializes only one included-list filter at a time; RemCTL rejects repeated included lists and list exclusions before writing. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
-
-For template automation, use `templates --json` and `template-info` to inspect saved templates. Use `template-create`, `template-apply`, and `template-delete` with `--private`; verify template rows with `templates --json` or `template-info`, and verify applied lists with `show <list> --json`. Template writes are list-level only: do not assume support for appending individual reminders to a template or excluding subtasks/due dates. Existing iCloud template links are read-only metadata.
-
-For Groceries automation, use `lists --json` to detect `listType: "groceries"` and `grocery.locale`, then use `add --private --grocery` or `edit --private --grocery` only against an existing Groceries list. Verify with `show <list> --json` and check the reminder's `section` after categorization.
-
-For shared-list assignments, call `remctl sharees LIST --json` first. `--assign` accepts a unique name, email/phone address, numeric sharee ID, object UUID, or `me`; prefer `address`, `id`, or `objectUUID` in automation because names can collide. Assignment writes require `--private` and a known target shared list, then verify with `remctl info ID --json` and inspect `assignment.assignee`.
-
-Agents should pass deterministic due dates, using `YYYY-MM-DD` for all-day reminders and `YYYY-MM-DD HH:MM` for timed reminders after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
-
-`flag`, `unflag`, and `add --flag` write the real flagged state through Reminders' AppleScript interface, because EventKit has no flagged API; there is no bridge fallback. In normal installed execution AppleScript runs inside the signed host, so Automation access belongs to that host. If the AppleScript write fails, `flag`/`unflag` exit 1 and emit `{"status": "error", "code": "applescript_flag_failed", "id", "message"}` on stderr instead of reporting a fake success. `add --flag` still creates the reminder and reports the failure as a `warnings` array (`["flag_not_set: …"]`) in the JSON payload; finish with `remctl edit <id> --private --flagged` rather than re-running `add`.
-
-List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `section-create`, `section-rename`, `section-delete`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, group membership/order edits, and smart-list list filters. Group commands target groups by name or `--group-id`; write commands that need a real list reject groups and name the child lists you can target. `list-create --private --group-id` is available when group names collide. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
-
-Do not mutate the Reminders SQLite database. Use RemCTL commands or EventKit.
-
-For troubleshooting, trust `access.effective` in `doctor --for-agent --json`. A blocked `access.direct` result for Hermes or another caller is expected when the signed host is fully ready. If effective access fails, rerun `install.sh` or `remctl onboard` as directed and grant permissions only to the exact signed host. Do not add the caller app or interpreter.
-
-After a repo update, rebuild and reinstall the complete signed host generation before testing:
+## Use it from the terminal
 
 ```bash
-git pull
-./install.sh
-hash -r
-remctl --version
-remctl doctor --for-agent --json
+remctl today                      # due today and overdue
+remctl upcoming 7                 # the next week
+remctl show Work --format table   # one list, in Reminders' order
+remctl search "invoice" --json    # titles, notes, and saved links
+remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
+remctl add "Pay rent" -d 2026-06-01 --recurrence monthly
+remctl done 23880 23881           # one id or a batch of up to 50
+remctl info 23880 --json          # everything RemCTL knows about one reminder
 ```
 
-`./install.sh` requires `swiftc`, `clang`, a protected Python 3.13+, and a stable signing identity. When an existing signed host is present, it preserves that identity and its macOS privacy grants. It also accepts a valid explicit `REMCTL_CODESIGN_IDENTITY` or auto-detects an Apple Development identity. It builds and strictly verifies the signed app before transactionally replacing and restarting the service. Do not rerun onboarding after an existing signed-host upgrade unless `doctor` reports permission trouble. The official 1.7.1-to-1.8.0 transition is different: 1.7.1 had no host, so run onboarding and grant the new host access after installation. `remctl doctor` reports broker protocol v2, host permissions, effective routing, and sealed-helper readiness. RemCTL also checks the `remctl-private` protocol on first `--private` use; an outdated direct helper refuses to run with `remctl-private is outdated (protocol N < required M); re-run install.sh to rebuild.` Maintainers can send `{"action":"capabilities"}` to `remctl-private` for a read-only selector report; it creates only unsaved change objects and returns `saveCalled: false`.
+Every reminder has a stable numeric `id`, and every read command has `--json`. `rctl` and `reminders` work as aliases. The [command guide](docs/commands.md) covers due dates, recurrence, output formats, inline images, and every command.
 
-## Docs
+## Use it from AI apps
 
-- [Installation and onboarding](docs/installation.md)
+RemCTL includes an MCP server (MCP, or Model Context Protocol, is the standard AI apps use to call tools). Setup offers to connect the AI apps it finds on your Mac. You can also do it yourself:
+
+```bash
+remctl mcp install                          # every supported app on this Mac
+remctl mcp install --client claude-desktop  # Claude Desktop and Cowork; restart Claude afterwards
+remctl mcp bundle --open                    # or install it as a one-click Claude Desktop extension
+remctl mcp status
+```
+
+AI apps can read, create, edit, complete, and delete reminders and lists, search with paging, and restore reminders from Recently Deleted. Apps that support MCP Apps also get an interactive reminders widget. To use RemCTL from Claude Code, Codex, or Claude Desktop on another computer, `remctl mcp install --client tailscale` serves the same tools over your private Tailscale network.
+
+The [MCP guide](docs/mcp.md) has the full tool list and troubleshooting. There's also a guide for [Hermes Agent](docs/hermes.md).
+
+## Use it in Claude Code
+
+The RemCTL plugin for Claude Code gives Claude RemCTL's tools and adds **Today**, a [mod](https://code.claude.com/docs/en/plugins/mods/overview) that keeps today's reminders above the prompt. A mod is the part of a plugin that draws in Claude Code's own interface. Today shows how many tasks are left, which ones are overdue, and every list in its Reminders color.
+
+![Today's reminders in a band above the Claude Code prompt](https://cdn.macstories.net/images/uploads/2026/10/01/social-terminal-1-band-1790885074819-a012d90b4e.png)
+
+Install RemCTL first, then add the plugin from this repository's marketplace. In Claude Code:
+
+```text
+/plugin marketplace add viticci/remctl
+/plugin install remctl@remctl
+/reload-plugins
+```
+
+Or from your shell, before you start Claude Code:
+
+```bash
+claude plugin marketplace add viticci/remctl
+claude plugin install remctl@remctl
+```
+
+What you get:
+
+- **RemCTL's tools.** The plugin starts `~/bin/remctl mcp`, the same server `remctl mcp install` connects, so Claude can read, create, edit, and complete your reminders.
+- **The band above the prompt.** How many tasks are left today and how many are overdue, a chip with a count for each list in its color, and your next few tasks with their list and due time. Overdue dates are red, ⚑ marks a flagged task, and `!`, `!!`, or `!!!` shows its priority. When the chips don't fit beside the summary, they get a row of their own. **Open ›** opens `/reminders`. When nothing is left, the band says so; when RemCTL can't read Reminders, it shows the error instead. The band hides while the `/reminders` pane is open, and Claude Code's `[-]` button collapses it.
+- **`/reminders`.** A pane with today's date and counts, and today's tasks grouped by list, in your sidebar's order. It docks beside the conversation in a window at least 110 columns wide, and opens above the prompt in a narrower one. Press ✓ to complete a task in Reminders: the row fills in, then leaves the list. **Undo** brings back the last task you completed, and only that one. **Refresh** reads Reminders again, and "Updated" shows when it last did. The command also adds one line to the conversation, such as "Today: 6 left, 1 overdue.", which Claude can read.
+- **The status line.** With "Show tasks as" set to `status`, the summary moves under the prompt, with your next task: "Today: 6 left · 1 overdue · next: Record AppStories 23:00".
+- **Live updates.** Today reads Reminders again as soon as Claude creates, edits, completes, flags, deletes, or restores a reminder through RemCTL, after `/clear`, and every five minutes otherwise.
+
+![The /reminders pane docked beside the conversation](https://cdn.macstories.net/images/uploads/2026/10/01/social-terminal-2-pane-1790885078972-d4da08a266.png)
+
+To use the pane from the keyboard, press ctrl+x, then Tab, to move from the prompt to the pane. Tab and Shift-Tab move between its buttons (each task's ✓, Undo, Refresh, and the ✕ that closes the pane), Enter presses the one that's selected, and Esc returns to the prompt. You can also click them. After you complete a task, the selection moves to the next task's ✓, so pressing Enter again completes that one too.
+
+To change how Today looks, open `/config`, where each setting's title starts with "Today:", or run `/plugin configure remctl@remctl`. From your shell, pass the settings you want to change as JSON, by key and with every value in quotes, then start a new session:
+
+```bash
+echo '{"display": "status", "refreshMinutes": "2"}' | claude plugin configure remctl@remctl --values-stdin
+```
+
+| Setting | Key | Default | What it does |
+| --- | --- | --- | --- |
+| Show tasks as | `display` | `band` | `band` lists your next tasks under the summary, `compact` shows the summary line only, `status` moves it to the status line, and `pane only` shows nothing until you run `/reminders`. |
+| Tasks in the band | `rows` | 3 | How many tasks the band lists, from 0 to 8. |
+| Include overdue tasks | `includeOverdue` | on | Counts and lists reminders that were due before today. |
+| Only these lists | `lists` | empty | Comma-separated list names, such as `Work, Editorial`. Empty means every list. |
+| Complete from the pane | `checkboxes` | on | Shows the ✓ buttons in `/reminders`. |
+| Refresh every (minutes) | `refreshMinutes` | 5 | How often Today reads Reminders again, from 1 to 60. |
+| Open the pane at start | `openOnStart` | off | Docks `/reminders` beside the conversation when a session starts in a wide window. |
+
+A few things to know:
+
+- **Mods need Claude Code 2.1.287 or later.** Run `claude --version` to check. Older versions still get RemCTL's tools, without the band or `/reminders`.
+- **The Claude app.** Its Code tab shows the band and `/reminders` once the app bundles Claude Code 2.1.287 or later. Until then, it has RemCTL's tools only.
+- **One connection is enough.** With the plugin installed, `remctl mcp install` and onboarding don't add another connection to Claude Code. If you connected Claude Code before with `remctl mcp install --client claude-code`, remove that connection so Claude doesn't see every RemCTL tool twice: `remctl mcp remove --client claude-code`, or run `remctl mcp install` again. `remctl doctor` points it out. Skills or prompts that name a tool such as `mcp__remctl__today` should then use `mcp__plugin_remctl_remctl__today`.
+- **Updates.** Claude Code doesn't update plugins from this marketplace automatically unless you turn on auto-update for it in `/plugin` → Marketplaces. To update by hand, run `claude plugin marketplace update remctl`, then `claude plugin update remctl@remctl`.
+
+## Use it in Codex
+
+The RemCTL plugin for Codex on the Mac adds a full Reminders workspace, with a sidebar that works like the Reminders app: list, column, and calendar layouts, an inspector for every reminder field, drag and drop, a command palette, quick add, and your real list icons and colors. It follows your Mac's light and dark appearance, remembers the layout you pick for each list, and keeps your reminders in Apple Reminders. You can attach specific reminders to a conversation.
+
+Install RemCTL first, then add the plugin from the installed app:
+
+```bash
+codex plugin marketplace add "$HOME/Applications/RemCTL Capability Host.app/Contents/Resources"
+codex plugin add remctl@remctl-local
+```
+
+Open 'Reminders' in the Codex sidebar, or ask Codex to open your Reminders workspace. The [Codex plugin guide](docs/desktop-plugin.md) covers updates, settings, keyboard shortcuts, and removal.
+
+![A RemCTL list in Codex with a reminder open in the inspector](https://cdn.macstories.net/images/uploads/2026/09/30/07-inspector-light-1790776780368-d6ee34a75e.png)
+
+![The calendar layout in dark mode](https://cdn.macstories.net/images/uploads/2026/09/30/12-calendar-dark-1790776812431-03166da0b7.png)
+
+![The columns layout, with one column per section](https://cdn.macstories.net/images/uploads/2026/09/30/05-kanban-demo-light-1790776758217-8b3e480458.png)
+
+![The command palette](https://cdn.macstories.net/images/uploads/2026/09/30/13-command-palette-light-1790776824784-63935204c2.png)
+
+## Multiple accounts
+
+Reminders keeps a separate database for each connected account, so by default RemCTL sees one: the live iCloud store. The optional multi-account extension (`remctl_accounts.py`) adds Exchange, Google, other CalDAV, and on-device local accounts:
+
+```bash
+remctl accounts                          # what's connected, and which is default
+remctl lists --all-accounts              # every account, grouped by account
+remctl today --account Exchange          # scope one command to one account
+remctl add "Send invoice" -l Projects --account "work@example.com"
+remctl done 42 --account Exchange
+remctl config accountScope all           # or set a persistent default
+```
+
+Nothing changes until you ask for it: with no `--account`, `--all-accounts`, `REMCTL_ACCOUNT_SCOPE`, or stored `accountScope`, every command behaves exactly as it does without the extension. Reads span every account in scope; commands that act on one reminder or list refuse an ID that exists in more than one account and ask for `--account`. `export` and `import` stay single-account. [Multiple accounts](docs/multi-account.md) covers scope, account types, writes to non-iCloud accounts, and the integration contract.
+
+## Private metadata
+
+Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, manual ordering, list icons, Groceries lists, list groups, custom smart lists, and templates. RemCTL writes them only when you pass `--private`:
+
+```bash
+remctl add "Research" -l Projects --private --url https://example.com -t remctl --section Research
+remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
+```
+
+These writes use Apple's private ReminderKit framework, never the database directly. Apple can change these APIs in any macOS release. [Private metadata](docs/private-metadata.md) lists what works and how to verify it.
+
+## For agents
+
+Read [SKILL.md](SKILL.md). In short: use the RemCTL MCP tools when they're connected, use deterministic dates (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`), and verify writes with `info <id> --json`. `remctl doctor --for-agent --json` reports readiness; `access.effective` is the field that matters.
+
+## Uninstall
+
+Disconnect AI apps and remove the Claude Code and Codex plugins first, then run the uninstaller that came with the app (or `./uninstall.sh` from a checkout):
+
+```bash
+remctl mcp remove
+claude plugin uninstall remctl@remctl && claude plugin marketplace remove remctl
+codex plugin remove remctl@remctl-local && codex plugin marketplace remove remctl-local
+~/Applications/"RemCTL Capability Host.app"/Contents/Resources/Distribution/uninstall.sh
+```
+
+It stops the Capability Host and removes the app, the CLI, its background service, and your RemCTL settings (add `--keep-config` to keep them). It leaves the shared Python under `/Library/RemCTL` and your signing certificate in place, and it doesn't revoke macOS permissions. `--dry-run` shows what it would remove.
+
+## Documentation
+
+- [Installation](docs/installation.md)
 - [Command guide](docs/commands.md)
 - [Multiple accounts](docs/multi-account.md)
-- [Smart-list command syntax](docs/commands.md#smart-lists)
-- [Template command syntax](docs/commands.md#templates)
-- [Private metadata writes](docs/private-metadata.md)
-- [Smart-list private API notes](docs/private-metadata.md#smart-list-examples)
-- [Template private API notes](docs/private-metadata.md#template-examples)
+- [MCP server](docs/mcp.md)
+- [Codex plugin](docs/desktop-plugin.md)
+- [Hermes Agent](docs/hermes.md)
+- [Private metadata](docs/private-metadata.md)
 - [Architecture](docs/architecture.md)
+- [Agent manual](SKILL.md)
+- [Changelog](CHANGELOG.md)
 
-## Project Layout
+## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `remctl` | Main Python CLI |
-| `remctl-bridge.swift` | Swift/EventKit write helper source |
-| `remctl-private.m` | Unsupported private ReminderKit metadata helper source |
-| `remctl-permissions.swift` | Swift/AppKit guided Full Disk Access helper for the signed host target |
-| `remctl-capability-host.swift` | Persistent signed AppKit host and native permission gate |
-| `remctl-capability-host-Info.plist` | Capability Host app identity and metadata |
-| `remctl-capability-host-launchagent.plist` | Per-user persistent host service template |
-| `remctl_broker.py` | Protocol-v2 client/server transport and host runtime |
-| `remctl_capability_policy.py` | Complete local/hosted command partition and broker policy |
-| `remctl_capabilities.py` | Descriptor-backed input-file and TTY capabilities |
-| `remctl_runtime.py` | Shared routing, paths, config, date windows, and safety helpers |
-| `remctl_images.py` | Attachment file resolution and inline terminal image rendering |
-| `remctl_serialization.py` | Shared reminder JSON serialization |
-| `remctl_smart_lists.py` | Smart-list filter decoding and safe v1 encoding |
-| `scripts/build_capability_archive.py` | Builds the sealed, sourceless Python runtime archive |
-| `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
-| `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |
-| `install.sh` | Transactional signed-host installer and bootstrap script |
-| `uninstall.sh` | Stops and removes the exact host service, app, socket, CLI files, and optional config |
+| `remctl` | The CLI |
+| `remctl_mcp.py`, `remctl_mcp_widget.html` | MCP server and its reminders widget |
+| `remctl_plugin.py`, `remctl_workspace.py`, `remctl_workspace.html` | Codex plugin tools and the built workspace |
+| `remctl_events.py` | MCP Events (not enabled in the plugin yet) |
+| `remctl_broker.py`, `remctl_capability_policy.py`, `remctl_capabilities.py` | Socket protocol and host command policy |
+| `remctl_runtime.py`, `remctl_serialization.py`, `remctl_images.py`, `remctl_smart_lists.py` | Shared helpers, JSON, images, and smart-list filters |
+| `remctl-capability-host.swift` | The signed host app |
+| `remctl-bridge.swift`, `remctl-private.m`, `remctl-permissions.swift` | EventKit, private ReminderKit, and Full Disk Access helpers |
+| `plugins/claude-code/`, `.claude-plugin/` | Claude Code plugin (MCP server and the Today mod) and its marketplace |
+| `plugins/remctl/`, `.agents/plugins/` | Codex plugin manifest, skills, and marketplace |
+| `ui/` | Workspace source (only needed to change the interface) |
+| `scripts/` | Release builds, notarization, signing, and live test matrices |
+| `install.sh`, `uninstall.sh` | Installer and uninstaller |
 
 ## License
 

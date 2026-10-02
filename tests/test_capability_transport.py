@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import plistlib
 import pty
 import select
 import signal
@@ -20,6 +21,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import remctl_broker
+import remctl_capabilities
 from remctl_capabilities import (
     CAPABILITY_PREFIX,
     CapabilityBundle,
@@ -219,6 +221,34 @@ class CapabilityBindingTests(unittest.TestCase):
 
 
 class CapabilityPlannerTests(unittest.TestCase):
+    def test_tty_duplicate_is_closed_when_descriptor_inspection_fails(self):
+        master, original = pty.openpty()
+        stream = SimpleNamespace(isatty=lambda: True, fileno=lambda: original)
+        try:
+            for target in ("os.fstat", "fcntl.fcntl"):
+                with self.subTest(target=target):
+                    duplicate = os.dup(original)
+                    try:
+                        with (
+                            mock.patch.object(remctl_capabilities.os, "dup", return_value=duplicate),
+                            mock.patch("remctl_capabilities." + target, side_effect=OSError("inspection failed")),
+                        ):
+                            result = remctl_capabilities._open_tty(
+                                stream, identifier="tty-0", purpose="stdin"
+                            )
+                        self.assertIsNone(result)
+                        with self.assertRaises(OSError):
+                            os.fstat(duplicate)
+                        os.fstat(original)
+                    finally:
+                        try:
+                            os.close(duplicate)
+                        except OSError:
+                            pass
+        finally:
+            os.close(original)
+            os.close(master)
+
     def test_installed_markers_resolve_custom_app_and_socket(self):
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value).resolve()
@@ -253,6 +283,44 @@ class CapabilityPlannerTests(unittest.TestCase):
                 self.assertEqual(remctl_broker.app_path(), app)
                 self.assertEqual(remctl_broker.socket_path(), socket_path)
                 self.assertEqual(remctl_broker.launch_agent_path(), agent_path)
+
+    def test_portable_app_under_custom_prefix_finds_socket_through_launch_agent(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            home = Path(temp_value).resolve()
+            prefix = home / ".local"
+            client = prefix / "bin"
+            app = prefix / "Applications" / "RemCTL Capability Host.app"
+            resources = app / "Contents" / "Resources"
+            socket_path = prefix / "Library/Application Support/RemCTL/capability-host.sock"
+            agent_path = home / "Library/LaunchAgents/net.macstories.remctl.capability-host.plist"
+            client.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            agent_path.parent.mkdir(parents=True)
+            (client / ".remctl-capability-host-app").write_text(str(app) + "\n")
+            (resources / "remctl-capability-host-socket-path").write_text("portable-user\n")
+            executable = app / "Contents/MacOS/RemCTL Capability Host"
+            agent_path.write_bytes(plistlib.dumps({
+                "Label": "net.macstories.remctl.capability-host",
+                "ProgramArguments": [str(executable), "--run-capability-host", "--socket", str(socket_path)],
+            }))
+            agent_path.chmod(0o644)
+            default_socket = home / "Library/Application Support/RemCTL/capability-host.sock"
+            with (
+                mock.patch.object(remctl_broker, "CLIENT_ROOT", client),
+                mock.patch.dict(os.environ, {
+                    "HOME": str(home),
+                    "REMCTL_CAPABILITY_HOST_APP": "",
+                    "REMCTL_CAPABILITY_HOST_SOCKET": "",
+                    "REMCTL_CAPABILITY_HOST_LAUNCH_AGENT": "",
+                }),
+            ):
+                self.assertEqual(remctl_broker.launch_agent_path(), agent_path)
+                self.assertEqual(remctl_broker.socket_path(), socket_path)
+                # A LaunchAgent others can write is not trusted.
+                agent_path.chmod(0o666)
+                self.assertEqual(remctl_broker.socket_path(), default_socket)
+                agent_path.unlink()
+                self.assertEqual(remctl_broker.socket_path(), default_socket)
 
     def test_real_parser_planner_and_server_binding_cover_all_file_surfaces(self):
         parser = remctl_broker._load_real_parser()
@@ -1430,6 +1498,35 @@ class InteractiveRelayTests(unittest.TestCase):
 
 
 class FramingSecurityTests(unittest.TestCase):
+    def test_short_send_preserves_frame_and_delivers_descriptor_once(self):
+        sender, receiver = socket.socketpair()
+        read_fd, write_fd = os.pipe()
+        received = []
+
+        class ShortSender:
+            def sendmsg(self, buffers, ancillary):
+                return sender.sendmsg([buffers[0][:7]], ancillary)
+
+            def sendall(self, remainder):
+                sender.sendall(remainder)
+
+        payload = {"protocolVersion": remctl_broker.PROTOCOL_VERSION, "operation": "ping"}
+        try:
+            remctl_broker._send_frame(
+                ShortSender(), payload, limit=1024, descriptors=[read_fd]
+            )
+            decoded, received = remctl_broker._recv_request(receiver)
+            self.assertEqual(decoded, payload)
+            self.assertEqual(len(received), 1)
+            self.assertEqual(os.fstat(received[0]), os.fstat(read_fd))
+        finally:
+            for fd in received:
+                os.close(fd)
+            os.close(read_fd)
+            os.close(write_fd)
+            sender.close()
+            receiver.close()
+
     def test_symlinked_socket_parent_is_rejected_by_client_and_server(self):
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value).resolve()
@@ -1707,6 +1804,13 @@ class PostSpawnClassificationTests(unittest.TestCase):
 
 
 class SignatureStatusTests(unittest.TestCase):
+    def test_local_identity_requires_exact_certificate_pin(self):
+        requirement = 'identifier "net.macstories.remctl.capability-host" and certificate leaf = H"' + 'a' * 40 + '"'
+        self.assertTrue(remctl_broker.has_stable_signing_identity({"teamID": "not set", "designatedRequirement": requirement}))
+        for altered in (requirement + ' or true', 'identifier "net.macstories.remctl.capability-host"', requirement.replace('net.macstories.remctl.capability-host', 'other.app')):
+            with self.subTest(requirement=altered):
+                self.assertFalse(remctl_broker.has_stable_signing_identity({"teamID": "not set", "designatedRequirement": altered}))
+
     def test_signature_status_has_structured_identity(self):
         verify = subprocess.CompletedProcess([], 0, b"", b"")
         describe = subprocess.CompletedProcess(
@@ -1730,6 +1834,18 @@ class SignatureStatusTests(unittest.TestCase):
             status["designatedRequirement"],
             "identifier net.macstories.remctl.capability-host",
         )
+
+
+class PrivateHelperProtocolTests(unittest.TestCase):
+    def test_host_accepts_known_helper_versions(self):
+        runtime = SimpleNamespace(private=Path('/unused/remctl-private'))
+        for version, compatible in ((None, False), (1, False), (2, True), (3, True), (4, False)):
+            with self.subTest(version=version), mock.patch.object(
+                remctl_broker.subprocess, 'run',
+                return_value=SimpleNamespace(stdout=json.dumps({'protocolVersion': version}).encode()),
+            ):
+                self.assertEqual(remctl_broker._private_protocol(runtime),
+                                 {'compatible': compatible, 'version': version})
 
 
 class PingTests(unittest.TestCase):
@@ -1928,6 +2044,64 @@ class PermissionRequestLifecycleTests(unittest.TestCase):
             "automation": "notDetermined",
             "automationTarget": "com.apple.reminders",
         }
+
+    def test_disk_access_probe_does_not_block_permission_cache_updates(self):
+        for initial_cache in (True, False):
+            with self.subTest(initial_cache=initial_cache), tempfile.TemporaryDirectory() as value:
+                runtime = self._runtime(Path(value))
+                permissions = self._permissions()
+                probe_started = threading.Event()
+                release_probe = threading.Event()
+                updated = threading.Event()
+                results = []
+                errors = []
+                refreshed = threading.Event()
+                refreshed.set()
+
+                def refresh(_runtime):
+                    remctl_broker._remember_permission_status(runtime, permissions)
+                    return refreshed
+
+                def probe():
+                    probe_started.set()
+                    if not release_probe.wait(timeout=2):
+                        raise AssertionError("disk access probe was not released")
+                    return "authorized"
+
+                def snapshot():
+                    try:
+                        results.append(remctl_broker._permission_status_snapshot(runtime))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                def update():
+                    remctl_broker._remember_permission_status(
+                        runtime, {**permissions, "reminders": "authorized"}
+                    )
+                    updated.set()
+
+                if initial_cache:
+                    remctl_broker._remember_permission_status(runtime, permissions)
+                with (
+                    mock.patch.object(remctl_broker, "_full_disk_access_status", side_effect=probe),
+                    mock.patch.object(remctl_broker, "_schedule_permission_status_refresh", side_effect=refresh),
+                ):
+                    reader = threading.Thread(target=snapshot)
+                    updater = threading.Thread(target=update)
+                    reader.start()
+                    try:
+                        self.assertTrue(probe_started.wait(timeout=1))
+                        updater.start()
+                        self.assertTrue(updated.wait(timeout=1))
+                    finally:
+                        release_probe.set()
+                        reader.join(timeout=2)
+                        if updater.ident is not None:
+                            updater.join(timeout=2)
+                self.assertFalse(reader.is_alive())
+                self.assertFalse(updater.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [permissions])
 
     def test_precancelled_client_never_dispatches_or_restarts_host(self):
         for cancellation, expected_code in (
@@ -2556,6 +2730,28 @@ class PersistentNativePermissionChannelTests(unittest.TestCase):
 
     def tearDown(self):
         remctl_broker._NATIVE_PERMISSION_CHANNEL_FAILED.clear()
+
+    def test_native_duplicate_is_closed_when_inheritance_guard_fails(self):
+        with self._channel():
+            duplicate = os.dup(remctl_broker.NATIVE_PERMISSION_FD)
+            try:
+                with (
+                    mock.patch.object(remctl_broker.os, "dup", return_value=duplicate),
+                    mock.patch.object(remctl_broker.os, "set_inheritable", side_effect=OSError("guard failed")),
+                    self.assertRaises(remctl_broker._ServerError) as error,
+                ):
+                    remctl_broker._native_permission_socket()
+                self.assertEqual(error.exception.code, "permission_channel_unavailable")
+                self.assertFalse(error.exception.dispatched)
+                self.assertFalse(error.exception.indeterminate)
+                with self.assertRaises(OSError):
+                    os.fstat(duplicate)
+                os.fstat(remctl_broker.NATIVE_PERMISSION_FD)
+            finally:
+                try:
+                    os.close(duplicate)
+                except OSError:
+                    pass
 
     @contextlib.contextmanager
     def _channel(self):

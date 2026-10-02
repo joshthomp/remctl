@@ -36,7 +36,7 @@ PREFIX_WAS_SET=0
 if [[ -n "${PREFIX+x}" ]]; then PREFIX_WAS_SET=1; fi
 PREFIX="${PREFIX:-$HOME}"
 APP_DIR="${REMCTL_APP_DIR:-$PREFIX/Applications}"
-LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$PREFIX/Library/LaunchAgents}"
+LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 APP_PATH="$APP_DIR/RemCTL Capability Host.app"
 HOST_EXECUTABLE="$APP_PATH/Contents/MacOS/RemCTL Capability Host"
 AGENT_LABEL="net.macstories.remctl.capability-host"
@@ -59,6 +59,18 @@ fi
 if [[ "$SKIP_LAUNCHSERVICES" == "1" && "$PREFIX" == "$HOME" ]]; then
     fail "REMCTL_SKIP_LAUNCHSERVICES is allowed only with a non-home PREFIX."
 fi
+if [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
+    if ! /usr/bin/python3 -I -S - "$PREFIX" "$LAUNCH_AGENT_DIR" "$HOME" <<'PYTHON'
+import os, pwd, sys
+prefix, agent, home = [os.path.realpath(path) for path in sys.argv[1:]]
+login_directory = os.path.realpath(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Library/LaunchAgents"))
+valid = prefix != home and agent != prefix and agent != login_directory and os.path.commonpath([prefix, agent]) == prefix
+raise SystemExit(0 if valid else 1)
+PYTHON
+    then
+        fail "Temp-prefix simulation requires a LaunchAgent directory under PREFIX after resolving symlinks; set REMCTL_LAUNCH_AGENT_DIR."
+    fi
+fi
 
 safe_config_dir() {
     [[ -n "$CONFIG_DIR" && "$CONFIG_DIR" == /* && "$CONFIG_DIR" != "/" && "$CONFIG_DIR" != "$HOME" && "$CONFIG_DIR" != "$CONFIG_BASE" ]]
@@ -68,17 +80,41 @@ if [[ "$KEEP_CONFIG" != "1" ]]; then
     safe_config_dir || fail "Refusing suspicious config path before uninstall: $CONFIG_DIR"
 fi
 
+# A packaged installation supplies its own interpreter; uninstall must work on
+# Macs without Xcode's /usr/bin/python3 shim or another Python installation.
+UNINSTALL_PYTHON=/usr/bin/python3
+if [[ -f "$APP_PATH/Contents/Resources/distribution.json" ]]; then
+    /usr/bin/codesign --verify --deep --strict "$APP_PATH" || fail "Cannot use an invalid packaged runtime."
+    packaged_python="$(cat "$APP_PATH/Contents/Resources/remctl-capability-python-path")"
+    [[ "$packaged_python" == /Library/RemCTL/Python/*/bin/python3.13 ]] || fail "Invalid packaged Python path."
+    if [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
+        packaged_python="$APP_PATH/Contents/Resources/Python/bin/python3.13"
+    fi
+    [[ -x "$packaged_python" ]] || fail "The packaged Python runtime is missing. Repair the installation before uninstalling."
+    UNINSTALL_PYTHON="$packaged_python"
+fi
+
 plist_value() {
     /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
 }
 
 agent_owned() {
     [[ -f "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || return 1
-    [[ "$(plist_value "$AGENT_PATH" Label)" == "$AGENT_LABEL" ]] || return 1
-    local arguments
-    arguments="$(plutil -extract ProgramArguments json -o - "$AGENT_PATH" 2>/dev/null || true)"
-    /usr/bin/python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]) == sys.argv[2:] else 1)' \
-        "$arguments" "$HOST_EXECUTABLE" --run-capability-host --socket "$SOCKET_PATH" >/dev/null 2>&1 || return 1
+    "$UNINSTALL_PYTHON" -B -I -S - "$AGENT_PATH" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PYTHON'
+import plistlib, sys
+path, label, host, socket = sys.argv[1:]
+try:
+    with open(path, "rb") as handle: value = plistlib.load(handle)
+except (OSError, ValueError, plistlib.InvalidFileException): raise SystemExit(1)
+valid = value == {
+    "Label": label,
+    "ProgramArguments": [host,"--run-capability-host","--socket",socket],
+    "RunAtLoad": True, "KeepAlive": True, "LimitLoadToSessionType": "Aqua",
+    "Umask": 0o77, "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
+}
+valid = valid and type(value["RunAtLoad"]) is bool and type(value["KeepAlive"]) is bool and type(value["Umask"]) is int
+raise SystemExit(0 if valid else 1)
+PYTHON
 }
 
 app_owned() {
@@ -91,6 +127,12 @@ app_owned() {
     /usr/bin/codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 || return 1
     local resources="$APP_PATH/Contents/Resources"
     local runtime="$resources/CapabilityRuntime"
+    if [[ "$(cat "$resources/remctl-capability-host-socket-path" 2>/dev/null || true)" == "portable-user" ]]; then
+        for required in "$resources/distribution.json" "$resources/python-manifest.json" "$runtime/bin/remctl-bridge" "$runtime/bin/remctl-private"; do
+            [[ -f "$required" && ! -L "$required" ]] || return 1
+        done
+        return 0
+    fi
     for required in \
         "$resources/remctl-capability-python-path" \
         "$resources/remctl-capability-host-socket-path" \
@@ -108,10 +150,10 @@ app_owned() {
 
 bin_owned() {
     local bin_dir="$1"
-    /usr/bin/python3 -I -S - "$bin_dir" <<'PY'
+    "$UNINSTALL_PYTHON" -B -I -S - "$bin_dir" <<'PY'
 import hashlib,json,os,stat,sys
 root=sys.argv[1]; manifest=os.path.join(root,".remctl-install-manifest.json")
-managed={"remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py","remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png",".remctl-capability-host-app",".remctl-capability-host-signing-identity","completions/_remctl","completions/_rctl","completions/_reminders","rctl","reminders"}
+managed={"remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py","remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_accounts.py","remctl_workspace.html","remctl-list-symbols.json","remctl-list-artwork","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png",".remctl-capability-host-app",".remctl-capability-host-signing-identity","completions/_remctl","completions/_rctl","completions/_reminders","rctl","reminders"}
 def present(): return {n for n in managed if os.path.lexists(os.path.join(root,n))}
 def match(name,item):
  p=os.path.join(root,name)
@@ -157,7 +199,7 @@ stop_job() {
 }
 
 socket_owned() {
-    /usr/bin/python3 -I -S - "$SOCKET_PATH" <<'PY'
+    "$UNINSTALL_PYTHON" -B -I -S - "$SOCKET_PATH" <<'PY'
 import os, stat, sys
 path=sys.argv[1]; parent=os.path.dirname(path)
 metadata=os.lstat(path); parent_metadata=os.lstat(parent)
@@ -170,7 +212,7 @@ PY
 }
 
 safe_remove_socket() {
-    /usr/bin/python3 -I -S - "$SOCKET_PATH" <<'PY'
+    "$UNINSTALL_PYTHON" -B -I -S - "$SOCKET_PATH" <<'PY'
 import errno, os, socket, stat, sys
 path=sys.argv[1]; parent=os.path.dirname(path); name=os.path.basename(path)
 directory=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -196,19 +238,35 @@ PY
 
 FILES=(
     remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_workspace.html remctl-list-symbols.json remctl-list-artwork remctl_mcp_widget.html
+    remctl-mcp-icon.png remctl-mcp-icon-512.png
     remctl-bridge remctl-private remctl-permissions remctl-permissions-icon.png
     .remctl-capability-host-app .remctl-capability-host-signing-identity
     .remctl-install-manifest.json
     completions/_remctl completions/_rctl completions/_reminders rctl reminders
 )
 
+# Keep the destination path for recovery checks even when removing a legacy agent.
+ORIGINAL_AGENT_PATH="$AGENT_PATH"
+
+# Recognize an unmigrated prefix-based agent only through the signed app marker.
+LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
+if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$AGENT_PATH" != "$LEGACY_AGENT_PATH" &&
+      "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
+    [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; nothing was removed."
+    AGENT_PATH="$LEGACY_AGENT_PATH"
+    app_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+    if [[ -e "$AGENT_PATH" || -L "$AGENT_PATH" ]]; then
+        agent_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+    fi
+fi
+
 # An interrupted install owns the recovery decision. Never delete either side.
 check_backup() {
     [[ ! -e "$1.remctl-transaction-backup" && ! -L "$1.remctl-transaction-backup" ]] || \
         fail "Unresolved installer backup found: $1.remctl-transaction-backup. Re-run install.sh only after recovering that exact transaction."
 }
-check_backup "$APP_PATH"; check_backup "$AGENT_PATH"
+check_backup "$APP_PATH"; check_backup "$AGENT_PATH"; check_backup "$ORIGINAL_AGENT_PATH"; check_backup "$LEGACY_AGENT_PATH"
 for bin_dir in "${BIN_DIRS[@]}"; do
     for name in "${FILES[@]}"; do check_backup "$bin_dir/$name"; done
 done
@@ -311,7 +369,7 @@ for bin_dir in "${BIN_DIRS[@]}"; do
         case "$name" in rctl|reminders|.remctl-install-manifest.json) continue ;; esac
         remove_file "$bin_dir/$name"
     done
-    for module in remctl_runtime remctl_images remctl_serialization remctl_smart_lists remctl_broker remctl_capability_policy remctl_capabilities; do
+    for module in remctl_runtime remctl_images remctl_serialization remctl_smart_lists remctl_broker remctl_capability_policy remctl_capabilities remctl_mcp remctl_workspace remctl_plugin remctl_accounts; do
         for cache_path in "$bin_dir/__pycache__/${module}.cpython-"*.pyc; do
             [[ -e "$cache_path" || -L "$cache_path" ]] && remove_file "$cache_path"
         done

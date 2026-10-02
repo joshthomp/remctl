@@ -82,7 +82,7 @@ SIGNAL_CONTROL_GRACE_SECONDS = 2.0
 CLIENT_SIGNAL_WAIT_SECONDS = 5.0
 MAX_CLIENT_WORKERS = 16
 MAX_ANCILLARY_FDS = 256
-PRIVATE_PROTOCOL_VERSION = 2
+SUPPORTED_PRIVATE_PROTOCOL_VERSIONS = (2, 3)
 NATIVE_PROTOCOL_VERSION = 1
 NATIVE_PERMISSION_FD = 199
 MAX_NATIVE_REQUEST_BYTES = 4096
@@ -242,7 +242,51 @@ def socket_path() -> Path:
     installed = _installed_path_marker(
         app_path() / "Contents/Resources/remctl-capability-host-socket-path"
     )
-    return installed or Path.home() / "Library/Application Support/RemCTL/capability-host.sock"
+    return (
+        installed
+        or _launch_agent_socket()
+        or Path.home() / "Library/Application Support/RemCTL/capability-host.sock"
+    )
+
+
+def _launch_agent_socket() -> Path | None:
+    """Socket the installer handed the host in its LaunchAgent.
+
+    A downloaded or source-built app is sealed without a socket path, and the
+    installer places the socket under PREFIX, so the LaunchAgent is the only
+    record of it for a custom PREFIX.
+    """
+    path = launch_agent_path()
+    try:
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) & 0o022
+            or details.st_size > 65536
+        ):
+            return None
+        with path.open("rb") as handle:
+            value = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    arguments = value.get("ProgramArguments") if isinstance(value, dict) else None
+    if (
+        not isinstance(arguments, list)
+        or len(arguments) != 4
+        or arguments[1:3] != ["--run-capability-host", "--socket"]
+        or not isinstance(arguments[3], str)
+        or "\x00" in arguments[3]
+    ):
+        return None
+    socket = Path(arguments[3])
+    if (
+        not socket.is_absolute()
+        or socket != socket.resolve(strict=False)
+        or socket.name != "capability-host.sock"
+    ):
+        return None
+    return socket
 
 
 def launch_agent_path() -> Path:
@@ -256,16 +300,8 @@ def launch_agent_path() -> Path:
     )
     if installed_agent is not None:
         return installed_agent
-    installed_app = _installed_path_marker(
-        CLIENT_ROOT / ".remctl-capability-host-app",
-        expected_name=APP_NAME,
-    )
-    if installed_app is not None and installed_app.parent.name == "Applications":
-        return (
-            installed_app.parent.parent
-            / "Library/LaunchAgents"
-            / f"{LAUNCH_AGENT_LABEL}.plist"
-        )
+    # The installer keeps the LaunchAgent in the login folder whatever PREFIX is,
+    # because launchd loads nothing else at login.
     return Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 
 
@@ -333,10 +369,7 @@ def _socket_metadata(path: Path) -> dict[str, Any]:
 
 
 def should_route(parsed_args: Any) -> bool:
-    try:
-        hosted = command_scope(getattr(parsed_args, "cmd", None)) == "hosted"
-    except CapabilityPolicyError:
-        raise
+    hosted = command_scope(getattr(parsed_args, "cmd", None)) == "hosted"
     if not hosted:
         return False
     requested = mode()
@@ -375,7 +408,7 @@ def _send_frame(
     if sent <= 0:
         raise OSError("failed to send capability request")
     if sent < len(framed):
-        connection.sendall(framed[sent:])
+        connection.sendall(memoryview(framed)[sent:])
 
 
 def _recv_exact(
@@ -721,17 +754,18 @@ def dispatch(
     forwarded_signals: list[int] = []
     try:
         with capabilities:
+            metadata = capabilities.metadata
             has_prompt_capability = any(
                 isinstance(item, dict)
                 and item.get("kind") == "tty"
                 and item.get("purpose") in {"stdin", "stderr"}
-                for item in capabilities.metadata
+                for item in metadata
             )
             request = {
                 "protocolVersion": PROTOCOL_VERSION,
                 "operation": "run",
                 "argv": capabilities.argv,
-                "capabilities": capabilities.metadata,
+                "capabilities": metadata,
                 "stdinBase64": capabilities.stdin_base64,
                 "mergeOutput": bool(
                     not has_prompt_capability and _output_streams_share_sink()
@@ -861,6 +895,25 @@ def _handle_run_response(response: dict[str, Any]) -> int:
 def _launch_agent_status() -> dict[str, Any]:
     path = launch_agent_path()
     installed = path.is_file()
+    contract_valid = False
+    if installed and not path.is_symlink():
+        try:
+            with path.open("rb") as handle:
+                value = plistlib.load(handle)
+            contract_valid = value == {
+                "Label": LAUNCH_AGENT_LABEL,
+                "ProgramArguments": [str(executable_path()), "--run-capability-host", "--socket", str(socket_path())],
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "LimitLoadToSessionType": "Aqua",
+                "Umask": 0o77,
+                "StandardOutPath": "/dev/null",
+                "StandardErrorPath": "/dev/null",
+            }
+            contract_valid = (contract_valid and type(value["RunAtLoad"]) is bool
+                              and type(value["KeepAlive"]) is bool and type(value["Umask"]) is int)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            pass
     loaded = False
     if installed:
         try:
@@ -874,7 +927,7 @@ def _launch_agent_status() -> dict[str, Any]:
             loaded = process.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
-    return {"path": str(path), "installed": installed, "loaded": loaded}
+    return {"path": str(path), "installed": installed, "loaded": loaded, "contractValid": contract_valid}
 
 
 def _app_status() -> dict[str, Any]:
@@ -906,6 +959,18 @@ def _empty_signature_status() -> dict[str, Any]:
         "designatedRequirement": None,
         "error": "Capability Host is not installed",
     }
+
+
+def has_stable_signing_identity(signature: dict[str, Any]) -> bool:
+    """Accept Apple team identity or an exact certificate-pinned local identity."""
+    team = signature.get("teamID")
+    if isinstance(team, str) and team and team != "not set":
+        return True
+    requirement = signature.get("designatedRequirement")
+    return isinstance(requirement, str) and re.fullmatch(
+        rf'identifier "{re.escape(BUNDLE_IDENTIFIER)}" and certificate leaf = H"[0-9a-fA-F]{{40}}"',
+        requirement,
+    ) is not None
 
 
 def _signature_status(app: Path) -> dict[str, Any]:
@@ -1838,10 +1903,16 @@ def _native_permission_socket() -> socket.socket:
             "native permission channel descriptor is not a socket",
             code="permission_channel_invalid",
         )
+    duplicate: int | None = None
     try:
         duplicate = os.dup(NATIVE_PERMISSION_FD)
         os.set_inheritable(duplicate, False)
     except OSError as exc:
+        if duplicate is not None:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
         raise _ServerError(
             "native permission channel could not be opened",
             code="permission_channel_unavailable",
@@ -2473,16 +2544,18 @@ def _permission_status_snapshot(runtime: HostedRuntime) -> dict[str, Any]:
     now = time.monotonic()
     with _PERMISSION_STATUS_LOCK:
         cached = _PERMISSION_STATUS_CACHE.get(key)
-        if cached is not None and now - cached[0] <= PERMISSION_STATUS_TTL_SECONDS:
-            return _with_effective_full_disk_access(cached[1])
+        snapshot = dict(cached[1]) if cached is not None else None
+    if cached is not None and now - cached[0] <= PERMISSION_STATUS_TTL_SECONDS:
+        return _with_effective_full_disk_access(snapshot)
     completed = _schedule_permission_status_refresh(runtime)
-    if cached is not None:
-        return _with_effective_full_disk_access(cached[1])
+    if snapshot is not None:
+        return _with_effective_full_disk_access(snapshot)
     completed.wait(timeout=PERMISSION_STATUS_INITIAL_WAIT_SECONDS)
     with _PERMISSION_STATUS_LOCK:
         refreshed = _PERMISSION_STATUS_CACHE.get(key)
-        if refreshed is not None:
-            return _with_effective_full_disk_access(refreshed[1])
+        snapshot = dict(refreshed[1]) if refreshed is not None else None
+    if snapshot is not None:
+        return _with_effective_full_disk_access(snapshot)
     return _unknown_permission_status()
 
 
@@ -2500,7 +2573,7 @@ def _private_protocol(runtime: HostedRuntime) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         return {"compatible": False, "version": None, "error": str(exc)}
     version = payload.get("protocolVersion") if isinstance(payload, dict) else None
-    return {"compatible": version == PRIVATE_PROTOCOL_VERSION, "version": version}
+    return {"compatible": version in SUPPORTED_PRIVATE_PROTOCOL_VERSIONS, "version": version}
 
 
 def _server_status(runtime: HostedRuntime) -> dict[str, Any]:

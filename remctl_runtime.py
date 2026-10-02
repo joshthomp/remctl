@@ -6,6 +6,7 @@ import ipaddress
 import os
 import shutil
 import socket
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ LOCAL_COMMANDS = frozenset(
         "completion",
         "doctor",
         "list-symbols",
+        "mcp",
         "onboard",
         "permissions",
         "setup",
@@ -32,6 +34,8 @@ HOSTED_COMMANDS = frozenset(
     {
         "add",
         "delete",
+        "deleted",
+        "restore",
         "done",
         "edit",
         "export",
@@ -48,10 +52,12 @@ HOSTED_COMMANDS = frozenset(
         "list-create",
         "list-delete",
         "list-edit",
+        "list-info",
         "list-pin",
         "list-rename",
         "list-unpin",
         "lists",
+        "location-lookup",
         "open",
         "overdue",
         "reminder-move",
@@ -79,8 +85,36 @@ HOSTED_COMMANDS = frozenset(
         "unflag",
         "upcoming",
         "urgent",
+        "workspace",
     }
 )
+_CORE_COMMANDS = LOCAL_COMMANDS | HOSTED_COMMANDS
+# Commands an optional extension (such as remctl_accounts) adds to the parser.
+EXTENSION_COMMANDS: frozenset[str] = frozenset()
+
+
+def register_extension_commands(*, local=(), hosted=()) -> None:
+    """Classify commands an optional extension adds to the CLI parser.
+
+    The Capability Host requires every parser command to be classified exactly
+    once, so an extension that adds commands must declare them here. Core
+    commands can never be reclassified, and repeating the same registration
+    is a no-op.
+    """
+
+    global LOCAL_COMMANDS, HOSTED_COMMANDS, EXTENSION_COMMANDS
+    local, hosted = frozenset(local), frozenset(hosted)
+    if local & hosted:
+        raise ValueError(f"extension commands classified twice: {sorted(local & hosted)!r}")
+    if (local | hosted) & _CORE_COMMANDS:
+        raise ValueError(
+            f"extensions cannot reclassify core commands: {sorted((local | hosted) & _CORE_COMMANDS)!r}"
+        )
+    if (local & HOSTED_COMMANDS) or (hosted & LOCAL_COMMANDS):
+        raise ValueError("extension command classification conflicts with an earlier registration")
+    LOCAL_COMMANDS = LOCAL_COMMANDS | local
+    HOSTED_COMMANDS = HOSTED_COMMANDS | hosted
+    EXTENSION_COMMANDS = EXTENSION_COMMANDS | local | hosted
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -153,19 +187,19 @@ def ensure_private_dir(path: Path) -> None:
 
 
 def write_private_text_file(path: Path, text: str) -> None:
+    """Publish complete private state without exposing a truncated token/config."""
     ensure_private_dir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
+    if path.is_symlink():
+        raise OSError(f"Refusing to overwrite a symbolic link: {path}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
     finally:
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        Path(temporary).unlink(missing_ok=True)
 
 
 def resolve_binary_path(script_path: str, binary_name: str, env_var: str) -> Path:
@@ -223,21 +257,41 @@ def is_safe_remote_url(url: str) -> bool:
     if parsed.username or parsed.password:
         return False
 
-    hostname = parsed.hostname
-    if not hostname or hostname.endswith(".local"):
+    try:
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
         return False
-
+    if not hostname or hostname.rstrip(".").endswith((".local", ".localhost")) or hostname.rstrip(".") == "localhost":
+        return False
+    # TUN proxies use this range for DNS placeholders. Never allow it as an
+    # explicit IP target, including legacy IPv4 spellings such as 0xc6120001.
+    literal = False
+    literal_host = hostname.rstrip(".")
+    try:
+        ipaddress.ip_address(literal_host)
+        literal = True
+    except ValueError:
+        try:
+            socket.inet_aton(literal_host)
+            literal = True
+        except OSError:
+            pass
     try:
         addrinfo = socket.getaddrinfo(
             hostname,
-            parsed.port or (443 if parsed.scheme == "https" else 80),
+            port,
             type=socket.SOCK_STREAM,
         )
     except socket.gaierror:
         return False
 
+    if not addrinfo:
+        return False
     for _, _, _, _, sockaddr in addrinfo:
         ip = ipaddress.ip_address(sockaddr[0])
+        if not literal and ip.version == 4 and ip in ipaddress.ip_network("198.18.0.0/15"):
+            continue
         if (
             ip.is_private
             or ip.is_loopback

@@ -1,0 +1,13 @@
+{
+  "name": "remctl",
+  "description": "RemCTL for Claude Code",
+  "owner": { "name": "Federico Viticci", "url": "https://macstories.net" },
+  "plugins": [
+    {
+      "name": "remctl",
+      "source": "./plugins/claude-code",
+      "description": "Apple Reminders in Claude Code: RemCTL's tools, plus today's tasks above the prompt in your lists' colors.",
+      "category": "productivity"
+    }
+  ]
+}

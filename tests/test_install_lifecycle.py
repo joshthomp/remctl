@@ -140,8 +140,10 @@ class InstallerLifecycleTests(unittest.TestCase):
         install_source = INSTALL.read_text()
         uninstall_source = UNINSTALL.read_text()
 
-        self.assertIn("command-line client supports Python 3.10+", install_help)
-        self.assertIn("signed host requires", install_help)
+        self.assertIn("default downloads the notarized release", install_help)
+        self.assertIn("no Apple account or paid membership", install_help)
+        self.assertIn("Both include Python", install_help)
+        self.assertIn("guided setup in an interactive terminal", install_help)
         self.assertIn("after an authorized upgrade/reinstall", install_help)
         self.assertIn("Reminders, and Automation", uninstall_help)
         self.assertIn("First capability-host install: run", install_source)
@@ -156,6 +158,133 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertIn("remctl permissions full-disk-access", install_source)
         self.assertIn("Resolve the reported checks", install_source)
         self.assertIn("Full Disk Access, Reminders, and Automation grants were not reset", uninstall_source)
+
+    def test_custom_prefix_agent_migrates_and_rolls_back(self) -> None:
+        self.run_script(INSTALL, "--shell-completions", "none")
+        legacy = self.agent
+        original = legacy.read_bytes()
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        destination = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        destination.parent.mkdir(parents=True)
+        new_backup = Path(str(destination) + ".remctl-transaction-backup")
+        new_backup.write_bytes(original)
+        blocked = self.run_script(UNINSTALL, "--keep-config", environment=environment, check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Unresolved installer backup", blocked.stdout)
+        self.assertTrue(self.app.exists())
+        self.assertEqual(legacy.read_bytes(), original)
+        new_backup.unlink()
+        self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
+
+        # Matching label/arguments alone must not authorize a different program.
+        modified = plistlib.loads(original)
+        modified["Program"] = "/bin/sh"
+        modified_bytes = plistlib.dumps(modified)
+        legacy.write_bytes(modified_bytes)
+        for script in (INSTALL, UNINSTALL):
+            refused = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(legacy.read_bytes(), modified_bytes)
+            self.assertTrue(self.app.exists())
+        legacy.write_bytes(original)
+
+        # An unrelated file at the old path must never be adopted or removed.
+        legacy.write_text("foreign plist")
+        refused = self.run_script(INSTALL, "--shell-completions", "none", environment=environment, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Refusing to migrate", refused.stdout)
+        self.assertEqual(legacy.read_text(), "foreign plist")
+        legacy.write_bytes(original)
+
+        failed_env = dict(environment, REMCTL_TEST_PUBLISH_FAIL_AT="3")
+        failed = self.run_script(INSTALL, "--shell-completions", "none", environment=failed_env, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertFalse(destination.exists())
+        self.assert_installed_contract()
+        self.assert_no_backups()
+
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.assertFalse(legacy.exists())
+        self.agent = destination
+        self.assert_installed_contract()
+        self.assert_no_backups()
+        # A committed migration can still leave an old-plist backup if cleanup stops.
+        old_backup = Path(str(legacy) + ".remctl-transaction-backup")
+        old_backup.write_bytes(original)
+        for script in (INSTALL, UNINSTALL):
+            blocked = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("backup", blocked.stdout)
+            self.assertTrue(self.app.exists())
+            self.assertTrue(destination.exists())
+            self.assertTrue(old_backup.exists())
+        old_backup.unlink()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(destination.exists())
+        self.assertFalse(self.app.exists())
+
+    def test_simulation_cannot_use_real_home_launchagents_by_default(self) -> None:
+        environment = self.environment.copy()
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        for script in (INSTALL, UNINSTALL):
+            result = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires a LaunchAgent directory under PREFIX", result.stdout)
+        self.assertFalse(self.app.exists())
+
+    def test_simulation_rejects_dotdot_and_symlink_agent_escapes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rctl-outside-", dir="/private/tmp") as tmp:
+            outside = Path(tmp)
+            link = self.prefix / "agent-link"
+            link.symlink_to(outside, target_is_directory=True)
+            paths = (self.prefix / ".." / outside.name / "LaunchAgents", link / "LaunchAgents")
+            for path in paths:
+                environment = dict(self.environment, REMCTL_LAUNCH_AGENT_DIR=str(path))
+                for script in (INSTALL, UNINSTALL):
+                    result = self.run_script(script, environment=environment, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("after resolving symlinks", result.stdout)
+                self.assertFalse((outside / "LaunchAgents").exists())
+            # A non-home spelling must not bypass the non-home prefix rule either.
+            environment = dict(self.environment, PREFIX=str(link), HOME=str(outside),
+                               REMCTL_LAUNCH_AGENT_DIR=str(link / "LaunchAgents"))
+            result = self.run_script(INSTALL, environment=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("after resolving symlinks", result.stdout)
+            self.assertFalse(self.app.exists())
+
+    def test_custom_prefix_reinstall_repairs_missing_legacy_agent(self) -> None:
+        self.run_script(INSTALL, "--shell-completions", "none")
+        backup = Path(str(self.agent) + ".remctl-transaction-backup")
+        self.agent.rename(backup)
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        blocked = self.run_script(INSTALL, "--shell-completions", "none", environment=environment, check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Stale transaction backup", blocked.stdout)
+        self.assertTrue(backup.exists())
+        backup.unlink()
+        self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.agent = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        self.assert_installed_contract()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(self.agent.exists())
+
+    def test_custom_prefix_new_install_uses_home_launchagents(self) -> None:
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.assertFalse(self.agent.exists())
+        self.agent = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        self.assert_installed_contract()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(self.agent.exists())
 
     def test_bootstrap_rejects_doctor_before_install_work(self) -> None:
         result = self.run_script(INSTALL, "--bootstrap", "--doctor", check=False)
@@ -422,7 +551,8 @@ class InstallerLifecycleTests(unittest.TestCase):
             INSTALL, "--dry-run", "--shell-completions", "none", check=False
         )
         self.assertNotEqual(reinstall.returncode, 0)
-        self.assertIn("foreign, modified, or unmanifested files", reinstall.stdout)
+        self.assertIn("Nothing was changed", reinstall.stdout)
+        self.assertIn("changed since it installed them", reinstall.stdout)
         self.assertIn("Ownership mismatch: remctl_runtime.py", reinstall.stdout)
         self.assertEqual(foreign.read_text(), "# foreign replacement\n")
 
@@ -451,11 +581,89 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertEqual(adopted.returncode, 0)
         self.assert_installed_contract()
 
+    def make_legacy_171_install(self) -> None:
+        """Turn a fresh install into the exact file set RemCTL 1.7.1 left in bin."""
+        scripts = ("remctl", "remctl_runtime.py", "remctl_images.py", "remctl_serialization.py", "remctl_smart_lists.py")
+        try:
+            sources = {name: subprocess.run(["git", "show", f"v1.7.1:{name}"], cwd=ROOT, check=True,
+                                            capture_output=True).stdout for name in scripts}
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("the v1.7.1 tag is not available")
+        self.run_script(INSTALL, "--shell-completions", "none")
+        shutil.rmtree(self.app)
+        self.agent.unlink()
+        kept = set(scripts) | {"remctl-bridge", "remctl-private", "remctl-permissions", "remctl-permissions-icon.png"}
+        for path in sorted(self.bin.iterdir()):
+            if path.name not in kept:
+                shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+        for name, data in sources.items():
+            (self.bin / name).write_bytes(data)
+        (self.bin / "remctl").chmod(0o755)
+        completion = subprocess.run([sys.executable, str(self.bin / "remctl"), "completion", "zsh"],
+                                    check=True, capture_output=True).stdout
+        (self.bin / "completions").mkdir()
+        for alias in ("remctl", "rctl", "reminders"):
+            (self.bin / "completions" / f"_{alias}").write_bytes(completion)
+            if alias != "remctl":
+                (self.bin / alias).symlink_to("remctl")
+
+    def run_in_terminal(self, *arguments: str, answer: str, prompt: bytes) -> tuple[int, str]:
+        """Run the installer on a pseudo-terminal and answer its first prompt."""
+        import pty, select
+        master, slave = pty.openpty()
+        process = subprocess.Popen([str(INSTALL), *arguments], cwd=ROOT, env=self.environment,
+                                   stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        output, answered = b"", False
+        while True:
+            ready, _, _ = select.select([master], [], [], 120)
+            if not ready:
+                process.kill()
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not answered and prompt in output:
+                os.write(master, answer.encode() + b"\n")
+                answered = True
+        os.close(master)
+        return process.wait(timeout=120), output.decode(errors="replace")
+
+    def test_exact_171_install_upgrades_after_a_yes_in_terminal(self) -> None:
+        self.make_legacy_171_install()
+        before = sha256(self.bin / "remctl")
+
+        refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("RemCTL 1.7.1 is installed", refused.stdout)
+        self.assertIn("Nothing was changed", refused.stdout)
+        self.assertEqual(sha256(self.bin / "remctl"), before)
+
+        status, output = self.run_in_terminal("--shell-completions", "none", answer="y", prompt=b"Upgrade it?")
+        self.assertEqual(status, 0, output)
+        self.assert_installed_contract()
+
+    def test_unverifiable_old_install_is_left_alone_without_a_terminal(self) -> None:
+        self.make_legacy_171_install()
+        (self.bin / "remctl_images.py").write_text("# edited by hand\n")
+
+        refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("can't verify its files", refused.stdout)
+        self.assertIn("Nothing was changed", refused.stdout)
+        self.assertEqual((self.bin / "remctl_images.py").read_text(), "# edited by hand\n")
+
     def test_failed_rollback_preserves_recovery_evidence(self) -> None:
         self.run_script(INSTALL, "--shell-completions", "none")
         injected = self.environment.copy()
         injected["REMCTL_TEST_PUBLISH_FAIL_AT"] = "5"
-        injected["REMCTL_TEST_ROLLBACK_FAIL_AT"] = "18"
+        # -4 = the fourth published pair (remctl_runtime.py) counted from the oldest
+        # journal entry, so the injected failure always hits a file that has a backup.
+        injected["REMCTL_TEST_ROLLBACK_FAIL_AT"] = "-4"
         result = self.run_script(
             INSTALL,
             "--shell-completions",

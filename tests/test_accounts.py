@@ -743,5 +743,115 @@ class AccountTypeMergeTests(AccountsTestBase):
         self.assertEqual(self.mod._merge_account_type("Exchange", None), "Exchange")
 
 
+class CapabilityHostIntegrationTests(AccountsTestBase):
+    """The extension must fit upstream's closed Capability Host contracts."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_host_env = {
+            key: os.environ.pop(key, None)
+            for key in ("REMCTL_CAPABILITY_HOST", "REMCTL_CAPABILITY_HOST_ACTIVE", "NO_COLOR")
+        }
+        self.parser, self.sub = self.core.build_parser()
+
+    def tearDown(self):
+        for key, value in self._saved_host_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        super().tearDown()
+
+    def test_extension_commands_are_classified_for_the_host(self):
+        import remctl_capability_policy
+        import remctl_runtime
+
+        self.assertEqual(remctl_runtime.capability_host_command_scope("accounts"), "hosted")
+        self.assertEqual(remctl_runtime.capability_host_command_scope("config"), "local")
+        # Raises if any parser command is unclassified or stale.
+        remctl_capability_policy.validate_command_scope(self.parser)
+
+    def test_extensions_cannot_reclassify_core_commands(self):
+        import remctl_runtime
+
+        with self.assertRaises(ValueError):
+            remctl_runtime.register_extension_commands(local={"today"})
+        with self.assertRaises(ValueError):
+            remctl_runtime.register_extension_commands(hosted={"config"})
+
+    def test_building_the_parser_twice_does_not_stack_wrappers(self):
+        route = self.core._should_route_capability_host
+        scanner = self.core.first_command_token
+        self.core.build_parser()
+        self.assertIs(self.core._should_route_capability_host, route)
+        self.assertIs(self.core.first_command_token, scanner)
+
+    def test_mcp_run_guard_skips_the_account_value(self):
+        import remctl_mcp
+
+        self.assertEqual(remctl_mcp._run_command_name(["--account", "Work", "setup"]), "setup")
+        self.assertEqual(remctl_mcp._run_command_name(["--all-accounts", "today"]), "today")
+        self.assertIn("config", remctl_mcp.RUN_FORBIDDEN_COMMANDS)
+
+    def _parse(self, *argv):
+        return self.core.parse_cli_args(self.parser, self.sub, list(argv))
+
+    def test_custom_store_settings_route_direct(self):
+        args = self._parse("today")
+        with mock.patch.object(self.core.remctl_broker, "should_route", return_value=True):
+            self.assertTrue(self.core._should_route_capability_host(args))
+            os.environ["REMCTL_DB"] = "/tmp/pinned.sqlite"
+            self.assertFalse(self.core._should_route_capability_host(args))
+            os.environ.pop("REMCTL_DB")
+            self.mod.save_config({"dbPath": "/tmp/pinned.sqlite"})
+            self.assertFalse(self.core._should_route_capability_host(args))
+
+    def test_custom_store_conflicts_with_force_mode(self):
+        args = self._parse("today")
+        os.environ["REMCTL_CAPABILITY_HOST"] = "force"
+        self.mod.save_config({"storeDir": "/tmp/stores"})
+        with mock.patch.object(self.core.remctl_broker, "should_route", return_value=True), \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as raised:
+            self.core._should_route_capability_host(args)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("config storeDir", err.getvalue())
+
+    def test_custom_stores_are_ignored_inside_the_host(self):
+        self.mod.save_config({"dbPath": "/tmp/pinned.sqlite", "storeDir": "/tmp/stores"})
+        os.environ["REMCTL_DB"] = "/tmp/other.sqlite"
+        os.environ["REMCTL_CAPABILITY_HOST_ACTIVE"] = "1"
+        self.assertIsNone(self.mod.db_override())
+        self.assertEqual(self.mod.store_dir(), self.core.STORE_DIR)
+
+    def test_env_scope_is_forwarded_to_the_host(self):
+        os.environ["REMCTL_ACCOUNT_SCOPE"] = "all"
+        args = self._parse("today")
+        self.assertEqual(
+            self.core._normalized_host_argv(["today"], args)[:1], ["--all-accounts"]
+        )
+        os.environ["REMCTL_ACCOUNT_SCOPE"] = "Exchange"
+        self.assertEqual(
+            self.core._normalized_host_argv(["today"], args)[:2], ["--account", "Exchange"]
+        )
+
+    def test_explicit_scope_flags_win_over_env_scope(self):
+        os.environ["REMCTL_ACCOUNT_SCOPE"] = "all"
+        argv = ["today", "--account", "Work"]
+        args = self._parse(*argv)
+        self.assertEqual(self.core._normalized_host_argv(argv, args), argv)
+
+    def test_env_scope_is_not_forwarded_to_unsupported_commands(self):
+        os.environ["REMCTL_ACCOUNT_SCOPE"] = "Exchange"
+        args = self._parse("doctor")
+        self.assertEqual(self.core._normalized_host_argv(["doctor"], args), ["doctor"])
+
+    def test_no_command_host_argv_keeps_scope_flags(self):
+        args = self._parse("--account", "Work")
+        argv = self.core._no_command_host_argv(args)
+        self.assertEqual(argv[:2], ["--account", "Work"])
+        self.assertEqual(self._parse(*argv).cmd, "today")
+
+
 if __name__ == "__main__":
     unittest.main()

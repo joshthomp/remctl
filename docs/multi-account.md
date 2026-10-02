@@ -5,14 +5,17 @@ store and writes through iCloud. Reminders keeps a **separate SQLite store per
 connected account**, so Exchange, Google, other CalDAV, and Local accounts are
 invisible to the core tool.
 
-`remctl_accounts.py` adds support for those accounts as a **drop-in optional
-module**. It is not required, not imported by default behavior, and deleting
-the file returns RemCTL to stock.
+`remctl_accounts.py` adds support for those accounts as an **optional
+module**. Core imports it inside `try/except ImportError`, and nothing it adds
+is active until the user opts in. At runtime, removing the file returns RemCTL
+to stock. The installer and the sealed host archive use a fixed file list, so
+removing it from a checkout before `install.sh` also means dropping it from
+`install.sh`, `uninstall.sh`, and `scripts/build_capability_archive.py`.
 
 ## Integration contract
 
-The entire footprint in core `remctl` is **23 added lines, 0 modified or
-deleted lines**, in four hunks:
+The footprint in core `remctl` is **23 added lines, 0 modified or deleted
+lines**, in four hunks:
 
 | Hook | Purpose |
 |------|---------|
@@ -22,7 +25,36 @@ deleted lines**, in four hunks:
 | `remctl_accounts.install(cmds, a, sub)` | Wraps the command dispatch table |
 
 Every hook is guarded by `if remctl_accounts:`. With the module absent, core
-runs exactly as upstream — verified by the full upstream test suite.
+runs exactly as upstream; upstream's runtime suite passes without it.
+
+### Capability Host integration
+
+The signed Capability Host keeps closed lists of commands and options, so the
+extension also needs three small hooks outside `remctl`:
+
+| File | Change | Why |
+|------|--------|-----|
+| `remctl_runtime.py` | `register_extension_commands(local=, hosted=)` (+27 lines) | The host refuses any parser command that is not classified. `accounts` is hosted (it reads the stores); `config` is local (it only edits `config.json`, like `setup`). Core commands can never be reclassified. |
+| `remctl_capability_policy.py` | Reads the command sets at call time (6 lines) | It previously copied them at import, before an extension could register. |
+| `remctl_mcp.py` | Optional import of the extension's `RUN_GLOBAL_OPTIONS` and `RUN_FORBIDDEN_COMMANDS` (+9 lines) | The MCP `run` guard must know `--account` takes a value; otherwise `--account X setup` reads `X` as the command and slips past the forbidden-command check. `config` is forbidden over MCP like `setup`. |
+
+`install.sh`, `uninstall.sh`, and `scripts/build_capability_archive.py` list
+`remctl_accounts.py` alongside the other `remctl_*.py` modules, so it ships in
+the sealed host archive (the archive builder rejects unlisted modules).
+
+`register_cli()` also wraps three client-side routing helpers in `remctl`:
+
+- **Custom stores run only in direct mode.** `REMCTL_DB`, config `dbPath`, and
+  config `storeDir` route the command directly, exactly like core's
+  `REMCTL_STORE_DIR`; `REMCTL_CAPABILITY_HOST=force` with any of them is an
+  error. Inside the host they are never honored, so the host only ever reads
+  its pinned Reminders store.
+- **Env scope reaches the host.** The host runs commands in a sanitized
+  environment, so `REMCTL_ACCOUNT_SCOPE` is forwarded as `--account NAME` or
+  `--all-accounts` when the command supports it. Explicit flags win.
+  `accountScope` in `config.json` is read by the host directly.
+- **No-command splash.** `remctl --account Work` keeps its scope when the host
+  runs the implied `today`.
 
 ## Why wrapping instead of editing commands
 
@@ -127,11 +159,12 @@ verbatim inside it).
 
 The bridge must be recompiled via `install.sh`.
 
-## The one change to upstream's test suite
+## Changes to upstream's test suite
 
-`tests/test_cli.py` is upstream's file with a **single line** changed:
+Two upstream assertions change, each by one line:
 
 ```diff
+# tests/test_cli.py
 -        self.assertIn("  add,", output)
 +        self.assertIn("add,", output)
 ```
@@ -140,28 +173,36 @@ That assertion probes the wrapped "Available commands:" columns by checking the
 first line begins with two spaces then `add,`. The command list is alphabetical,
 and `accounts` sorts before `add`, so the line becomes `"  accounts, add, …"`.
 `add` is still listed and the error message is still correct — only the leading
-whitespace moved. Dropping the two spaces keeps what the test is really checking
-and makes it robust against any future command that sorts before `add`.
+whitespace moved.
 
-Nothing else in the file is touched, so the rest of the suite remains upstream's
-own verification of core behavior.
+```diff
+# tests/test_runtime.py
+-        self.assertEqual(remctl_runtime.LOCAL_COMMANDS, expected_local)
++        self.assertEqual(
++            remctl_runtime.LOCAL_COMMANDS - remctl_runtime.EXTENSION_COMMANDS, expected_local
++        )
+```
 
-The suite is green in both configurations:
+The exact set of core local commands is still asserted; `config` is excluded
+because the extension registers it when the suite has loaded `remctl`.
 
-| Configuration | Result |
-|---|---|
-| Extension present | 431 passed |
-| Extension deleted | 350 passed (stock upstream) |
+Nothing else in upstream's tests is touched. Upstream's own partition test
+(every parser command classified exactly once) and the MCP run-guard test
+(every top-level option known) pass unchanged with the extension loaded.
 
-Determinism note: `tests/conftest.py` pins each test run to an empty config
+Determinism note: `tests/conftest.py` pins pytest runs to an empty config
 directory and clears the `REMCTL_*` environment overrides. Without it a
-contributor with a stored `accountScope` sees four extra failures that do not
-reproduce in CI — those tests assert `main()` dispatches to exactly `cmd_show`
-/`cmd_done`, and a stored scope opts the run into the wrapped handlers.
+contributor with a stored `accountScope` sees extra failures that do not
+reproduce elsewhere — those tests assert `main()` dispatches to exactly
+`cmd_show`/`cmd_done`, and a stored scope opts the run into the wrapped
+handlers. `tests/test_accounts.py` isolates its own environment, so it is
+deterministic under `unittest` too.
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (81 tests):
+`tests/test_accounts.py` covers the extension in isolation (92 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
-dispatch installation, bridge payload handling, and identifier backfill.
+dispatch installation, bridge payload handling, identifier backfill, and the
+Capability Host integration (command classification, the MCP run guard,
+custom-store routing, and scope forwarding).

@@ -77,6 +77,18 @@ ACCOUNT_SCOPE_ENV = "REMCTL_ACCOUNT_SCOPE"
 STORE_DIR_ENV = "REMCTL_STORE_DIR"
 DB_ENV = "REMCTL_DB"
 
+# Capability Host integration. The host requires every parser command to be
+# classified: `accounts` reads the Reminders stores (needs the host's grants);
+# `config` only edits ~/.config/remctl/config.json, like `setup`.
+HOSTED_COMMANDS = frozenset({"accounts"})
+LOCAL_COMMANDS = frozenset({"config"})
+# Top-level options register_cli() adds, and whether each takes a value. The
+# MCP `run` guard imports these so `--account NAME` is not read as a command.
+RUN_GLOBAL_OPTIONS = {"--account": True, "--all-accounts": False}
+# Persistent configuration is a setup action, not something an MCP client runs.
+RUN_FORBIDDEN_COMMANDS = frozenset({"config"})
+CAPABILITY_HOST_ACTIVE_ENV = "REMCTL_CAPABILITY_HOST_ACTIVE"
+
 # Reminders keeps an internal bookkeeping account that holds no user data.
 HIDDEN_ACCOUNT_NAMES = {"LocalInternal"}
 
@@ -136,16 +148,43 @@ def save_config(data):
     config_file().write_text(json.dumps(data, indent=2) + "\n")
 
 
+def _inside_capability_host():
+    return os.environ.get(CAPABILITY_HOST_ACTIVE_ENV) == "1"
+
+
 def store_dir():
-    """Reminders Stores directory, honoring env then config then core default."""
-    override = os.environ.get(STORE_DIR_ENV, "").strip() or load_config().get("storeDir", "")
+    """Reminders Stores directory, honoring env then config then core default.
+
+    Inside the Capability Host only the host-pinned store is used: like core's
+    REMCTL_STORE_DIR, custom stores run only in direct mode.
+    """
+    override = os.environ.get(STORE_DIR_ENV, "").strip()
+    if not override and not _inside_capability_host():
+        override = load_config().get("storeDir", "")
     return Path(override).expanduser() if override else core.STORE_DIR
 
 
 def db_override():
-    """A pinned store file (REMCTL_DB / config dbPath), or None."""
+    """A pinned store file (REMCTL_DB / config dbPath), or None.
+
+    Never honored inside the Capability Host; see store_dir().
+    """
+    if _inside_capability_host():
+        return None
     raw = os.environ.get(DB_ENV, "").strip() or load_config().get("dbPath", "")
     return Path(raw).expanduser() if raw else None
+
+
+def custom_store_settings():
+    """Names of the extension's custom-store settings that are in effect."""
+    names = []
+    if os.environ.get(DB_ENV, "").strip():
+        names.append(DB_ENV)
+    config = load_config()
+    for key in ("storeDir", "dbPath"):
+        if config.get(key):
+            names.append(f"config {key}")
+    return names
 
 
 # ── Account discovery ────────────────────────────────────────────────────────
@@ -698,6 +737,11 @@ def _add_scope_flags(parser, *, all_accounts=True):
                             help="Act on every connected Reminders account")
 
 
+# Core functions this module has already wrapped; build_parser() can run more
+# than once per process and must not stack wrappers.
+_WRAPPERS = set()
+
+
 def _patch_command_token_scanner():
     """Teach core's command-token scanner that --account takes a value.
 
@@ -705,6 +749,8 @@ def _patch_command_token_scanner():
     Wrapping keeps the fix local to this module.
     """
     original = core.first_command_token
+    if original in _WRAPPERS:
+        return
 
     def scanner(args):
         filtered, skip = [], False
@@ -720,13 +766,92 @@ def _patch_command_token_scanner():
             filtered.append(token)
         return original(filtered)
 
+    _WRAPPERS.add(scanner)
     core.first_command_token = scanner
+
+
+def _option_given(argv, option):
+    try:
+        argv = argv[:argv.index("--")]
+    except ValueError:
+        pass
+    return any(token == option or token.startswith(option + "=") for token in argv)
+
+
+def _host_scope_flags(argv, command, args=None):
+    """Scope flags the Capability Host needs to see this invocation's scope.
+
+    The host runs the command in a sanitized environment, so an account scope
+    that came from REMCTL_ACCOUNT_SCOPE (or from flags the caller's argv no
+    longer carries) must travel as explicit flags. Explicit flags always win.
+    """
+    if _option_given(argv, "--account") or _option_given(argv, "--all-accounts"):
+        return []
+    names = _requested_account_names(args) if args is not None else []
+    if names:
+        return ["--account", names[-1]]
+    if args is not None and getattr(args, "all_accounts", False):
+        return ["--all-accounts"]
+    scope = os.environ.get(ACCOUNT_SCOPE_ENV, "").strip()
+    if not scope:
+        return []
+    parser = _SUBPARSERS.choices.get(command) if _SUBPARSERS is not None else None
+    options = {opt for action in getattr(parser, "_actions", []) for opt in action.option_strings}
+    if scope.lower() == "all":
+        return ["--all-accounts"] if "--all-accounts" in options else []
+    return ["--account", scope] if "--account" in options else []
+
+
+def _patch_capability_host_routing():
+    """Keep account scope and custom stores coherent with the Capability Host.
+
+    - Custom stores (REMCTL_DB, config dbPath/storeDir) run only in direct
+      mode, exactly like core's REMCTL_STORE_DIR; force mode is a conflict.
+    - Scope from REMCTL_ACCOUNT_SCOPE is forwarded to the host as flags.
+    """
+    route = core._should_route_capability_host
+    if route in _WRAPPERS:
+        return
+    normalized = core._normalized_host_argv
+    no_command = core._no_command_host_argv
+
+    def should_route(args):
+        routed = route(args)
+        custom = custom_store_settings()
+        if not custom or _inside_capability_host():
+            return routed
+        if core.remctl_broker.mode() == "force":
+            print(f"Error: REMCTL_CAPABILITY_HOST=force conflicts with {', '.join(custom)}; "
+                  "custom stores can run only in auto or direct mode", file=sys.stderr)
+            sys.exit(2)
+        return False
+
+    def normalized_host_argv(argv, args):
+        values = normalized(argv, args)
+        return _host_scope_flags(values, getattr(args, "cmd", None)) + values
+
+    def no_command_host_argv(args):
+        values = no_command(args)
+        return _host_scope_flags(values, "today", args) + values
+
+    _WRAPPERS.update((should_route, normalized_host_argv, no_command_host_argv))
+    core._should_route_capability_host = should_route
+    core._normalized_host_argv = normalized_host_argv
+    core._no_command_host_argv = no_command_host_argv
+
+
+_SUBPARSERS = None
 
 
 def register_cli(p, sub):
     """Add multi-account flags and the `accounts`/`config` subcommands."""
+    global _SUBPARSERS
+    _SUBPARSERS = sub
     _add_scope_flags(p)
     _patch_command_token_scanner()
+    _patch_capability_host_routing()
+    import remctl_runtime
+    remctl_runtime.register_extension_commands(local=LOCAL_COMMANDS, hosted=HOSTED_COMMANDS)
 
     for name in sorted(AGGREGATE_COMMANDS | REMINDER_TARGET_COMMANDS | LIST_TARGET_COMMANDS):
         parser = sub.choices.get(name)

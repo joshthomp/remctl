@@ -19,6 +19,7 @@ struct Command: Decodable {
     let url: String?
     let flagged: Bool?
     let recurrence: RecurrenceSpec?
+    let clearRecurrence: Bool?
     let alarm: String?
     let allDay: Bool?
     let clearAlarms: Bool?
@@ -35,6 +36,8 @@ struct Command: Decodable {
     let days: Int?
     let includeOverdue: Bool?
     let limit: Int?
+    let address: String?
+    let timeoutSeconds: Double?
 }
 
 struct RecurrenceSpec: Decodable {
@@ -43,6 +46,11 @@ struct RecurrenceSpec: Decodable {
     let daysOfWeek: [Int]?
     let weekNumbers: [Int]?
     let daysOfMonth: [Int]?
+    let monthsOfYear: [Int]?
+    let daysOfYear: [Int]?
+    let weeksOfYear: [Int]?
+    let setPositions: [Int]?
+    let count: Int?
     let end: String?
 }
 
@@ -92,7 +100,25 @@ let localDateTimeShort: DateFormatter = {
     return f
 }()
 
+let isoFractionalFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+let localFractionalFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+    f.timeZone = TimeZone.current
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
 func parseISO(_ s: String) -> Date? {
+    if s.contains(".") {
+        if let d = isoFractionalFormatter.date(from: s) { return d }
+        if let d = localFractionalFormatter.date(from: s) { return d }
+    }
     // 1. Full ISO 8601 with timezone (e.g., "2026-03-28T15:00:00Z" or "+02:00")
     if let d = isoFormatter.date(from: s) { return d }
     // 2. Naive datetime as local time (e.g., "2026-03-28T15:00:00")
@@ -191,13 +217,26 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
 
     var daysOfMonth: [NSNumber]?
     if let days = spec.daysOfMonth {
-        guard !days.isEmpty, days.allSatisfy({ 1...31 ~= $0 }) else { return nil }
+        guard !days.isEmpty, days.allSatisfy({ $0 != 0 && -31...31 ~= $0 }) else { return nil }
         daysOfMonth = days.map { NSNumber(value: $0) }
     }
 
+    for (values, bound, allowsNegative) in [
+        (spec.monthsOfYear, 12, false), (spec.daysOfYear, 366, true),
+        (spec.weeksOfYear, 53, true), (spec.setPositions, 366, true)
+    ] {
+        if let values = values {
+            let lower = allowsNegative ? -bound : 1
+            guard !values.isEmpty, values.allSatisfy({ $0 != 0 && lower...bound ~= $0 }) else { return nil }
+        }
+    }
     var end: EKRecurrenceEnd?
-    if let endStr = spec.end, let endDate = parseISO(endStr) {
+    if let endStr = spec.end {
+        guard spec.count == nil, let endDate = parseISO(endStr) else { return nil }
         end = EKRecurrenceEnd(end: endDate)
+    } else if let count = spec.count {
+        guard count > 0 else { return nil }
+        end = EKRecurrenceEnd(occurrenceCount: count)
     }
 
     return EKRecurrenceRule(
@@ -205,10 +244,10 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
         interval: interval,
         daysOfTheWeek: daysOfWeek,
         daysOfTheMonth: daysOfMonth,
-        monthsOfTheYear: nil,
-        weeksOfTheYear: nil,
-        daysOfTheYear: nil,
-        setPositions: nil,
+        monthsOfTheYear: spec.monthsOfYear?.map { NSNumber(value: $0) },
+        weeksOfTheYear: spec.weeksOfYear?.map { NSNumber(value: $0) },
+        daysOfTheYear: spec.daysOfYear?.map { NSNumber(value: $0) },
+        setPositions: spec.setPositions?.map { NSNumber(value: $0) },
         end: end
     )
 }
@@ -225,9 +264,12 @@ func colorForName(_ name: String) -> CGColor? {
         "purple": (0.69, 0.32, 0.87),
         "brown":  (0.64, 0.52, 0.37),
         "cyan":   (0.35, 0.78, 0.98),
+        "gray":   (91.0 / 255, 98.0 / 255, 106.0 / 255),
+        "teal":   (48.0 / 255, 176.0 / 255, 199.0 / 255),
     ]
     guard let (r, g, b) = map[name.lowercased()] else { return nil }
-    return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+    let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    return CGColor(colorSpace: space, components: [r, g, b, 1.0])
 }
 
 // MARK: - Helpers
@@ -434,6 +476,9 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
         fail("flagged is not supported: EventKit cannot set the real flagged state; use the AppleScript path or remctl-private set_flagged")
     }
 
+    if cmd.clearRecurrence == true {
+        reminder.recurrenceRules = []
+    }
     if let spec = cmd.recurrence {
         guard let rule = buildRecurrenceRule(spec) else { fail("Invalid recurrence") }
         reminder.recurrenceRules = [rule]
@@ -647,11 +692,94 @@ func containsQuery(_ reminder: EKReminder, _ query: String) -> Bool {
     let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
     if (reminder.title ?? "").range(of: query, options: options) != nil { return true }
     if (reminder.notes ?? "").range(of: query, options: options) != nil { return true }
+    if (reminder.url?.absoluteString ?? "").range(of: query, options: options) != nil { return true }
     return false
 }
 
-func dueDateForSort(_ reminder: EKReminder) -> Date? {
-    dateFromComponents(reminder.dueDateComponents).0
+// MARK: - Geocoding
+
+/// One geocoder match with the fields RemCTL needs to judge its precision.
+func placemarkPayload(_ placemark: CLPlacemark) -> [String: Any]? {
+    guard let location = placemark.location else { return nil }
+    var payload: [String: Any] = [
+        "latitude": location.coordinate.latitude,
+        "longitude": location.coordinate.longitude,
+    ]
+    func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
+    }
+    let street = [placemark.subThoroughfare, placemark.thoroughfare].compactMap(nonEmpty).joined(separator: " ")
+    let address = [nonEmpty(street), placemark.locality, placemark.administrativeArea, placemark.postalCode, placemark.country]
+        .compactMap(nonEmpty)
+    if !address.isEmpty { payload["address"] = address.joined(separator: ", ") }
+    if let name = nonEmpty(placemark.name) { payload["name"] = name }
+    if let thoroughfare = nonEmpty(placemark.thoroughfare) { payload["thoroughfare"] = thoroughfare }
+    // Separate parts let RemCTL check the match against the words the user typed.
+    let parts: [(String, String?)] = [
+        ("subLocality", placemark.subLocality), ("locality", placemark.locality),
+        ("subAdministrativeArea", placemark.subAdministrativeArea), ("administrativeArea", placemark.administrativeArea),
+        ("postalCode", placemark.postalCode), ("country", placemark.country),
+    ]
+    for (key, value) in parts {
+        if let value = nonEmpty(value) { payload[key] = value }
+    }
+    if let areas = placemark.areasOfInterest, !areas.isEmpty { payload["areasOfInterest"] = areas }
+    if let region = placemark.region as? CLCircularRegion { payload["regionRadius"] = region.radius }
+    if let country = nonEmpty(placemark.isoCountryCode) { payload["isoCountryCode"] = country }
+    return payload
+}
+
+/// Forward-geocode an address with a hard deadline. Needs no Reminders or
+/// Location Services permission: it only asks Apple's geocoder, and it never
+/// writes anything. On the deadline it cancels the request and reports timeout.
+func runGeocode(_ cmd: Command) -> Never {
+    guard let address = cmd.address?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty else {
+        fail("address is required for geocode")
+    }
+    guard address.count <= 512 else { fail("address is longer than 512 characters") }
+    let timeout = min(max(cmd.timeoutSeconds ?? 10, 1), 30)
+    let geocoder = CLGeocoder()
+    var placemarks: [CLPlacemark] = []
+    var failure: Error?
+    var finished = false
+    geocoder.geocodeAddressString(address) { results, error in
+        placemarks = results ?? []
+        failure = error
+        finished = true
+    }
+    // The completion handler arrives on the main queue, which this loop services.
+    let deadline = Date().addingTimeInterval(timeout)
+    while !finished && Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: min(deadline, Date().addingTimeInterval(0.05)))
+    }
+    if !finished {
+        geocoder.cancelGeocode()
+        output(["status": "error", "code": "timeout", "message": "Geocoding did not finish within \(Int(timeout)) seconds."])
+        exit(1)
+    }
+    if let error = failure as? CLError {
+        switch error.code {
+        case .geocodeFoundNoResult, .geocodeFoundPartialResult:
+            output(["status": "ok", "query": address, "candidates": [] as [Any]])
+            exit(0)
+        case .network:
+            output(["status": "error", "code": "network", "message": "Apple's geocoder could not be reached: \(error.localizedDescription)"])
+        case .denied:
+            output(["status": "error", "code": "denied", "message": "Geocoding was denied: \(error.localizedDescription)"])
+        case .geocodeCanceled:
+            output(["status": "error", "code": "timeout", "message": "Geocoding was cancelled."])
+        default:
+            output(["status": "error", "code": "failed", "message": "Geocoding failed: \(error.localizedDescription)"])
+        }
+        exit(1)
+    }
+    if let error = failure {
+        output(["status": "error", "code": "failed", "message": "Geocoding failed: \(error.localizedDescription)"])
+        exit(1)
+    }
+    output(["status": "ok", "query": address, "candidates": placemarks.compactMap(placemarkPayload)])
+    exit(0)
 }
 
 func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
@@ -698,9 +826,13 @@ func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
         fail("Unsupported EventKit read mode: \(mode)")
     }
 
-    reminders.sort {
-        let leftDue = dueDateForSort($0)
-        let rightDue = dueDateForSort($1)
+    // Convert date components once per reminder, rather than on each comparison.
+    var sortableReminders = reminders.map {
+        (reminder: $0, dueDate: dateFromComponents($0.dueDateComponents).0, title: $0.title ?? "")
+    }
+    sortableReminders.sort {
+        let leftDue = $0.dueDate
+        let rightDue = $1.dueDate
         if let leftDue = leftDue, let rightDue = rightDue {
             if leftDue != rightDue { return leftDue < rightDue }
         } else if leftDue != nil {
@@ -708,9 +840,9 @@ func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
         } else if rightDue != nil {
             return false
         }
-        return ($0.title ?? "") < ($1.title ?? "")
+        return $0.title < $1.title
     }
-    let items = reminders.prefix(limit).map { reminderPayload($0) }
+    let items = sortableReminders.prefix(limit).map { reminderPayload($0.reminder) }
     output([
         "status": "ok",
         "source": "eventkit",
@@ -750,6 +882,11 @@ let dueExplicitlyNull: Bool = {
     return obj.keys.contains("due") && obj["due"] is NSNull
 }()
 
+// Geocoding touches no reminders, so it runs before EventKit is opened or asked for access.
+if cmd.action == "geocode" {
+    runGeocode(cmd)
+}
+
 let store = EKEventStore()
 
 if cmd.action == "authorize" {
@@ -757,6 +894,7 @@ if cmd.action == "authorize" {
     output(authorizationSummary(store))
     exit(0)
 }
+
 
 requestAccess(store)
 
@@ -905,7 +1043,8 @@ case "create_list":
         }
         cal.source = source
     }
-    if let colorName = cmd.color, let cg = colorForName(colorName) {
+    if let colorName = cmd.color {
+        guard let cg = colorForName(colorName) else { fail("Unsupported list color: \(colorName)") }
         cal.cgColor = cg
     }
     do {

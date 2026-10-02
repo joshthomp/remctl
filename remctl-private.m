@@ -1,17 +1,27 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#define REMCTL_PRIVATE_PROTOCOL_VERSION 2
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 3
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <dlfcn.h>
 #include <netinet/in.h>
 
 @interface REMObjectID : NSObject
 + (id)objectIDWithURL:(NSURL *)url;
 - (NSUUID *)uuid;
+- (NSString *)entityName;
 - (NSURL *)urlRepresentation;
 @end
 
+@interface NSObject (RemctlRecoveryInvocation)
+- (id)initWithFetchResultTokenToDiffAgainst:(id)token;
+- (NSData *)resultData;
+@end
+
 @interface REMStore : NSObject
+- (id)resultFromPerformingSwiftInvocation:(id)invocation parametersData:(NSData *)data storages:(id)storages error:(NSError **)error;
+- (NSArray *)fetchAccountsWithError:(NSError **)error;
+- (id)fetchReminderIncludingMarkedForDeleteWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchReminderWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchSmartListWithObjectID:(id)objectID error:(NSError **)error;
@@ -56,6 +66,7 @@
 
 @interface REMAccountCapabilities : NSObject
 - (BOOL)supportsCustomSmartLists;
+- (BOOL)supportsRecentlyDeletedList;
 @end
 
 @interface REMSmartListChangeItem : NSObject
@@ -68,7 +79,6 @@
 - (void)setName:(NSString *)name;
 - (void)setParentOwnerID:(id)objectID;
 - (void)setSmartListType:(NSString *)smartListType;
-- (void)setSortingStyle:(NSString *)sortingStyle;
 - (void)updateManualOrdering:(id)manualOrdering;
 - (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
 @end
@@ -98,6 +108,7 @@
 @end
 
 @interface REMReminderChangeItem : NSObject
+- (void)setListID:(id)listID;
 - (id)remObjectID;
 - (id)assignmentContext;
 - (id)attachmentContext;
@@ -148,8 +159,8 @@
 @end
 
 @interface REMListChangeItem : NSObject
+- (void)undeleteRemindersWithoutUndoWithIDs:(NSArray *)ids;
 - (id)remObjectID;
-- (id)sublistContext;
 - (id)sectionsContextChangeItem;
 - (id)appearanceContext;
 - (id)groceryContextChangeItem;
@@ -167,7 +178,6 @@
 @interface REMList : NSObject
 - (id)account;
 - (id)remObjectID;
-- (id)parentList;
 - (NSOrderedSet *)reminderIDsOrdering;
 @end
 
@@ -522,6 +532,10 @@ static BOOL ipv4AddressIsPrivateOrLocal(uint32_t address) {
         ((ip & 0xf0000000) == 0xe0000000);        // multicast/reserved
 }
 
+static BOOL ipv4AddressIsFakeIP(uint32_t address) {
+    return (ntohl(address) & 0xfffe0000) == 0xc6120000;
+}
+
 static BOOL sockaddrIsPrivateOrLocal(const struct sockaddr *addr) {
     if (!addr) return YES;
     if (addr->sa_family == AF_INET) {
@@ -531,6 +545,11 @@ static BOOL sockaddrIsPrivateOrLocal(const struct sockaddr *addr) {
     if (addr->sa_family == AF_INET6) {
         const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)addr;
         const struct in6_addr *address = &ipv6->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(address)) {
+            uint32_t mapped;
+            memcpy(&mapped, &address->s6_addr[12], sizeof(mapped));
+            return ipv4AddressIsPrivateOrLocal(mapped) || ipv4AddressIsFakeIP(mapped);
+        }
         return IN6_IS_ADDR_UNSPECIFIED(address) ||
             IN6_IS_ADDR_LOOPBACK(address) ||
             IN6_IS_ADDR_LINKLOCAL(address) ||
@@ -547,8 +566,24 @@ static BOOL hostResolvesOnlyToPublicAddresses(NSString *host) {
         return NO;
     }
     NSString *lower = [host lowercaseString];
+    while ([lower hasSuffix:@"."]) { lower = [lower substringToIndex:lower.length - 1]; }
     if ([lower isEqualToString:@"localhost"] || [lower hasSuffix:@".local"]) {
         return NO;
+    }
+    // Fake-IP DNS placeholders are accepted for names, never literal targets.
+    struct in_addr literal;
+    if (inet_aton(lower.UTF8String, &literal) != 0 && ipv4AddressIsFakeIP(literal.s_addr)) {
+        return NO;
+    }
+    NSString *ipv6Host = lower;
+    if ([ipv6Host hasPrefix:@"["] && [ipv6Host hasSuffix:@"]"]) {
+        ipv6Host = [ipv6Host substringWithRange:NSMakeRange(1, ipv6Host.length - 2)];
+    }
+    struct in6_addr literal6;
+    if (inet_pton(AF_INET6, ipv6Host.UTF8String, &literal6) == 1 && IN6_IS_ADDR_V4MAPPED(&literal6)) {
+        uint32_t mapped;
+        memcpy(&mapped, &literal6.s6_addr[12], sizeof(mapped));
+        if (ipv4AddressIsPrivateOrLocal(mapped) || ipv4AddressIsFakeIP(mapped)) return NO;
     }
 
     struct addrinfo hints;
@@ -691,6 +726,32 @@ static NSArray<NSDictionary *> *subtaskSpecArray(NSDictionary *cmd) {
     return result;
 }
 
+// Ask Reminders for its recovery list; deleted database rows also include purged items.
+static NSArray *recentlyDeletedReminders(REMStore *store, REMAccount *account) {
+    dlopen("/System/Library/PrivateFrameworks/ReminderKitInternal.framework/ReminderKitInternal", RTLD_NOW);
+    Class invocationClass = NSClassFromString(@"REMRemindersListDataView_RecentlyDeletedInvocation");
+    if (!invocationClass || ![invocationClass instancesRespondToSelector:@selector(initWithFetchResultTokenToDiffAgainst:)]
+        || ![store respondsToSelector:@selector(resultFromPerformingSwiftInvocation:parametersData:storages:error:)]) {
+        fail(@"Recently Deleted is unavailable on this macOS version");
+    }
+    id accountID = [account remObjectID];
+    NSDictionary *params = @{
+        @"accountID": @{@"uuid": [[accountID uuid] UUIDString], @"entityName": [accountID entityName]},
+        @"deletedAfterDate": [NSDate dateWithTimeIntervalSinceNow:-30 * 24 * 60 * 60],
+        @"remindersPrefetch": @{@"base": @"none"}, @"countCompleted": @YES,
+    };
+    NSError *error = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:params format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    id invocation = [[invocationClass alloc] initWithFetchResultTokenToDiffAgainst:nil];
+    id result = [store resultFromPerformingSwiftInvocation:invocation parametersData:data storages:nil error:&error];
+    if (!result || ![result respondsToSelector:@selector(resultData)]) fail(error.localizedDescription ?: @"Recently Deleted query failed");
+    id decoded = [NSPropertyListSerialization propertyListWithData:[result resultData] options:NSPropertyListImmutable format:nil error:&error];
+    id model = [decoded isKindOfClass:[NSDictionary class]] ? decoded[@"model"] : nil;
+    id reminders = [model isKindOfClass:[NSDictionary class]] ? model[@"reminders"] : nil;
+    if (![reminders isKindOfClass:[NSArray class]]) fail(@"Unexpected Recently Deleted response; update RemCTL for this macOS version");
+    return reminders;
+}
+
 int main(void) {
     @autoreleasepool {
         NSData *input = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
@@ -776,6 +837,66 @@ int main(void) {
                 };
             }
             output(details);
+            return 0;
+        }
+        if ([action isEqualToString:@"recently_deleted"] || [action isEqualToString:@"restore_reminder"]) {
+            REMStore *store = [REMStore new];
+            NSArray *accounts = [store fetchAccountsWithError:&error];
+            if (!accounts) fail(error.localizedDescription ?: @"Could not fetch Reminders accounts");
+            if ([action isEqualToString:@"recently_deleted"]) {
+                NSMutableArray *items = [NSMutableArray array];
+                BOOL queriedAccount = NO;
+                for (REMAccount *account in accounts) {
+                    id capabilities = [account capabilities];
+                    if ([capabilities respondsToSelector:@selector(supportsRecentlyDeletedList)] && [capabilities supportsRecentlyDeletedList]) {
+                        [items addObjectsFromArray:recentlyDeletedReminders(store, account)];
+                        queriedAccount = YES;
+                    }
+                }
+                if (!queriedAccount) fail(@"No account supports Recently Deleted on this Mac");
+                output(@{@"status": @"ok", @"reminders": items});
+                return 0;
+            }
+            NSString *reminderID = cmd[@"reminderId"], *listID = cmd[@"listId"];
+            if (![reminderID isKindOfClass:[NSString class]] || ![[NSUUID alloc] initWithUUIDString:reminderID]
+                || ![listID isKindOfClass:[NSString class]] || ![[NSUUID alloc] initWithUUIDString:listID]) fail(@"Valid reminderId and listId are required");
+            id targetID = [REMObjectID objectIDWithURL:listURL(listID)];
+            REMList *list = [store fetchListWithObjectID:targetID error:&error];
+            if (!list) fail(error.localizedDescription ?: @"Destination list not found");
+            REMAccount *account = [list account];
+            id capabilities = [account capabilities];
+            if (![capabilities respondsToSelector:@selector(supportsRecentlyDeletedList)] || ![capabilities supportsRecentlyDeletedList]) fail(@"This account does not support Recently Deleted");
+            NSDictionary *deletedRoot = nil;
+            for (NSDictionary *item in recentlyDeletedReminders(store, account)) {
+                id oid = [item isKindOfClass:[NSDictionary class]] ? item[@"objectID"] : nil;
+                NSString *uuid = [oid isKindOfClass:[NSDictionary class]] ? oid[@"uuid"] : nil;
+                if ([uuid isKindOfClass:[NSString class]] && [uuid caseInsensitiveCompare:reminderID] == NSOrderedSame) { deletedRoot = item; break; }
+            }
+            if (!deletedRoot) fail(@"Reminder is not a recoverable top-level item in the destination account; restore its parent if it is a subtask");
+            id objectID = [REMObjectID objectIDWithURL:reminderURL(reminderID)];
+            if (![store respondsToSelector:@selector(fetchReminderIncludingMarkedForDeleteWithObjectID:error:)]) fail(@"Deleted reminder fetch is unavailable on this macOS version");
+            id reminder = [store fetchReminderIncludingMarkedForDeleteWithObjectID:objectID error:&error];
+            if (!reminder) fail(error.localizedDescription ?: @"Deleted reminder is no longer available");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListChangeItem *change = [save updateList:list];
+            if (![change respondsToSelector:@selector(undeleteRemindersWithoutUndoWithIDs:)]) fail(@"Reminder recovery is unavailable on this macOS version");
+            [change undeleteRemindersWithoutUndoWithIDs:@[objectID]];
+            // Deleted children can still point at the old list, including a deleted list.
+            // Reparent them in the same save request that recovers the root.
+            NSMutableArray *pending = [NSMutableArray arrayWithArray:deletedRoot[@"subtasks"] ?: @[]];
+            while (pending.count) {
+                NSDictionary *child = pending.lastObject;
+                [pending removeLastObject];
+                id childID = [REMObjectID objectIDWithURL:reminderURL(child[@"objectID"][@"uuid"])];
+                id childReminder = [store fetchReminderIncludingMarkedForDeleteWithObjectID:childID error:&error];
+                if (!childReminder) fail(error.localizedDescription ?: @"Deleted subtask is no longer available");
+                REMReminderChangeItem *childChange = [save updateReminder:childReminder];
+                if (![childChange respondsToSelector:@selector(setListID:)]) fail(@"Subtask recovery into another list is unavailable");
+                [childChange setListID:targetID];
+                [pending addObjectsFromArray:child[@"subtasks"] ?: @[]];
+            }
+            if (![save saveSynchronouslyWithError:&error]) fail(error.localizedDescription ?: @"Reminder recovery failed");
+            output(@{@"status": @"updated", @"action": action});
             return 0;
         }
         NSSet<NSString *> *allowedActions = [NSSet setWithArray:@[

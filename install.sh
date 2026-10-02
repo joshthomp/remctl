@@ -748,11 +748,16 @@ legacy={
  "remctl_serialization.py":"4a23f4e8b1f5996de9a25788bce41baaf07e0efbb390a05d9ac6be04c8f6d6d9",
  "remctl_smart_lists.py":"81a500c42712e1519c5af15244ec9b55483617aef3ca6a931c800d70fc2e29ee",
  "completions/_remctl":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37",
- "completions/_rctl":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37",
- "completions/_reminders":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37"}
+ "completions/_rctl":"2d3bcbc3fcabb3779585b1ac78ccce1d25449b72b24768d095f509487f3f382f",
+ "completions/_reminders":"7592287a7643fa9f4ceeedab23193d0216a76498d7f95f91cf40484a7f607ebd"}
 allowed=set(legacy)|{"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png","rctl","reminders","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_accounts.py","remctl_workspace.html","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-list-symbols.json","remctl-list-artwork"}
 valid=present <= allowed and set(legacy) <= present
-for name,digest in legacy.items(): valid &= matches(os.path.join(root,name),{"type":"file","sha256":digest})
+for name,digest in legacy.items():
+    path=os.path.join(root,name)
+    valid &= matches(path,{"type":"file","sha256":digest}) or (
+        # Preserve the identical alias files accepted by earlier 2.x installers.
+        name in ("completions/_rctl","completions/_reminders")
+        and matches(path,{"type":"file","sha256":legacy["completions/_remctl"]}))
 for name in ("rctl","reminders"): valid &= matches(os.path.join(root,name),{"type":"symlink","target":"remctl"})
 generated=present & {"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png"}
 for name in generated - {"remctl-permissions-icon.png"}:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.1 — 2026-10-02
+
+### Fixes
+
+- List colors stored as archived strings no longer crash `lists --json` or MCP list reads. The decoder unwraps the text and keeps the default color for malformed data. Thanks to @jeremedia ([#53](https://github.com/viticci/remctl/pull/53)).
+- Ordinary agent calls through the Codex plugin return data without opening workspace tabs. The sidebar and explicit workspace command still open Reminders, and standalone MCP clients keep their widgets. Thanks to @hachinekooo ([#52](https://github.com/viticci/remctl/pull/52)).
+- Renamed iCloud accounts are recognized by stable account ID and provider inside the signed host. Names and comma-separated overrides are not needed; known non-iCloud accounts remain excluded. If account records are unavailable, the previous name-based fallback remains. Based on @rodchristiansen's report and proposal ([#33](https://github.com/viticci/remctl/pull/33)).
+- Stock 1.7.1 installations are recognized for an upgrade in place. Each command alias generated a different shell completion file, but the installer expected three identical files. The check now accepts the original alias files and the identical copies earlier 2.x installers accepted; modified files still require review. Corrected the legacy test fixture to generate each alias as 1.7.1 did. Thanks to @Sub-lime-time ([#56](https://github.com/viticci/remctl/issues/56)).
+
 ## 2.2.0 — 2026-10-02
 
 ### Fixes

@@ -17,6 +17,12 @@ Both install routes produce the same result. The difference that matters is who 
 
 You don't need an Apple account, a developer membership, Homebrew, or your own Python.
 
+### Renamed iCloud accounts
+
+Renaming an iCloud account does not change where RemCTL can write. The signed host reads macOS account records and matches EventKit sources by stable account ID, including accounts nested under iCloud. It does not depend on the account's display name or need another permission.
+
+If those records cannot be read, the existing iCloud-name fallback remains. A renamed account may then be refused; use `remctl doctor --for-agent` to check the host's access. Other account providers identified by macOS remain excluded even if their names contain “iCloud.”
+
 ## Download
 
 Download `RemCTL-arm64.dmg` from [Releases](https://github.com/viticci/remctl/releases), open it, and double-click 'Install RemCTL'. macOS asks whether to open an app downloaded from the internet; click Open, and Terminal runs the installer. The download is for Macs with Apple silicon. On an Intel Mac, [build it yourself](#build-it-yourself); that route is designed for Intel too, but it hasn't been tested on one yet.

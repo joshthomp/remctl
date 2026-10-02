@@ -38,6 +38,7 @@ struct Command: Decodable {
     let limit: Int?
     let address: String?
     let timeoutSeconds: Double?
+    let accountProviders: [String: String]?
 }
 
 struct RecurrenceSpec: Decodable {
@@ -300,9 +301,21 @@ func normalizedReminderKitListIdentifier(_ raw: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// Account IDs survive renaming; display names do not identify a provider.
+func isICloudSource(identifier: String, title: String, type: EKSourceType,
+                    providers: [String: String]) -> Bool {
+    guard type == .calDAV else { return false }
+    if let provider = providers[identifier.lowercased()] {
+        return provider == "com.apple.account.AppleAccount"
+    }
+    // Preserve the old path for standalone helpers and unavailable account records.
+    return title.localizedCaseInsensitiveContains("icloud")
+}
+
 func isICloudReminderSource(_ source: EKSource?) -> Bool {
     guard let source = source else { return false }
-    return source.sourceType == .calDAV && source.title.localizedCaseInsensitiveContains("icloud")
+    return isICloudSource(identifier: source.sourceIdentifier, title: source.title,
+                         type: source.sourceType, providers: cmd.accountProviders ?? [:])
 }
 
 func iCloudReminderCalendars(_ store: EKEventStore) -> [EKCalendar] {

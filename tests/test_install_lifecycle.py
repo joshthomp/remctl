@@ -602,13 +602,14 @@ class InstallerLifecycleTests(unittest.TestCase):
         for name, data in sources.items():
             (self.bin / name).write_bytes(data)
         (self.bin / "remctl").chmod(0o755)
-        completion = subprocess.run([sys.executable, str(self.bin / "remctl"), "completion", "zsh"],
-                                    check=True, capture_output=True).stdout
         (self.bin / "completions").mkdir()
         for alias in ("remctl", "rctl", "reminders"):
-            (self.bin / "completions" / f"_{alias}").write_bytes(completion)
             if alias != "remctl":
                 (self.bin / alias).symlink_to("remctl")
+            # 1.7.1 generated each alias separately; CLI_NAME changes its output.
+            completion = subprocess.run([sys.executable, str(self.bin / alias), "completion", "zsh"],
+                                        check=True, capture_output=True).stdout
+            (self.bin / "completions" / f"_{alias}").write_bytes(completion)
 
     def run_in_terminal(self, *arguments: str, answer: str, prompt: bytes) -> tuple[int, str]:
         """Run the installer on a pseudo-terminal and answer its first prompt."""
@@ -640,6 +641,16 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.make_legacy_171_install()
         before = sha256(self.bin / "remctl")
 
+        # Older 2.x accepted aliases copied from _remctl; keep that upgrade path.
+        aliases = {name: (self.bin / "completions" / name).read_bytes()
+                   for name in ("_rctl", "_reminders")}
+        for name in aliases:
+            (self.bin / "completions" / name).write_bytes((self.bin / "completions/_remctl").read_bytes())
+        copied = self.run_script(INSTALL, "--dry-run", "--shell-completions", "none")
+        self.assertIn("it would be upgraded in place", copied.stdout)
+        for name, data in aliases.items():
+            (self.bin / "completions" / name).write_bytes(data)
+
         refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("RemCTL 1.7.1 is installed", refused.stdout)
@@ -652,13 +663,17 @@ class InstallerLifecycleTests(unittest.TestCase):
 
     def test_unverifiable_old_install_is_left_alone_without_a_terminal(self) -> None:
         self.make_legacy_171_install()
-        (self.bin / "remctl_images.py").write_text("# edited by hand\n")
-
-        refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("can't verify its files", refused.stdout)
-        self.assertIn("Nothing was changed", refused.stdout)
-        self.assertEqual((self.bin / "remctl_images.py").read_text(), "# edited by hand\n")
+        for name in ("remctl_images.py", "completions/_rctl"):
+            with self.subTest(name=name):
+                modified = self.bin / name
+                original = modified.read_bytes()
+                modified.write_text("# edited by hand\n")
+                refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("can't verify its files", refused.stdout)
+                self.assertIn("Nothing was changed", refused.stdout)
+                self.assertEqual(modified.read_text(), "# edited by hand\n")
+                modified.write_bytes(original)
 
     def test_failed_rollback_preserves_recovery_evidence(self) -> None:
         self.run_script(INSTALL, "--shell-completions", "none")

@@ -263,8 +263,17 @@ def _merge_account_type(db_type, eventkit_type):
     return eventkit_type or db_type
 
 
+# REMCDAccount.ZTYPE values as Reminders writes them. Unknown codes fall back
+# to the replica-identifier heuristic.
+ACCOUNT_TYPE_CODES = {1: "Local", 2: "iCloud", 3: "CalDAV", 4: "Exchange", 5: "LocalInternal"}
+
+
 def _store_account_info(path):
-    """Return (name, type) for the account stored at *path*, or None."""
+    """Return (name, type) for the account stored at *path*, or None.
+
+    None also covers stores with no account record: Reminders leaves empty
+    stores behind when an account is re-added or fails its first sync.
+    """
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     except sqlite3.Error:
@@ -276,12 +285,18 @@ def _store_account_info(path):
         ).fetchone()
         if ent_row is None:
             return None
-        name_row = conn.execute(
-            "SELECT ZNAME FROM ZREMCDOBJECT WHERE Z_ENT=? AND ZNAME IS NOT NULL LIMIT 1",
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ZREMCDOBJECT)")}
+        type_column = "ZTYPE" if "ZTYPE" in columns else "NULL"
+        live = " AND ZMARKEDFORDELETION = 0" if "ZMARKEDFORDELETION" in columns else ""
+        account_row = conn.execute(
+            f"SELECT ZNAME, {type_column} FROM ZREMCDOBJECT WHERE Z_ENT=?{live} "
+            "ORDER BY ZNAME IS NULL LIMIT 1",
             (ent_row[0],),
         ).fetchone()
+        if account_row is None:
+            return None
         # A freshly added account may not have synced its name yet.
-        name = name_row[0] if name_row else None
+        name, type_code = account_row
 
         try:
             identifiers = [
@@ -292,7 +307,7 @@ def _store_account_info(path):
         except sqlite3.Error:
             identifiers = []
 
-        acct_type = _account_type_from_identifiers(identifiers)
+        acct_type = ACCOUNT_TYPE_CODES.get(type_code) or _account_type_from_identifiers(identifiers)
         if not name:
             if identifiers:
                 name = f"{acct_type} ({identifiers[0].split('/')[0][:8]})"
@@ -468,6 +483,7 @@ def account_context(account):
     prev_call = core.bridge_call
     prev_call_result = core.bridge_call_result
     prev_q_reminder = core.q_reminder
+    prev_q_by_identifier = core.q_reminder_by_identifier
 
     def opener():
         conn = sqlite3.connect(f"file:{account.store_path}?mode=ro", uri=True)
@@ -485,6 +501,8 @@ def account_context(account):
     core.bridge_call_result = lambda data, *args, **kw: prev_call_result(tag(data), *args, **kw)
     core.q_reminder = lambda db, pk, *args, **kw: _with_identifier(
         prev_q_reminder(db, pk, *args, **kw), account)
+    core.q_reminder_by_identifier = lambda db, identifier: (
+        prev_q_by_identifier(db, identifier) or _q_reminder_by_eventkit_id(db, identifier))
     try:
         yield
     finally:
@@ -492,6 +510,32 @@ def account_context(account):
         core.bridge_call = prev_call
         core.bridge_call_result = prev_call_result
         core.q_reminder = prev_q_reminder
+        core.q_reminder_by_identifier = prev_q_by_identifier
+
+
+def _q_reminder_by_eventkit_id(db, identifier):
+    """The row for a reminder the bridge just created, by its EventKit id.
+
+    Core finds a new reminder by ZCKIDENTIFIER, which only iCloud reminders
+    have. Exchange and CalDAV rows store the identifier the bridge returned in
+    ZDACALENDARITEMUNIQUEIDENTIFIER instead, so `add --json` can still report
+    a numericId. Exact match only; never a title guess.
+    """
+    if not identifier:
+        return None
+    try:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(ZREMCDREMINDER)")}
+        if "ZDACALENDARITEMUNIQUEIDENTIFIER" not in columns:
+            return None
+        return db.execute(
+            f"SELECT {core.rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+            "ON r.ZLIST = l.Z_PK "
+            "WHERE r.ZDACALENDARITEMUNIQUEIDENTIFIER = ? "
+            f"AND {core.LIVE_REMINDER_SQL} ORDER BY r.Z_PK DESC LIMIT 1",
+            (identifier,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
 
 
 CaptureResult = namedtuple("CaptureResult", ["out", "err", "ok"])

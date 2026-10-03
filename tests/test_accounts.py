@@ -144,6 +144,57 @@ class AccountTypeDetectionTests(AccountsTestBase):
         self.assertEqual([(a.name, a.type) for a in accounts], [("Work", "Exchange")])
 
 
+class StoreAccountInfoTests(AccountsTestBase):
+    """_store_account_info against minimal Reminders-shaped SQLite stores."""
+
+    def _store(self, accounts=(), identifiers=()):
+        path = self._config_dir / f"Data-{len(list(self._config_dir.glob('*.sqlite')))}.sqlite"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME TEXT);
+            INSERT INTO Z_PRIMARYKEY VALUES (7, 'REMCDAccount');
+            CREATE TABLE ZREMCDOBJECT (Z_ENT INTEGER, ZNAME TEXT, ZTYPE INTEGER,
+                                       ZMARKEDFORDELETION INTEGER);
+            CREATE TABLE ZREMCDREPLICAMANAGER (ZIDENTIFIER TEXT);
+        """)
+        conn.executemany("INSERT INTO ZREMCDOBJECT VALUES (7, ?, ?, ?)", accounts)
+        conn.executemany("INSERT INTO ZREMCDREPLICAMANAGER VALUES (?)", [(i,) for i in identifiers])
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_account_type_comes_from_the_account_record(self):
+        for code, expected in ((1, "Local"), (2, "iCloud"), (3, "CalDAV"), (4, "Exchange")):
+            path = self._store(accounts=[("Acct", code, 0)])
+            self.assertEqual(self.mod._store_account_info(path), ("Acct", expected))
+
+    def test_unsynced_caldav_account_is_not_reported_as_local(self):
+        """No lists or replica records yet, but the account record says CalDAV."""
+        path = self._store(accounts=[("RemCTL CalDAV Test", 3, 0)])
+        self.assertEqual(self.mod._store_account_info(path), ("RemCTL CalDAV Test", "CalDAV"))
+
+    def test_store_without_an_account_record_is_skipped(self):
+        """Reminders leaves empty stores behind when an account is re-added."""
+        self.assertIsNone(self.mod._store_account_info(self._store()))
+
+    def test_account_marked_for_deletion_is_skipped(self):
+        path = self._store(accounts=[("Gone", 3, 1)])
+        self.assertIsNone(self.mod._store_account_info(path))
+
+    def test_unknown_type_code_falls_back_to_identifier_heuristic(self):
+        path = self._store(accounts=[("Work", 99, 0)],
+                           identifiers=["UUID/com.apple.exchangesync.exchangesyncd"])
+        self.assertEqual(self.mod._store_account_info(path), ("Work", "Exchange"))
+
+    def test_unnamed_account_gets_a_typed_placeholder_name(self):
+        path = self._store(accounts=[(None, 3, 0)])
+        info = self.mod._store_account_info(path)
+        assert info is not None
+        name, acct_type = info
+        self.assertEqual(acct_type, "CalDAV")
+        self.assertTrue(name.startswith("CalDAV ("))
+
+
 class DiscoveryTests(AccountsTestBase):
     def _discover(self, infos, scores=None):
         paths = [Path(f"/tmp/data-{i}.sqlite") for i in range(len(infos))]
@@ -663,6 +714,52 @@ class BridgePayloadTests(AccountsTestBase):
             self.assertIsNone(self.mod._bridge_payload({"action": "x"}))
 
 
+class CreatedReminderLookupTests(AccountsTestBase):
+    """`add --json` reports numericId for non-iCloud reminders too."""
+
+    def _db(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE ZREMCDBASELIST (Z_PK INTEGER PRIMARY KEY, ZNAME TEXT,
+                                         ZMARKEDFORDELETION INTEGER);
+            INSERT INTO ZREMCDBASELIST VALUES (1, 'RemCTL Test', 0);
+            CREATE TABLE ZREMCDREMINDER (Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZLIST INTEGER,
+                                         ZCKIDENTIFIER TEXT, ZDACALENDARITEMUNIQUEIDENTIFIER TEXT,
+                                         ZMARKEDFORDELETION INTEGER, ZCOMPLETED INTEGER);
+            INSERT INTO ZREMCDREMINDER VALUES (3, 'Same title', 1, NULL, 'EK-ID-3', 0, 0);
+            INSERT INTO ZREMCDREMINDER VALUES (4, 'Same title', 1, NULL, 'EK-ID-4', 0, 0);
+        """)
+        return conn
+
+    def _lookup(self, db, identifier):
+        with mock.patch.object(self.mod.sqlite3, "connect", return_value=db), \
+                self.mod.account_context(self._account("Test", "CalDAV")):
+            return self.core.q_reminder_by_identifier(db, identifier)
+
+    def test_bridge_id_resolves_the_exact_row(self):
+        db = self._db()
+        with mock.patch.object(self.core, "rem_cols", return_value="r.Z_PK AS Z_PK"), \
+                mock.patch.object(self.core, "LIVE_REMINDER_SQL", "r.ZMARKEDFORDELETION = 0"):
+            self.assertEqual(self._lookup(db, "EK-ID-3")["Z_PK"], 3)
+            self.assertEqual(self._lookup(db, "EK-ID-4")["Z_PK"], 4)
+
+    def test_unknown_id_is_not_guessed_from_title(self):
+        db = self._db()
+        with mock.patch.object(self.core, "rem_cols", return_value="r.Z_PK AS Z_PK"), \
+                mock.patch.object(self.core, "LIVE_REMINDER_SQL", "r.ZMARKEDFORDELETION = 0"):
+            self.assertIsNone(self._lookup(db, "Same title"))
+            self.assertIsNone(self._lookup(db, ""))
+
+    def test_lookup_is_restored_after_the_context(self):
+        original = self.core.q_reminder_by_identifier
+        with mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()), \
+                self.mod.account_context(self._account("Test", "CalDAV")):
+            self.assertIsNot(self.core.q_reminder_by_identifier, original)
+        self.assertIs(self.core.q_reminder_by_identifier, original)
+
+
 class IdentifierBackfillTests(AccountsTestBase):
     """Exchange/CalDAV reminders have no ZCKIDENTIFIER; core refuses to touch
     them. The extension resolves the real EventKit id so core's own bridge
@@ -794,16 +891,16 @@ class CapabilityHostIntegrationTests(AccountsTestBase):
         args = self._parse("today")
         with mock.patch.object(self.core.remctl_broker, "should_route", return_value=True):
             self.assertTrue(self.core._should_route_capability_host(args))
-            os.environ["REMCTL_DB"] = "/tmp/pinned.sqlite"
+            os.environ["REMCTL_DB"] = str(self._config_dir / "pinned.sqlite")
             self.assertFalse(self.core._should_route_capability_host(args))
             os.environ.pop("REMCTL_DB")
-            self.mod.save_config({"dbPath": "/tmp/pinned.sqlite"})
+            self.mod.save_config({"dbPath": str(self._config_dir / "pinned.sqlite")})
             self.assertFalse(self.core._should_route_capability_host(args))
 
     def test_custom_store_conflicts_with_force_mode(self):
         args = self._parse("today")
         os.environ["REMCTL_CAPABILITY_HOST"] = "force"
-        self.mod.save_config({"storeDir": "/tmp/stores"})
+        self.mod.save_config({"storeDir": str(self._config_dir / "stores")})
         with mock.patch.object(self.core.remctl_broker, "should_route", return_value=True), \
                 contextlib.redirect_stderr(io.StringIO()) as err, \
                 self.assertRaises(SystemExit) as raised:
@@ -812,8 +909,9 @@ class CapabilityHostIntegrationTests(AccountsTestBase):
         self.assertIn("config storeDir", err.getvalue())
 
     def test_custom_stores_are_ignored_inside_the_host(self):
-        self.mod.save_config({"dbPath": "/tmp/pinned.sqlite", "storeDir": "/tmp/stores"})
-        os.environ["REMCTL_DB"] = "/tmp/other.sqlite"
+        self.mod.save_config({"dbPath": str(self._config_dir / "pinned.sqlite"),
+                              "storeDir": str(self._config_dir / "stores")})
+        os.environ["REMCTL_DB"] = str(self._config_dir / "other.sqlite")
         os.environ["REMCTL_CAPABILITY_HOST_ACTIVE"] = "1"
         self.assertIsNone(self.mod.db_override())
         self.assertEqual(self.mod.store_dir(), self.core.STORE_DIR)

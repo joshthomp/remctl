@@ -107,12 +107,14 @@ remctl config [KEY] [VALUE]          # accountScope | storeDir | dbPath
 
 ## Account types
 
-Account type is resolved from two sources and the **more specific** label wins:
-
-1. EventKit via the bridge — authoritative for concrete kinds (Exchange, …).
-2. A store heuristic over `ZREMCDREPLICAMANAGER` identifiers — needed because
-   EventKit reports iCloud and every other CalDAV account as plain `CalDAV`,
-   and because the bridge may be unavailable.
+Account type comes from the store itself: each store's `REMCDAccount` record
+has a type code (1 Local, 2 iCloud, 3 CalDAV, 4 Exchange, 5 LocalInternal).
+This is right even before an account's first sync, when it has no lists yet.
+For an unknown code the extension falls back to a heuristic over
+`ZREMCDREPLICAMANAGER` identifiers. EventKit, via the bridge, can still refine
+the label when it names a concrete kind (Exchange, …); it reports iCloud and
+every other CalDAV account as plain `CalDAV`, so that label never overrides the
+store's.
 
 Google accounts are not a Reminders source: Google's CalDAV server syncs calendar
 events but not tasks, so macOS offers no Reminders option for them and no Google
@@ -120,8 +122,10 @@ store ever appears.
 
 Account *discovery* itself is type-agnostic: it enumerates every
 `Data-*.sqlite` store and reads the `REMCDAccount` entity, so any account type
-Reminders supports is found. Only `LocalInternal`, an internal bookkeeping
-store, is skipped.
+Reminders supports is found. It skips `LocalInternal` (an internal bookkeeping
+store), accounts marked for deletion, and stores with no account record at all.
+Reminders leaves those empty stores behind when an account is re-added or fails
+its first sync, and listing them would show phantom "Local" accounts.
 
 ## Reminders without a CloudKit identifier
 
@@ -130,6 +134,13 @@ without one rather than risk a title-based fallback — which would make every
 Exchange/CalDAV reminder read-only. When an account is explicitly targeted, the
 extension resolves the real EventKit identifier (via the bridge's
 `find_reminder`) and hands it to core's normal write path.
+
+When `add` creates a reminder in such an account, core looks the new row up
+by `ZCKIDENTIFIER` to report `numericId`, and finds nothing. Exchange and CalDAV
+rows store the identifier the bridge returned in
+`ZDACALENDARITEMUNIQUEIDENTIFIER`, so inside an account context the extension
+also checks that column (exact match only) and `add --json` reports
+`numericId` for every account type.
 
 **Caveat:** EventKit is queried by `(calendar, title)`, so a list holding two
 reminders with the identical title resolves to the first. This trades core's
@@ -204,9 +215,10 @@ deterministic under `unittest` too.
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (91 tests):
+`tests/test_accounts.py` covers the extension in isolation (100 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
 dispatch installation, bridge payload handling, identifier backfill, and the
 Capability Host integration (command classification, the MCP run guard,
-custom-store routing, and scope forwarding).
+custom-store routing, and scope forwarding), account-type detection against
+real store schemas, and the numericId lookup for non-iCloud reminders.

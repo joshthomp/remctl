@@ -2,7 +2,7 @@
 
 RemCTL's core is single-account by design: it reads the one "live" Reminders
 store and writes through iCloud. Reminders, however, keeps a separate SQLite
-store per connected account (iCloud, Exchange, Google/CalDAV, Local), so any
+store per connected account (iCloud, Exchange, other CalDAV, Local), so any
 non-iCloud account is invisible to the core tool.
 
 This module adds that support **without modifying core behavior**. It attaches
@@ -218,8 +218,8 @@ def _bridge_payload(request):
 def _bridge_source_types():
     """{source title: EventKit source type} from the bridge, or {} if absent.
 
-    EventKit is authoritative about account types, so this correctly labels
-    Google/CalDAV and any other account type Reminders supports. The DB
+    EventKit is authoritative about concrete account types (Exchange, ...),
+    and labels every other CalDAV account, iCloud included, as "CalDAV". The DB
     heuristic below is only a fallback for when the bridge is unavailable.
     """
     result = _bridge_payload({"action": "list_calendars"})
@@ -239,8 +239,6 @@ def _account_type_from_identifiers(identifiers):
         return "Exchange"
     if "com.apple.reminders" in joined or "cloudkit" in joined:
         return "iCloud"
-    if "google" in joined:
-        return "Google"
     if "caldav" in joined or "dav" in joined:
         return "CalDAV"
     return "Local"
@@ -255,8 +253,8 @@ def _merge_account_type(db_type, eventkit_type):
     """Prefer whichever label is more specific.
 
     EventKit wins when it names a concrete account kind (Exchange, Birthdays,
-    ...). When it only says "CalDAV" -- which is what iCloud and Google both
-    report -- the store heuristic is the more useful answer.
+    ...). When it only says "CalDAV" -- which is what iCloud and every other
+    CalDAV account report -- the store heuristic is the more useful answer.
     """
     if eventkit_type and eventkit_type not in GENERIC_SOURCE_TYPES:
         return eventkit_type
@@ -424,7 +422,7 @@ def _with_identifier(row, account):
 
     Only iCloud reminders carry a CloudKit identifier (ZCKIDENTIFIER). Core
     refuses to modify a reminder without one rather than risk a title-based
-    fallback, which would make every Exchange/Google reminder read-only. Here
+    fallback, which would make every Exchange/CalDAV reminder read-only. Here
     we ask EventKit for the real item identifier so core's normal bridge path
     works unchanged.
 

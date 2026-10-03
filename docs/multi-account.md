@@ -2,7 +2,7 @@
 
 RemCTL's core is single-account by design: it reads the one "live" Reminders
 store and writes through iCloud. Reminders keeps a **separate SQLite store per
-connected account**, so Exchange, Google, other CalDAV, and Local accounts are
+connected account**, so Exchange, other CalDAV, and Local accounts are
 invisible to the core tool.
 
 `remctl_accounts.py` adds support for those accounts as an **optional
@@ -111,8 +111,12 @@ Account type is resolved from two sources and the **more specific** label wins:
 
 1. EventKit via the bridge — authoritative for concrete kinds (Exchange, …).
 2. A store heuristic over `ZREMCDREPLICAMANAGER` identifiers — needed because
-   EventKit reports both iCloud and Google as plain `CalDAV`, and because the
-   bridge may be unavailable.
+   EventKit reports iCloud and every other CalDAV account as plain `CalDAV`,
+   and because the bridge may be unavailable.
+
+Google accounts are not a Reminders source: Google's CalDAV server syncs calendar
+events but not tasks, so macOS offers no Reminders option for them and no Google
+store ever appears.
 
 Account *discovery* itself is type-agnostic: it enumerates every
 `Data-*.sqlite` store and reads the `REMCDAccount` entity, so any account type
@@ -123,7 +127,7 @@ store, is skipped.
 
 Only iCloud reminders carry `ZCKIDENTIFIER`. Core refuses to modify a reminder
 without one rather than risk a title-based fallback — which would make every
-Exchange/Google reminder read-only. When an account is explicitly targeted, the
+Exchange/CalDAV reminder read-only. When an account is explicitly targeted, the
 extension resolves the real EventKit identifier (via the bridge's
 `find_reminder`) and hands it to core's normal write path.
 
@@ -200,7 +204,7 @@ deterministic under `unittest` too.
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (92 tests):
+`tests/test_accounts.py` covers the extension in isolation (91 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
 dispatch installation, bridge payload handling, identifier backfill, and the

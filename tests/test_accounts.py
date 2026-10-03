@@ -118,12 +118,6 @@ class AccountTypeDetectionTests(AccountsTestBase):
             self.mod._account_type_from_identifiers(
                 ["UUID/com.apple.reminders.sharingextension"]), "iCloud")
 
-    def test_google_identifier_detected(self):
-        """A Google account must not fall through to the Local default."""
-        self.assertEqual(
-            self.mod._account_type_from_identifiers(["UUID/com.google.caldav.sync"]),
-            "Google")
-
     def test_generic_caldav_identifier_detected(self):
         self.assertEqual(
             self.mod._account_type_from_identifiers(["UUID/org.example.caldav"]),
@@ -133,21 +127,21 @@ class AccountTypeDetectionTests(AccountsTestBase):
         self.assertEqual(self.mod._account_type_from_identifiers([]), "Local")
 
     def test_bridge_source_type_refines_heuristic(self):
-        """A concrete EventKit label (Exchange, Google, ...) wins."""
-        store = Path("/tmp/data-google.sqlite")
+        """A concrete EventKit label (Exchange, ...) wins."""
+        store = Path("/tmp/data-work.sqlite")
         with (
             mock.patch.object(self.core, "reminders_store_access_error", return_value=None),
             mock.patch.object(self.mod, "db_override", return_value=None),
             mock.patch.object(self.mod, "store_dir",
                               return_value=SimpleNamespace(glob=lambda _p: [store])),
             mock.patch.object(self.mod, "_store_account_info",
-                              return_value=("Work Google", "Local")),
+                              return_value=("Work", "Local")),
             mock.patch.object(self.mod, "_bridge_source_types",
-                              return_value={"Work Google": "Google"}),
+                              return_value={"Work": "Exchange"}),
             mock.patch.object(self.core, "reminders_db_score", return_value=(1,)),
         ):
             accounts = self.mod.discover_accounts(force_refresh=True)
-        self.assertEqual([(a.name, a.type) for a in accounts], [("Work Google", "Google")])
+        self.assertEqual([(a.name, a.type) for a in accounts], [("Work", "Exchange")])
 
 
 class DiscoveryTests(AccountsTestBase):
@@ -202,7 +196,7 @@ class ScopeResolutionTests(AccountsTestBase):
     def setUp(self):
         super().setUp()
         self.all = [self._account("iCloud"), self._account("Work", "Exchange"),
-                    self._account("Gmail", "Google")]
+                    self._account("Fastmail", "CalDAV")]
         self._patch = mock.patch.object(self.mod, "discover_accounts", return_value=self.all)
         self._patch.start()
         self.addCleanup(self._patch.stop)
@@ -213,17 +207,17 @@ class ScopeResolutionTests(AccountsTestBase):
 
     def test_all_accounts_flag(self):
         scope = self.mod.resolve_account_scope(self._args(all_accounts=True))
-        self.assertEqual([a.name for a in scope], ["iCloud", "Work", "Gmail"])
+        self.assertEqual([a.name for a in scope], ["iCloud", "Work", "Fastmail"])
 
     def test_named_account_is_case_insensitive(self):
-        scope = self.mod.resolve_account_scope(self._args(account="gmail"))
-        self.assertEqual([a.name for a in scope], ["Gmail"])
+        scope = self.mod.resolve_account_scope(self._args(account="fastmail"))
+        self.assertEqual([a.name for a in scope], ["Fastmail"])
 
     def test_unknown_account_exits_with_available_list(self):
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             self.mod.resolve_account_scope(self._args(account="Nope"))
         self.assertIn("unknown account(s): Nope", err.getvalue())
-        self.assertIn("Gmail", err.getvalue())
+        self.assertIn("Fastmail", err.getvalue())
 
     def test_env_scope_all(self):
         os.environ["REMCTL_ACCOUNT_SCOPE"] = "all"
@@ -610,13 +604,13 @@ class AccountsCommandTests(AccountsTestBase):
         self.assertEqual(payload[1]["type"], "Exchange")
 
     def test_human_output_lists_every_account_type(self):
-        accounts = [self._account("iCloud"), self._account("Gmail", "Google"),
+        accounts = [self._account("iCloud"), self._account("Fastmail", "CalDAV"),
                     self._account("Work", "Exchange")]
         with mock.patch.object(self.mod, "discover_accounts", return_value=accounts):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.mod.cmd_accounts(self._args(json=False))
         text = out.getvalue()
-        for name in ("iCloud", "Gmail", "Work"):
+        for name in ("iCloud", "Fastmail", "Work"):
             self.assertIn(name, text)
         self.assertIn("3 accounts", text)
 
@@ -670,7 +664,7 @@ class BridgePayloadTests(AccountsTestBase):
 
 
 class IdentifierBackfillTests(AccountsTestBase):
-    """Exchange/Google reminders have no ZCKIDENTIFIER; core refuses to touch
+    """Exchange/CalDAV reminders have no ZCKIDENTIFIER; core refuses to touch
     them. The extension resolves the real EventKit id so core's own bridge
     path works unchanged."""
 
@@ -733,8 +727,8 @@ class AccountTypeMergeTests(AccountsTestBase):
         """EventKit calls iCloud "CalDAV"; the heuristic knows better."""
         self.assertEqual(self.mod._merge_account_type("iCloud", "CalDAV"), "iCloud")
 
-    def test_google_heuristic_survives_generic_eventkit_label(self):
-        self.assertEqual(self.mod._merge_account_type("Google", "CalDAV"), "Google")
+    def test_caldav_heuristic_survives_generic_eventkit_label(self):
+        self.assertEqual(self.mod._merge_account_type("CalDAV", "CalDAV"), "CalDAV")
 
     def test_local_stays_local(self):
         self.assertEqual(self.mod._merge_account_type("Local", "Local"), "Local")

@@ -160,7 +160,7 @@ Open 'Reminders' in the Codex sidebar, or ask Codex to open your Reminders works
 
 ## Multiple accounts
 
-Reminders keeps a separate database for each connected account, so by default RemCTL sees one: the live iCloud store. The optional multi-account extension (`remctl_accounts.py`) adds Exchange, Google, other CalDAV, and on-device local accounts:
+Reminders keeps a separate database for each connected account, so by default RemCTL sees one: the live iCloud store. The optional multi-account extension (`remctl_accounts.py`) adds Exchange, other CalDAV (such as Fastmail or Nextcloud), and on-device local accounts:
 
 ```bash
 remctl accounts                          # what's connected, and which is default

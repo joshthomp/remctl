@@ -131,21 +131,26 @@ its first sync, and listing them would show phantom "Local" accounts.
 
 Only iCloud reminders carry `ZCKIDENTIFIER`. Core refuses to modify a reminder
 without one rather than risk a title-based fallback — which would make every
-Exchange/CalDAV reminder read-only. When an account is explicitly targeted, the
-extension resolves the real EventKit identifier (via the bridge's
-`find_reminder`) and hands it to core's normal write path.
+Exchange/CalDAV reminder read-only. Those stores keep each reminder's EventKit
+`calendarItemIdentifier` in `ZDACALENDARITEMUNIQUEIDENTIFIER` instead (verified
+on Exchange and CalDAV), so when an account is explicitly targeted the
+extension hands that **exact** identifier to core's normal write path.
 
-When `add` creates a reminder in such an account, core looks the new row up
-by `ZCKIDENTIFIER` to report `numericId`, and finds nothing. Exchange and CalDAV
-rows store the identifier the bridge returned in
-`ZDACALENDARITEMUNIQUEIDENTIFIER`, so inside an account context the extension
-also checks that column (exact match only) and `add --json` reports
-`numericId` for every account type.
+Only if a row has no stored identifier does the extension ask EventKit by
+`(calendar, title)` (the bridge's `find_reminder`), and only when that title is
+unique in its list. Otherwise the row is left alone and core's refusal stands,
+so a same-titled sibling is never modified by mistake.
 
-**Caveat:** EventKit is queried by `(calendar, title)`, so a list holding two
-reminders with the identical title resolves to the first. This trades core's
-exact refusal for a resolvable-but-ambiguous match, and only on accounts that
-would otherwise be unusable.
+`add` uses the same column in reverse: core looks the new row up by
+`ZCKIDENTIFIER` to report `numericId`, so inside an account context the
+extension also matches the bridge's returned identifier against
+`ZDACALENDARITEMUNIQUEIDENTIFIER` (exact match only).
+
+**Flags.** Exchange and CalDAV reminders have no flag attribute: Reminders
+accepts the AppleScript flag write and silently drops it. The extension
+refuses `flag`, `unflag`, and `add --flag` on those accounts before writing
+(`code: "flag_unsupported_for_account"`), instead of letting core report a
+flag that never stuck.
 
 ## Bridge changes
 
@@ -215,10 +220,11 @@ deterministic under `unittest` too.
 
 ## Tests
 
-`tests/test_accounts.py` covers the extension in isolation (100 tests):
+`tests/test_accounts.py` covers the extension in isolation (107 tests):
 discovery and ranking, config precedence, scope resolution, the account
 context manager and its restoration, JSON merging, target disambiguation,
 dispatch installation, bridge payload handling, identifier backfill, and the
 Capability Host integration (command classification, the MCP run guard,
 custom-store routing, and scope forwarding), account-type detection against
-real store schemas, and the numericId lookup for non-iCloud reminders.
+real store schemas, exact identifier targeting for non-iCloud reminders
+(including same-titled siblings), the numericId lookup, and flag refusal.

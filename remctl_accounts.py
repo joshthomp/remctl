@@ -441,19 +441,25 @@ def _with_identifier(row, account):
     we ask EventKit for the real item identifier so core's normal bridge path
     works unchanged.
 
-    Caveat: EventKit is queried by (calendar, title), so if a list holds two
-    reminders with the identical title the first is returned. Core's own
-    guard is stricter -- it simply refuses -- so this trades an exact refusal
-    for a resolvable-but-ambiguous match only on accounts that would
-    otherwise be unusable.
+    The store keeps each Exchange/CalDAV reminder's EventKit
+    calendarItemIdentifier in ZDACALENDARITEMUNIQUEIDENTIFIER, so that exact
+    id is used whenever present. Only if it is missing does this ask EventKit
+    by (calendar, title), and only when that title is unique in its list;
+    otherwise the row is returned unchanged and core's own refusal stands.
+    A same-titled sibling is never modified by mistake.
     """
     if row is None:
         return row
     if core._row_get(row, "ZCKIDENTIFIER"):
         return row
+    exact_id, title_is_unique = _store_identity(account, core._row_get(row, "Z_PK"))
+    if exact_id:
+        enriched = dict(row)
+        enriched["ZCKIDENTIFIER"] = exact_id
+        return enriched
     title = core._row_get(row, "ZTITLE")
     list_name = core._row_get(row, "list_name")
-    if not title or not list_name:
+    if not title or not list_name or not title_is_unique:
         return row
     calendar_id = _calendar_id_for(list_name, account)
     if not calendar_id:
@@ -469,6 +475,35 @@ def _with_identifier(row, account):
     enriched = dict(row)
     enriched["ZCKIDENTIFIER"] = identifier
     return enriched
+
+
+def _store_identity(account, pk):
+    """(EventKit id or None, title-unique-in-list) for reminder *pk* in *account*."""
+    if pk is None:
+        return None, False
+    try:
+        conn = sqlite3.connect(f"file:{account.store_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None, False
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ZREMCDREMINDER)")}
+        id_column = ("ZDACALENDARITEMUNIQUEIDENTIFIER"
+                     if "ZDACALENDARITEMUNIQUEIDENTIFIER" in columns else "NULL")
+        live = "AND s.ZMARKEDFORDELETION = 0" if "ZMARKEDFORDELETION" in columns else ""
+        found = conn.execute(
+            f"SELECT r.{id_column} AS ek_id, "
+            f"(SELECT count(*) FROM ZREMCDREMINDER s WHERE s.ZLIST = r.ZLIST "
+            f" AND lower(s.ZTITLE) = lower(r.ZTITLE) {live}) AS same_title "
+            "FROM ZREMCDREMINDER r WHERE r.Z_PK = ?",
+            (pk,),
+        ).fetchone()
+        if found is None:
+            return None, False
+        return (found[0] or None), found[1] == 1
+    except sqlite3.Error:
+        return None, False
+    finally:
+        conn.close()
 
 
 @contextlib.contextmanager
@@ -706,6 +741,27 @@ def _pick_target_account(a, scope, command):
               f"Use --account to specify which one.", file=sys.stderr)
         sys.exit(1)
     return candidates[0]
+
+
+# Exchange and CalDAV reminders have no flag attribute: Reminders accepts the
+# AppleScript flag write and silently drops it, so core would report success.
+FLAG_UNSUPPORTED_TYPES = frozenset({"Exchange", "CalDAV"})
+
+
+def _refuse_unsupported_flag(a, command, account):
+    """Fail before writing when a flag change can't stick on *account*."""
+    wants_flag = command in ("flag", "unflag") or (
+        command == "add" and getattr(a, "flag", False))
+    if not wants_flag or account.type not in FLAG_UNSUPPORTED_TYPES:
+        return
+    message = (f"{account.type} account {account.name!r} has no flag attribute, so "
+               f"Reminders would drop the flag. Use priority instead (-p high).")
+    if getattr(a, "json", False):
+        print(json.dumps({"status": "error", "code": "flag_unsupported_for_account",
+                          "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ── Extension commands ───────────────────────────────────────────────────────
@@ -968,7 +1024,9 @@ def install(cmds, a, sub):
         cmds[command] = lambda args, _h=handler, _s=scope: _aggregate(_h, args, _s)
     else:
         def targeted(args, _h=handler, _s=scope, _c=command):
-            with account_context(_pick_target_account(args, _s, _c)):
+            account = _pick_target_account(args, _s, _c)
+            _refuse_unsupported_flag(args, _c, account)
+            with account_context(account):
                 _h(args)
         cmds[command] = targeted
     return cmds

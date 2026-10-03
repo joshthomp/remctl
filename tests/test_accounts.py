@@ -408,6 +408,46 @@ class TargetResolutionTests(AccountsTestBase):
         lookup.assert_called_once()
 
 
+class FlagSupportTests(AccountsTestBase):
+    """Flags on Exchange/CalDAV are refused up front instead of falsely succeeding."""
+
+    def _run(self, command, acct_type, **kw):
+        handler = mock.Mock()
+        args = self._args(cmd=command, account="Acct", **kw)
+        sub = SimpleNamespace(choices={command: SimpleNamespace(
+            _actions=[SimpleNamespace(option_strings=["--account"])])})
+        with mock.patch.object(self.mod, "resolve_account_scope",
+                               return_value=[self._account("Acct", acct_type)]), \
+                mock.patch.object(self.mod.sqlite3, "connect", return_value=mock.Mock()):
+            cmds = self.mod.install({command: handler}, args, sub)
+            cmds[command](args)
+        return handler
+
+    def test_flag_is_refused_on_exchange_and_caldav(self):
+        for acct_type in ("Exchange", "CalDAV"):
+            for command in ("flag", "unflag"):
+                with self.subTest(command=command, acct_type=acct_type), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit) as raised:
+                    self._run(command, acct_type, id=2)
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn("no flag attribute", err.getvalue())
+
+    def test_json_refusal_has_a_stable_code(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            self._run("flag", "CalDAV", id=2, json=True)
+        self.assertEqual(json.loads(err.getvalue())["code"], "flag_unsupported_for_account")
+
+    def test_add_with_flag_is_refused_before_creating(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self._run("add", "Exchange", flag=True)
+
+    def test_add_without_flag_and_icloud_flag_still_run(self):
+        self._run("add", "CalDAV", flag=False).assert_called_once()
+        self._run("flag", "iCloud", id=2).assert_called_once()
+        self._run("flag", "Local", id=2).assert_called_once()
+
+
 class InstallTests(AccountsTestBase):
     def setUp(self):
         super().setUp()
@@ -774,8 +814,10 @@ class IdentifierBackfillTests(AccountsTestBase):
         self.assertIs(self.mod._with_identifier(row, self.account), row)
 
     def test_missing_identifier_is_resolved_via_eventkit(self):
+        """No stored EventKit id: fall back to (calendar, title) for a unique title."""
         row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
         with (
+            mock.patch.object(self.mod, "_store_identity", return_value=(None, True)),
             mock.patch.object(self.mod, "_calendar_id_for", return_value="CAL-1"),
             mock.patch.object(self.mod, "_bridge_payload",
                               return_value={"calendarItemIdentifier": "EK-9"}),
@@ -787,6 +829,7 @@ class IdentifierBackfillTests(AccountsTestBase):
     def test_unresolvable_reminder_is_returned_unchanged(self):
         row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
         with (
+            mock.patch.object(self.mod, "_store_identity", return_value=(None, True)),
             mock.patch.object(self.mod, "_calendar_id_for", return_value="CAL-1"),
             mock.patch.object(self.mod, "_bridge_payload", return_value=None),
         ):
@@ -794,8 +837,57 @@ class IdentifierBackfillTests(AccountsTestBase):
 
     def test_unknown_calendar_returns_row_unchanged(self):
         row = {"ZCKIDENTIFIER": None, "ZTITLE": "T", "list_name": "Projects"}
-        with mock.patch.object(self.mod, "_calendar_id_for", return_value=None):
+        with (
+            mock.patch.object(self.mod, "_store_identity", return_value=(None, True)),
+            mock.patch.object(self.mod, "_calendar_id_for", return_value=None),
+        ):
             self.assertIs(self.mod._with_identifier(row, self.account), row)
+
+    def _store(self):
+        """Two reminders share a title in one list, as in a real CalDAV test run."""
+        path = self._config_dir / "Data-dup.sqlite"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE ZREMCDREMINDER (Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZLIST INTEGER,
+                                         ZDACALENDARITEMUNIQUEIDENTIFIER TEXT,
+                                         ZMARKEDFORDELETION INTEGER);
+            INSERT INTO ZREMCDREMINDER VALUES (2, 'Created by remctl', 1, 'EK-2', 0);
+            INSERT INTO ZREMCDREMINDER VALUES (4, 'Created by remctl', 1, 'EK-4', 0);
+            INSERT INTO ZREMCDREMINDER VALUES (5, 'Created by remctl', 1, NULL, 0);
+            INSERT INTO ZREMCDREMINDER VALUES (6, 'Unique', 1, NULL, 0);
+            INSERT INTO ZREMCDREMINDER VALUES (7, 'Unique', 1, 'EK-7', 1);
+        """)
+        conn.commit()
+        conn.close()
+        return self.mod.Account(path, "Work", "Exchange")
+
+    def test_stored_eventkit_id_targets_the_exact_reminder(self):
+        """Editing #4 must not resolve to its same-titled sibling #2."""
+        account = self._store()
+        row = {"Z_PK": 4, "ZCKIDENTIFIER": None, "ZTITLE": "Created by remctl",
+               "list_name": "RemCTL Test"}
+        with mock.patch.object(self.mod, "_bridge_payload") as bridge:
+            out = self.mod._with_identifier(row, account)
+        self.assertEqual(out["ZCKIDENTIFIER"], "EK-4")
+        bridge.assert_not_called()
+
+    def test_duplicate_title_without_stored_id_is_refused(self):
+        """No exact id and an ambiguous title: leave it for core to refuse."""
+        account = self._store()
+        row = {"Z_PK": 5, "ZCKIDENTIFIER": None, "ZTITLE": "Created by remctl",
+               "list_name": "RemCTL Test"}
+        with mock.patch.object(self.mod, "_bridge_payload") as bridge:
+            self.assertIs(self.mod._with_identifier(row, account), row)
+        bridge.assert_not_called()
+
+    def test_store_identity_reports_id_and_title_uniqueness(self):
+        account = self._store()
+        self.assertEqual(self.mod._store_identity(account, 4), ("EK-4", False))
+        self.assertEqual(self.mod._store_identity(account, 5), (None, False))
+        # #7 shares the title but is marked for deletion, so #6 is unique.
+        self.assertEqual(self.mod._store_identity(account, 6), (None, True))
+        self.assertEqual(self.mod._store_identity(account, 99), (None, False))
+        self.assertEqual(self.mod._store_identity(account, None), (None, False))
 
     def test_none_row_is_passed_through(self):
         self.assertIsNone(self.mod._with_identifier(None, self.account))
